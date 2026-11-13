@@ -592,7 +592,17 @@ impl Model {
         let n = b.seq_start.len();
         let w = *b.seq_len.iter().max().unwrap() as usize;
         let bucket = DECODE_BUCKETS.iter().copied().find(|&x| x >= n).unwrap_or(n).min(lim.max_seqs).max(n);
-        let rows = bucket * w;
+        // Rows padded to a multiple of 16 (not bucket * W): sequences keep their own lengths,
+        // so the padding is only the round-up, bounded by `max_rows`.
+        let rows = b
+            .tokens
+            .len()
+            .next_multiple_of(16)
+            .max(bucket)
+            .min(lim.max_rows())
+            .min(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ)
+            .max(b.tokens.len());
+        let _ = w;
         let used = b.tokens.len();
         let mb = lim.max_blocks_per_seq();
         let dummy_slot = lim.max_seqs as u32;
@@ -622,7 +632,7 @@ impl Model {
         self.cur_nd_rows = rows;
         self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
         anyhow::ensure!(rows * self.cur_splits <= attn_part_rows(lim.max_seqs), "decode attention partials overflow");
-        let key = (bucket * 1000 + w * 10 + 1, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        let key = (bucket * 100_000 + rows * 10 + 1, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
         if let Some((exec, _)) = self.graphs.get(&key) {
             self.gpu.launch_graph(*exec)?;
         } else {
