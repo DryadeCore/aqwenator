@@ -108,6 +108,11 @@ pub struct Limits {
     pub max_ctx: usize,
     /// KV cache page size in tokens.
     pub block_size: usize,
+    /// KV page pool size in bytes; 0 = enough for every slot at `max_ctx`. With a budget,
+    /// slots can outnumber what fits at full context (idle sessions share the pool).
+    pub kv_budget_bytes: usize,
+    /// Pages in the pool, resolved at load time from the budget.
+    pub kv_blocks: usize,
 }
 
 impl Limits {
@@ -121,7 +126,7 @@ impl Limits {
         self.max_ctx.div_ceil(self.block_size)
     }
     pub fn num_blocks(&self) -> usize {
-        self.max_seqs * self.max_blocks_per_seq()
+        if self.kv_blocks > 0 { self.kv_blocks } else { self.max_seqs * self.max_blocks_per_seq() }
     }
 }
 
@@ -222,7 +227,12 @@ impl Model {
         };
 
         let hv = cfg.linear_num_value_heads;
-        let lim = limits;
+        let mut lim = limits;
+        if lim.kv_budget_bytes > 0 {
+            let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count();
+            let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
+            lim.kv_blocks = lim.kv_budget_bytes / page_bytes;
+        }
         let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
@@ -284,6 +294,14 @@ impl Model {
             layers.push(layer);
         }
         let weight_bytes = gpu.allocated_bytes;
+        eprintln!(
+            "memory: {:.2} GiB weights+state+KV ({} KV pages = {} tokens, {} state slots of {:.1} MiB)",
+            weight_bytes as f64 / (1u64 << 30) as f64,
+            lim.num_blocks(),
+            lim.num_blocks() * lim.block_size,
+            lim.max_seqs,
+            cfg.state_bytes_per_seq() as f64 / (1 << 20) as f64
+        );
 
         let hd = cfg.hidden_size;
         let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);

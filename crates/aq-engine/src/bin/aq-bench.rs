@@ -92,6 +92,8 @@ fn main() -> Result<()> {
         max_seqs: a.max_seqs,
         max_ctx: (a.input_len + a.output_len).next_multiple_of(16),
         block_size: 16,
+        kv_budget_bytes: 0,
+        kv_blocks: 0,
     };
     let model = Model::load(&dir, limits)?;
     let loaded_s = process_start.elapsed().as_secs_f64();

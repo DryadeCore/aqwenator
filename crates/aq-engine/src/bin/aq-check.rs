@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 
     let ctx = (ids.len() + greedy_ref.len() + 64).next_multiple_of(256);
     let t0 = Instant::now();
-    let mut m = Model::load(&dir, Limits { max_tokens: 8192, max_seqs: 4, max_ctx: ctx, block_size: 16 })?;
+    let mut m = Model::load(&dir, Limits { max_tokens: 8192, max_seqs: 4, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
     println!(
         "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
         t0.elapsed().as_secs_f64(),
@@ -212,6 +212,30 @@ fn main() -> Result<()> {
     for (i, gseq) in got.iter().enumerate() {
         failed |= !classify(&format!("batched seq {i} vs single"), gseq, &single);
     }
+
+    // ---- 4. session cache: a request that extends a finished one must resume from the parked
+    // state and produce the same tokens as a cold engine (session cache off) on the same prompt.
+    let turn2: Vec<u32> = ids.iter().copied().chain(single[..8].iter().copied()).chain(ids[..ids.len().min(37)].iter().copied()).collect();
+    let mut run_turns = |eng: &mut Engine, cached: bool| -> Result<(Vec<u32>, u64)> {
+        eng.session_cache = cached;
+        let mut out = Vec::new();
+        for (id, prompt, n) in [(100u64, ids.clone(), 9usize), (101, turn2.clone(), 16)] {
+            eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: true })?;
+            while eng.has_work() {
+                for e in eng.step()? {
+                    if e.id == 101 {
+                        out.push(e.token);
+                    }
+                }
+            }
+        }
+        Ok((out, eng.cache.reused_tokens))
+    };
+    let (warm, reused) = run_turns(&mut eng, true)?;
+    let (cold, _) = run_turns(&mut eng, false)?;
+    let same = warm.iter().zip(&cold).take_while(|(a, b)| a == b).count();
+    println!("session cache: turn 2 resumed from {reused} cached tokens; {same}/{} tokens identical to a cold prefill", cold.len());
+    failed |= reused == 0 || same != cold.len();
 
     if failed {
         anyhow::bail!("correctness check FAILED");
