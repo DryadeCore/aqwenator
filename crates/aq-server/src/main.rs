@@ -237,9 +237,9 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} (snapshot {}) deferred {}",
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} (snapshot {}) deferred {} host {:.0}us/step",
                 eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions,
-                c.snapshot_evictions, c.deferred
+                c.snapshot_evictions, c.deferred, c.host_us as f64 / c.steps.max(1) as f64
             );
             last_report = Instant::now();
         }
@@ -315,6 +315,7 @@ async fn main() -> Result<()> {
             "--srpt" => opts.policy.srpt = v.parse()?,
             "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
             "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
+            "--quantum" => opts.policy.quantum = v.parse()?,
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,

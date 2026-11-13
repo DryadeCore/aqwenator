@@ -50,6 +50,8 @@ struct Seq {
     computed: usize,
     /// Pause prefill at this position and snapshot the state there (shared prefix).
     snapshot_at: Option<usize>,
+    /// Turns served since this session last became resident (cache hits keep counting).
+    turns: u32,
 }
 
 impl Seq {
@@ -60,6 +62,14 @@ impl Seq {
         let p = self.req.prompt.len();
         if i < p { self.req.prompt[i] } else { self.out[i - p] }
     }
+}
+
+/// `t` is a strict prefix of `prompt`. Cheap rejects first (last and middle token), so the
+/// full comparison usually runs only for the request's own session.
+#[inline]
+fn is_strict_prefix(t: &[u32], prompt: &[u32]) -> bool {
+    let n = t.len();
+    n < prompt.len() && (n == 0 || (t[n - 1] == prompt[n - 1] && t[n / 2] == prompt[n / 2])) && prompt[..n] == t[..]
 }
 
 /// Which parked session to evict when pages or slots run out.
@@ -91,11 +101,23 @@ pub struct Policy {
     pub max_wait_ms: u64,
     /// `Evict::Idle`: idle time after which a parked session is presumed finished.
     pub dead_after_ms: u64,
+    /// Load control residency quantum: a waiting non-hit request may evict a live parked
+    /// session once that session has been served this many turns since it became resident
+    /// (0 = never; only finished sessions).
+    pub quantum: u32,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { evict: Evict::Lru, pin_snapshots: false, load_control: false, srpt: false, max_wait_ms: 2000, dead_after_ms: 6000 }
+        Self {
+            evict: Evict::Lru,
+            pin_snapshots: false,
+            load_control: false,
+            srpt: false,
+            max_wait_ms: 2000,
+            dead_after_ms: 6000,
+            quantum: 0,
+        }
     }
 }
 
@@ -119,6 +141,7 @@ struct Parked {
     blocks: Vec<u32>,
     last_used: u64,
     parked_at: Instant,
+    turns: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,6 +155,9 @@ pub struct CacheStats {
     pub evictions: u64,
     pub snapshot_evictions: u64,
     pub deferred: u64,
+    /// Scheduler host time (admission + batch building) and steps, cumulative.
+    pub host_us: u64,
+    pub steps: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -253,13 +279,25 @@ impl Engine {
         now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms
     }
 
+    /// May a restricted admission (load control, non-hit) evict parked session `i`? Sessions
+    /// presumed finished always; with a residency quantum, also sessions that have been served
+    /// `quantum` turns since they last became resident (working-set rotation).
+    fn evictable_restricted(&self, i: usize, now: Instant) -> bool {
+        self.is_dead(i, now) || (self.policy.quantum > 0 && self.parked[i].turns >= self.policy.quantum)
+    }
+
     /// Evict one parked session chosen by the policy (or, if none and snapshots are not
     /// pinned, the least-recently-used snapshot), returning its slot and pages.
     /// With `self.dead_only`, only sessions presumed finished may go.
     fn evict_lru(&mut self) -> bool {
         if self.dead_only {
+            // Restricted: finished sessions first (oldest first), then the sessions that have
+            // used up their residency quantum (most served first).
             let now = Instant::now();
-            let Some(i) = (0..self.parked.len()).filter(|&i| self.is_dead(i, now)).min_by_key(|&i| self.parked[i].parked_at) else {
+            let dead = (0..self.parked.len()).filter(|&i| self.is_dead(i, now)).min_by_key(|&i| self.parked[i].parked_at);
+            let Some(i) = dead.or_else(|| {
+                (0..self.parked.len()).filter(|&i| self.evictable_restricted(i, now)).max_by_key(|&i| self.parked[i].turns)
+            }) else {
                 return false;
             };
             let p = self.parked.swap_remove(i);
@@ -384,10 +422,7 @@ impl Engine {
             return None;
         }
         (0..self.parked.len())
-            .filter(|&i| {
-                let t = &self.parked[i].tokens;
-                t.len() < prompt.len() && prompt[..t.len()] == t[..]
-            })
+            .filter(|&i| is_strict_prefix(&self.parked[i].tokens, prompt))
             .max_by_key(|&i| self.parked[i].tokens.len())
     }
 
@@ -396,10 +431,7 @@ impl Engine {
             return None;
         }
         (0..self.snapshots.len())
-            .filter(|&i| {
-                let t = &self.snapshots[i].tokens;
-                t.len() < prompt.len() && prompt[..t.len()] == t[..]
-            })
+            .filter(|&i| is_strict_prefix(&self.snapshots[i].tokens, prompt))
             .max_by_key(|&i| self.snapshots[i].tokens.len())
     }
 
@@ -442,7 +474,10 @@ impl Engine {
             }
             let Some(wi) = self.waiting.iter().position(|(r, _)| r.id == id) else { continue };
             let hit = self.find_parked(&self.waiting[wi].0.prompt).is_some();
-            let allow_evict = !pol.load_control || hit || !not_aged || self.running.is_empty();
+            // Hits may evict freely unless a residency quantum is set (then everyone rotates
+            // through the same restricted victims); anyone waiting past max_wait may.
+            let hit_ok = hit && pol.quantum == 0;
+            let allow_evict = !pol.load_control || hit_ok || !not_aged || self.running.is_empty();
             // Without permission to evict live sessions, sessions presumed finished may still go.
             self.dead_only = !allow_evict;
             let ok = self.try_admit(wi, allow_evict);
@@ -478,7 +513,7 @@ impl Engine {
             let mut slots = self.free_slots.len();
             let now = Instant::now();
             for (k, p) in self.parked.iter().enumerate() {
-                if Some(k) == best || (!allow_evict && !self.is_dead(k, now)) {
+                if Some(k) == best || (!allow_evict && !self.evictable_restricted(k, now)) {
                     continue;
                 }
                 avail += p.blocks.iter().filter(|&&b| self.refcnt[b as usize] == 1).count();
@@ -491,8 +526,10 @@ impl Engine {
         }
         let mut snapshot_at = None;
         let mut forked = false;
+        let mut resident_turns = 0;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
+            resident_turns = p.turns;
             (p.slot, p.blocks, p.tokens.len())
         } else {
             let slot = match self.free_slots.pop() {
@@ -546,7 +583,7 @@ impl Engine {
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
                     let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
-                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now() });
+                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns });
                 } else {
                     self.free_slots.push(slot);
                     self.release(blocks);
@@ -564,7 +601,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, turns: resident_turns });
         Ok(true)
     }
 
@@ -654,6 +691,8 @@ impl Engine {
         }
         b.n_decode = decode_seqs;
         let host_us = t0.elapsed().as_micros() as u64;
+        self.cache.host_us += host_us;
+        self.cache.steps += 1;
         let t1 = Instant::now();
         let toks = self.model.step(&b, None)?;
         let gpu_us = t1.elapsed().as_micros() as u64;
@@ -693,7 +732,14 @@ impl Engine {
             let s = self.running.swap_remove(i);
             if self.session_cache {
                 let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now() });
+                self.parked.push(Parked {
+                    tokens,
+                    slot: s.slot,
+                    blocks: s.blocks,
+                    last_used: self.clock,
+                    parked_at: Instant::now(),
+                    turns: s.turns + 1,
+                });
             } else {
                 self.free_slots.push(s.slot);
                 self.release(s.blocks);
