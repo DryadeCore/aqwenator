@@ -185,6 +185,7 @@ struct EngineOpts {
     max_snapshots: Option<usize>,
     itl_target_ms: Option<f64>,
     adaptive: Option<(usize, usize)>,
+    prewarm: bool,
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -196,6 +197,17 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
             return;
         }
     };
+    let mut model = model;
+    if opts.prewarm {
+        let t = Instant::now();
+        match model.prewarm_gemms() {
+            Ok(n) => eprintln!("prewarmed GEMM plans for {n} M buckets in {:.1}s", t.elapsed().as_secs_f64()),
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        }
+    }
     let mut eng = Engine::new(model, eos);
     if let Some(m) = opts.mixed {
         eng.mixed_prefill_budget = m;
@@ -292,7 +304,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
@@ -318,6 +330,7 @@ async fn main() -> Result<()> {
             "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
             "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
             "--quantum" => opts.policy.quantum = v.parse()?,
+            "--prewarm" => opts.prewarm = v.parse()?,
             "--mixed-prefill-adaptive" => {
                 // "HI:THRESHOLD", e.g. 8192:16384
                 let (a, b) = v.split_once(':').context("--mixed-prefill-adaptive HI:THRESHOLD")?;
