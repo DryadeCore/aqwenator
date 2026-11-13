@@ -465,14 +465,13 @@ impl Engine {
             if self.running[i].spare.is_none() {
                 d.clear();
             }
-            let n = (pending + d.len()).min(budget);
-            if n < pending + d.len() {
-                d.clear();
-            }
-            let n = n.min(pending + d.len());
+            // A decode entry costs the step budget what plain decoding would (one token);
+            // re-fed tokens and drafts ride along in the step's row headroom
+            // (`Limits::max_rows`), so speculation never changes how much prefill fits.
+            let n = pending + d.len();
             plan.push((i, n));
             drafts.push(d);
-            budget -= n;
+            budget -= 1;
         }
         let decode_seqs = plan.len();
         if decode_seqs > 0 {

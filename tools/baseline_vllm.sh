@@ -28,7 +28,7 @@ nvidia-smi --query-gpu=name,driver_version --format=csv,noheader -i "$GPU" | tee
 
 T0=$(date +%s.%N)
 vllm serve "$MODEL" --port "$PORT" --max-model-len 16384 --gpu-memory-utilization 0.85 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 256 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 256 ${VLLM_EXTRA_ARGS:-} \
   > "$OUT/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT

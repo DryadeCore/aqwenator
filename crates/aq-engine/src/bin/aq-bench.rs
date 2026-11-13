@@ -110,6 +110,10 @@ fn main() -> Result<()> {
         eng.mixed_prefill_budget = m;
     }
     eng.spec_k = a.spec_k;
+    if a.spec_k > 0 || std::env::var("AQ_ATTN_SPLIT_KEYS").is_ok() {
+        // Fixed decode-attention slices (required by the speculative graph path).
+        eng.model.attn_split_keys = std::env::var("AQ_ATTN_SPLIT_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    }
 
     // Cold start: first token of a short request right after load (includes module load,
     // cuBLASLt plan creation, first-touch of every kernel).

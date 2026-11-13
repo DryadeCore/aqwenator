@@ -135,6 +135,11 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// Token rows a step may hold: the token budget plus headroom for speculative draft rows
+    /// (drafts do not count against the budget).
+    pub fn max_rows(&self) -> usize {
+        self.max_tokens + self.max_seqs * (MAX_DECODE_ROWS_PER_SEQ - 1)
+    }
     pub fn max_chunks(&self) -> usize {
         self.max_tokens / GDN_CHUNK + self.max_seqs
     }
@@ -343,7 +348,7 @@ impl Model {
         let hd = cfg.hidden_size;
         let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
         let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
-        let t = lim.max_tokens;
+        let t = lim.max_rows();
         let sq = lim.max_seqs;
         let hvd = cfg.linear_num_value_heads * 128;
         let hq = cfg.num_attention_heads;
@@ -490,7 +495,7 @@ impl Model {
         let nseq = b.seq_start.len();
         let ns = b.sample_rows.len();
         let lim = self.limits;
-        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_tokens, "{} tokens exceeds max_tokens", b.tokens.len());
+        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_rows(), "{} tokens exceeds max_rows", b.tokens.len());
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
         anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
@@ -744,7 +749,7 @@ impl Model {
                 LayerKind::Linear => {
                     let n = c.gdn_proj_ld();
                     mark!("norm");
-                    g.gemm(t, lim.max_tokens, n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_gdn_in");
                     let cd = c.conv_dim() as u32;
                     unsafe {
@@ -978,14 +983,14 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("gdn");
-                    g.gemm(t, lim.max_tokens, c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_gdn_out");
                 }
                 LayerKind::Full => {
                     let n = c.attn_proj_dim();
                     let (h, hkv) = (c.num_attention_heads as u32, c.num_key_value_heads as u32);
                     mark!("norm");
-                    g.gemm(t, lim.max_tokens, n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_qkv");
                     unsafe {
                         g.k.attn_prep(
@@ -1132,7 +1137,7 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("attn_prefill");
-                    g.gemm(t, lim.max_tokens, c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_o");
                 }
             }
@@ -1153,7 +1158,7 @@ impl Model {
             .map_err(de)?;
             mark!("norm");
             let inter = c.intermediate_size;
-            g.gemm(t, lim.max_tokens, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
+            g.gemm(t, lim.max_rows(), 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
             mark!("gemm_gate_up");
             let nvec = (t * inter / 8) as u32;
             unsafe {
@@ -1161,7 +1166,7 @@ impl Model {
             }
             .map_err(de)?;
             mark!("silu_mul");
-            g.gemm(t, lim.max_tokens, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
+            g.gemm(t, lim.max_rows(), c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
             mark!("gemm_down");
 
             if let Some(d) = dump.as_deref_mut() {

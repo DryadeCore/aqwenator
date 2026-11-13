@@ -301,7 +301,9 @@ fn main() -> Result<()> {
         eng.model.attn_split_keys = 256;
         // One GEMM plan for every decode-sized GEMM: rows then compute identically whatever
         // else shares the GEMM, so speculative and plain decoding must match bit for bit.
-        eng.model.gpu.gemm_min_m = 64;
+        // With a small step budget, prefill and decode share steps; pin every GEMM to the full
+        // row capacity so no row's plan depends on what else is in the step.
+        eng.model.gpu.gemm_min_m = if budget < 8192 { eng.model.limits.max_rows() } else { 64 };
         let mut run = |eng: &mut Engine, spec: usize, which: &[usize]| -> Result<Vec<Vec<u32>>> {
             eng.spec_k = spec;
             for &w in which {
