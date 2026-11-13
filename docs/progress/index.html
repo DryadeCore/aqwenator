@@ -47,12 +47,13 @@
 <div class="aq">
   <header id="top">
     <h1>aqwenator</h1>
-    <p class="lede">A handrolled inference server for the Qwen3.5 hybrid family (Gated DeltaNet plus gated attention), written in Rust with kernels compiled by cuda-oxide. Each run here is measured on one NVIDIA B200 against vLLM on the same GPU. The target hardware is consumer Blackwell and DGX Spark, so these are development numbers.</p>
+    <p class="lede">A handrolled inference server for the Qwen3.5 hybrid family (Gated DeltaNet plus gated attention), written in Rust with kernels compiled by cuda-oxide. Every comparison runs aqwenator and vLLM on the same machine: an NVIDIA B200 (development, shared with other users) or a DGX Spark (target hardware). Latency is reported at the tail (p99, p99.9).</p>
   </header>
 
   <p class="take" id="takeaway">On <b data-draw="t-model">—</b> with <b data-draw="t-shape">—</b>, the newest aqwenator build (<b data-draw="t-build">—</b>) peaks at <b data-draw="t-aq" data-source="summary" data-field="aq_peak" data-row="0">—</b> output tokens/s, against <b data-draw="t-vllm" data-source="summary" data-field="vllm_peak" data-row="0">—</b> for vLLM: <b data-draw="t-ratio" data-source="summary" data-field="ratio_pct" data-row="0">—</b>% of vLLM.</p>
 
   <div class="controls" id="controls">
+    <label>Hardware <select class="dash-select" id="sel-gpu" data-draw="sel-gpu" aria-label="Hardware" data-source="bench"></select></label>
     <label>Model <select class="dash-select" id="sel-model" data-draw="sel-model" aria-label="Model" data-source="bench"></select></label>
     <label>Workload <select class="dash-select" id="sel-shape" data-draw="sel-shape" aria-label="Workload" data-source="bench"></select></label>
   </div>
@@ -63,20 +64,25 @@
       <span><span class="num" data-draw="k-aq-peak" data-source="summary" data-field="aq_peak" data-row="0">—</span> <span class="unit">tok/s</span></span>
       <span class="sub">vLLM: <span data-draw="k-vllm-peak" data-source="summary" data-field="vllm_peak" data-row="0">—</span> tok/s</span>
     </div>
+    <div class="tile" id="tile-itl">
+      <span class="label">Inter-token latency p99 at 16 concurrent requests</span>
+      <span><span class="num" data-draw="k-aq-itl" data-source="summary" data-field="aq_itl16" data-row="0">—</span> <span class="unit">ms</span></span>
+      <span class="sub">vLLM: <span data-draw="k-vllm-itl" data-source="summary" data-field="vllm_itl16" data-row="0">—</span> ms</span>
+    </div>
+    <div class="tile" id="tile-ttft">
+      <span class="label">Time to first token p99 at 16 concurrent requests</span>
+      <span><span class="num" data-draw="k-aq-ttft" data-source="summary" data-field="aq_ttft16" data-row="0">—</span> <span class="unit">ms</span></span>
+      <span class="sub">vLLM: <span data-draw="k-vllm-ttft" data-source="summary" data-field="vllm_ttft16" data-row="0">—</span> ms</span>
+    </div>
     <div class="tile" id="tile-tpot">
       <span class="label">Time per output token, one stream</span>
       <span><span class="num" data-draw="k-aq-tpot" data-source="summary" data-field="aq_tpot1" data-row="0">—</span> <span class="unit">ms</span></span>
       <span class="sub">vLLM: <span data-draw="k-vllm-tpot" data-source="summary" data-field="vllm_tpot1" data-row="0">—</span> ms</span>
     </div>
-    <div class="tile" id="tile-ttft">
-      <span class="label">Time to first token, one stream (p50)</span>
-      <span><span class="num" data-draw="k-aq-ttft" data-source="summary" data-field="aq_ttft1" data-row="0">—</span> <span class="unit">ms</span></span>
-      <span class="sub">vLLM: <span data-draw="k-vllm-ttft" data-source="summary" data-field="vllm_ttft1" data-row="0">—</span> ms</span>
-    </div>
     <div class="tile" id="tile-cold">
       <span class="label">Cold start to first token, aqwenator</span>
       <span><span class="num" data-draw="k-aq-cold" data-source="summary" data-field="aq_cold" data-row="0">—</span> <span class="unit">s</span></span>
-      <span class="sub">Process start, weights resident, first token. vLLM: not measured yet.</span>
+      <span class="sub">Process start, weights resident, first token.</span>
     </div>
   </div>
 
@@ -90,13 +96,13 @@
         <div class="chart" id="chart-tput" data-draw="chart-tput" data-source="bench"></div>
       </div>
       <div class="chartbox" id="chart-ttft-box">
-        <h2>Time to first token, p50 (ms)</h2>
+        <h2>Time to first token, p99 (ms)</h2>
         <p>Lower is better. Includes queueing behind other requests' prefill.</p>
         <div class="chart" id="chart-ttft" data-draw="chart-ttft" data-source="bench"></div>
       </div>
       <div class="chartbox" id="chart-tpot-box">
-        <h2>Time per output token, p50 (ms)</h2>
-        <p>Lower is better. Decode speed seen by one request.</p>
+        <h2>Inter-token latency, p99 (ms)</h2>
+        <p>Lower is better. A long pause mid-answer, usually a decode step waiting behind prefill.</p>
         <div class="chart" id="chart-tpot" data-draw="chart-tpot" data-source="bench"></div>
       </div>
     </div>
@@ -112,13 +118,38 @@
           <th data-field="output_tok_s" class="n">Output tok/s</th>
           <th data-field="ttft_p50_ms" class="n">TTFT p50 (ms)</th>
           <th data-field="ttft_p99_ms" class="n">TTFT p99 (ms)</th>
+          <th data-field="ttft_p999_ms" class="n">TTFT p99.9 (ms)</th>
           <th data-field="tpot_p50_ms" class="n">TPOT p50 (ms)</th>
           <th data-field="itl_p99_ms" class="n">ITL p99 (ms)</th>
+          <th data-field="itl_p999_ms" class="n">ITL p99.9 (ms)</th>
           <th data-field="run">Run</th>
           <th data-field="date">Date (UTC)</th>
         </tr></thead>
         <tbody data-draw="runs-body"></tbody>
       </table>
+    </div>
+  </section>
+
+  <section id="agentic">
+    <h2>Agentic workload: concurrent multi-turn agents</h2>
+    <p class="lede">Each agent shares a 4,096-token system prompt, starts with a 1,024-token task, then loops: generate 256 tokens, receive a 512–4,096-token tool result after a 0.5–3 s tool delay, and continue until its context reaches 32k, then starts a new session. Both engines run Qwen3.5-9B under the same 32 GB memory budget (the size of an RTX 5090). Higher turns per minute at a bounded tail is the goal.</p>
+    <div class="legend" data-draw="legend-agentic" data-source="agentic" aria-label="Legend"></div>
+    <div class="charts">
+      <div class="chartbox" id="chart-agent-turns-box">
+        <h2>Agent turns per minute</h2>
+        <p>Higher is better.</p>
+        <div class="chart" id="chart-agent-turns" data-draw="chart-agent-turns" data-source="agentic"></div>
+      </div>
+      <div class="chartbox" id="chart-agent-ttft-box">
+        <h2>Time to first token per turn, p99 (ms)</h2>
+        <p>Lower is better. What an agent waits after each tool call.</p>
+        <div class="chart" id="chart-agent-ttft" data-draw="chart-agent-ttft" data-source="agentic"></div>
+      </div>
+      <div class="chartbox" id="chart-agent-itl-box">
+        <h2>Inter-token latency, p99 (ms)</h2>
+        <p>Lower is better.</p>
+        <div class="chart" id="chart-agent-itl" data-draw="chart-agent-itl" data-source="agentic"></div>
+      </div>
     </div>
   </section>
 
@@ -140,17 +171,19 @@
 
   <section id="correctness">
     <h2>Correctness against transformers</h2>
-    <p class="lede">Reference activations come from transformers in bf16 eager mode. Relative error is the L2 norm of the difference over the L2 norm of the reference, across all prompt tokens. On the long prompt, the 9B drift is the same with the reference kernels, so the fast kernels are not its cause.</p>
+    <p class="lede">The reference is transformers in bf16. Teacher-forced: the reference's own tokens are fed through our decode path and every logits row is compared; a top-1 disagreement where the reference's top-2 margin is under 0.25 counts as a near-tie, anything else as a real miss. Session resume and shared-prefix fork compare a cached turn with a cold prefill of the same prompt. The suite also runs with odd step budgets and chunk sizes, which is how an upload/compute stream race was found and fixed.</p>
     <div class="tablewrap">
       <table data-source="correctness" data-row-key="model,prompt_tokens" aria-label="Correctness checks">
         <thead><tr>
           <th data-field="model">Model</th>
           <th data-field="prompt_tokens" class="n">Prompt tokens</th>
-          <th data-field="worst_layer_rel_l2" class="n">Worst layer rel. error</th>
-          <th data-field="logits_rel_l2" class="n">Logits rel. error</th>
-          <th data-field="top5_match">Top-5 logits match</th>
-          <th data-field="greedy_match">Greedy tokens match</th>
-          <th data-field="batched_match">Batched (3 sequences)</th>
+          <th data-field="teacher_forced_top1">Teacher-forced top-1</th>
+          <th data-field="real_misses" class="n">Real misses</th>
+          <th data-field="worst_logits_rel_l2" class="n">Worst logits rel. error</th>
+          <th data-field="free_running">Free-running greedy</th>
+          <th data-field="batched">Batched</th>
+          <th data-field="session_resume">Session resume</th>
+          <th data-field="shared_prefix_fork">Shared-prefix fork</th>
           <th data-field="build">Build</th>
         </tr></thead>
         <tbody data-draw="correctness-body"></tbody>
@@ -165,7 +198,8 @@
       <li>aqwenator: <code>aq-bench</code>, an in-process closed loop with the same shapes and concurrency. It has no HTTP or tokenization yet, which slightly favors it; the HTTP server comes next so both can use the same client.</li>
       <li>Workloads: 1024 prompt tokens with 256 output tokens, and 8192 prompt tokens with 512 output tokens. Prompts are random token ids.</li>
       <li>Builds: m2 has the batched engine; m2g adds CUDA graphs; m3b adds the chunked DeltaNet prefill and tiled attention.</li>
-      <li>The B200 is shared with other users. Runs use a GPU that was idle at launch.</li>
+      <li>The B200 is shared with other users. Runs use a GPU that was idle at launch, but other users' jobs sometimes landed on the same GPU later. The DGX Spark runs are on a dedicated, otherwise idle machine.</li>
+      <li>Builds: m3c adds split-K decode attention and vectorized small kernels; spark1 is the first DGX Spark build (tensor-core attention and DeltaNet, session cache, upload race fixed).</li>
     </ul>
   </details>
 </div>
@@ -174,7 +208,7 @@
   // Selection lives in page params (no query uses them, so nothing re-runs on change).
   window.aqSel = () => {
     const p = dash.params();
-    return { model: p.model || 'Qwen/Qwen3.5-0.8B', shape: p.shape || '1024/256' };
+    return { gpu: p.gpu || 'B200', model: p.model || 'Qwen/Qwen3.5-9B', shape: p.shape || '1024/256' };
   };
   window.aqShape = (r) => `${r.input_len}/${r.output_len}`;
   window.aqShapeLabel = (s) => { const [i, o] = s.split('/'); return `${(+i).toLocaleString()} in, ${(+o).toLocaleString()} out`; };
@@ -182,38 +216,40 @@
   window.aqColor = (engines, e) => dash.colors[aqEngineOrder(engines).indexOf(e) % dash.colors.length];
   window.aqSelected = (rows) => {
     const s = aqSel();
-    return rows.filter((r) => r.model === s.model && aqShape(r) === s.shape);
+    return rows.filter((r) => (r.gpu || 'B200') === s.gpu && r.model === s.model && aqShape(r) === s.shape);
   };
 
   dash.calc('summary', {
     inputs: ['bench'],
     title: 'Headline comparison',
-    description: 'For the selected model and workload: peak output tokens/s, one-stream TPOT and TTFT, for the newest aqwenator build and for vLLM; cold start for aqwenator.',
+    description: 'For the selected hardware, model and workload: peak output tokens/s, ITL and TTFT p99 at 16 concurrent requests, one-stream TPOT, for the newest aqwenator build and for vLLM; cold start for aqwenator.',
     fn: (bench) => {
       const p = dash.params();
-      const model = p.model || 'Qwen/Qwen3.5-0.8B';
+      const gpu = p.gpu || 'B200';
+      const model = p.model || 'Qwen/Qwen3.5-9B';
       const shape = p.shape || '1024/256';
-      const rows = bench.filter((r) => r.model === model && `${r.input_len}/${r.output_len}` === shape);
+      const rows = bench.filter((r) => (r.gpu || 'B200') === gpu && r.model === model && `${r.input_len}/${r.output_len}` === shape);
       const aqDates = d3.rollups(rows.filter((r) => r.engine.startsWith('aqwenator')), (v) => d3.max(v, (r) => r.date), (r) => r.engine);
       const newest = aqDates.sort((a, b) => (a[1] < b[1] ? 1 : -1))[0]?.[0] ?? null;
       const aq = rows.filter((r) => r.engine === newest);
       const vl = rows.filter((r) => r.engine.startsWith('vLLM'));
       const pa = d3.greatest(aq, (r) => r.output_tok_s);
       const pv = d3.greatest(vl, (r) => r.output_tok_s);
-      const one = (a) => a.find((r) => +r.concurrency === 1);
-      const r1 = (x) => (x == null ? null : Math.round(x));
+      const at = (a, c) => a.find((r) => +r.concurrency === c);
+      const r0 = (x) => (x == null ? null : Math.round(x));
+      const r1 = (x) => (x == null ? null : Math.round(x * 10) / 10);
       const r2 = (x) => (x == null ? null : Math.round(x * 100) / 100);
       return [{
         aq_engine: newest,
-        aq_peak: r1(pa?.output_tok_s),
-        aq_peak_c: pa?.concurrency ?? null,
-        vllm_peak: r1(pv?.output_tok_s),
-        vllm_peak_c: pv?.concurrency ?? null,
+        aq_peak: r0(pa?.output_tok_s),
+        vllm_peak: r0(pv?.output_tok_s),
         ratio_pct: pa && pv ? Math.round((100 * pa.output_tok_s) / pv.output_tok_s) : null,
-        aq_tpot1: r2(one(aq)?.tpot_p50_ms),
-        vllm_tpot1: r2(one(vl)?.tpot_p50_ms),
-        aq_ttft1: r1(one(aq)?.ttft_p50_ms),
-        vllm_ttft1: r1(one(vl)?.ttft_p50_ms),
+        aq_itl16: r1(at(aq, 16)?.itl_p99_ms),
+        vllm_itl16: r1(at(vl, 16)?.itl_p99_ms),
+        aq_ttft16: r0(at(aq, 16)?.ttft_p99_ms),
+        vllm_ttft16: r0(at(vl, 16)?.ttft_p99_ms),
+        aq_tpot1: r2(at(aq, 1)?.tpot_p50_ms),
+        vllm_tpot1: r2(at(vl, 1)?.tpot_p50_ms),
         aq_cold: r2(d3.min(aq, (r) => r.cold_start_first_token_s)),
       }];
     },
@@ -232,10 +268,12 @@
   dash.draw('k-vllm-peak', summaryField('vllm_peak'));
   dash.draw('k-aq-tpot', summaryField('aq_tpot1'));
   dash.draw('k-vllm-tpot', summaryField('vllm_tpot1'));
-  dash.draw('k-aq-ttft', summaryField('aq_ttft1'));
-  dash.draw('k-vllm-ttft', summaryField('vllm_ttft1'));
+  dash.draw('k-aq-itl', summaryField('aq_itl16'));
+  dash.draw('k-vllm-itl', summaryField('vllm_itl16'));
+  dash.draw('k-aq-ttft', summaryField('aq_ttft16'));
+  dash.draw('k-vllm-ttft', summaryField('vllm_ttft16'));
   dash.draw('k-aq-cold', summaryField('aq_cold'));
-  dash.draw('t-model', (el) => { el.textContent = aqSel().model.replace('Qwen/', ''); });
+  dash.draw('t-model', (el) => { const s = aqSel(); el.textContent = `${s.model.replace('Qwen/', '')} (${s.gpu === 'GB10' ? 'DGX Spark' : s.gpu})`; });
   dash.draw('t-shape', (el) => { el.textContent = aqShapeLabel(aqSel().shape).replace('in,', 'prompt tokens and').replace(' out', ' output tokens'); });
   dash.draw('t-build', (el) => {
     const s = dash.data('summary');
@@ -243,13 +281,26 @@
   });
 
   // ---- selects
+  dash.draw('sel-gpu', (sel) => {
+    const b = dash.data('bench');
+    const gpus = b.status === 'ok' ? [...new Set(b.data.map((r) => r.gpu || 'B200'))].sort() : [];
+    sel.replaceChildren(...gpus.map((g) => new Option(g === 'GB10' ? 'DGX Spark (GB10)' : `NVIDIA ${g}`, g)));
+    sel.value = aqSel().gpu;
+    sel.onchange = () => {
+      const rows = b.data.filter((r) => (r.gpu || 'B200') === sel.value);
+      const models = [...new Set(rows.map((r) => r.model))];
+      const model = models.includes(aqSel().model) ? aqSel().model : models[0];
+      const shapes = [...new Set(rows.filter((r) => r.model === model).map(aqShape))];
+      dash.setParams({ gpu: sel.value, model, shape: shapes.includes(aqSel().shape) ? aqSel().shape : shapes[0] });
+    };
+  });
   dash.draw('sel-model', (sel) => {
     const b = dash.data('bench');
-    const models = b.status === 'ok' ? [...new Set(b.data.map((r) => r.model))].sort() : [];
+    const models = b.status === 'ok' ? [...new Set(b.data.filter((r) => (r.gpu || 'B200') === aqSel().gpu).map((r) => r.model))].sort() : [];
     sel.replaceChildren(...models.map((m) => new Option(m.replace('Qwen/', ''), m)));
     sel.value = aqSel().model;
     sel.onchange = () => {
-      const shapes = [...new Set(b.data.filter((r) => r.model === sel.value).map(aqShape))];
+      const shapes = [...new Set(b.data.filter((r) => (r.gpu || 'B200') === aqSel().gpu && r.model === sel.value).map(aqShape))];
       const keep = shapes.includes(aqSel().shape) ? aqSel().shape : shapes[0];
       dash.setParams({ model: sel.value, shape: keep });
     };
@@ -257,7 +308,7 @@
   dash.draw('sel-shape', (sel) => {
     const b = dash.data('bench');
     const m = aqSel().model;
-    const shapes = b.status === 'ok' ? [...new Set(b.data.filter((r) => r.model === m).map(aqShape))].sort((a, c) => +a.split('/')[0] - +c.split('/')[0]) : [];
+    const shapes = b.status === 'ok' ? [...new Set(b.data.filter((r) => (r.gpu || 'B200') === aqSel().gpu && r.model === m).map(aqShape))].sort((a, c) => +a.split('/')[0] - +c.split('/')[0]) : [];
     sel.replaceChildren(...shapes.map((s) => new Option(aqShapeLabel(s), s)));
     sel.value = aqSel().shape;
     sel.onchange = () => dash.setParams({ shape: sel.value });
@@ -279,12 +330,15 @@
   });
 
   // ---- line charts (concurrency on a log2 axis)
-  window.aqLineChart = (el, field, fmt) => {
-    const b = dash.data('bench');
+  window.aqLineChart = (el, field, fmt, opts = {}) => {
+    const src = opts.source || 'bench';
+    const xf = opts.x || 'concurrency';
+    const xlabel = opts.xlabel || 'concurrent requests';
+    const b = dash.data(src);
     el.replaceChildren();
     if (b.status === 'error') { el.textContent = 'Failed to load'; return; }
     if (b.status !== 'ok') { el.textContent = '—'; return; }
-    const rows = aqSelected(b.data).filter((r) => r[field] != null);
+    const rows = (opts.filter ? b.data.filter(opts.filter) : aqSelected(b.data)).filter((r) => r[field] != null).map((r) => ({ ...r, concurrency: r[xf] }));
     const engines = aqEngineOrder([...new Set(rows.map((r) => r.engine))]);
     if (!rows.length) { el.textContent = 'No runs for this selection.'; return; }
     const W = Math.max(280, el.clientWidth || 320), H = 260;
@@ -308,7 +362,7 @@
       .call(d3.axisLeft(y).tickValues(ticks).tickFormat(fmt).tickSize(-(W - m.left - m.right)))
       .call((g) => g.select('.domain').remove())
       .call((g) => g.selectAll('line').style('stroke', 'var(--cds-chart-grid)'));
-    svg.append('text').attr('x', W - m.right).attr('y', H - 2).attr('text-anchor', 'end').text('concurrent requests');
+    svg.append('text').attr('x', W - m.right).attr('y', H - 2).attr('text-anchor', 'end').text(xlabel);
     const line = d3.line().x((r) => x(+r.concurrency)).y((r) => y(+r[field]));
     const tip = document.createElement('div');
     tip.className = 'tip';
@@ -322,7 +376,7 @@
         .attr('cx', (r) => x(+r.concurrency)).attr('cy', (r) => y(+r[field])).attr('r', 3.5)
         .style('fill', color).style('stroke', 'var(--color-bg)').attr('stroke-width', 1.5)
         .on('pointerenter', (ev, r) => {
-          tip.textContent = `${r.engine} · c=${r.concurrency} · ${fmt(r[field])}`;
+          tip.textContent = `${r.engine} · ${opts.x ? 'agents' : 'c'}=${r.concurrency} · ${fmt(r[field])}`;
           tip.hidden = false;
           const px = x(+r.concurrency) / W * el.clientWidth, py = y(+r[field]) / H * el.clientHeight;
           tip.style.left = `${Math.min(px + 8, el.clientWidth - tip.offsetWidth - 4)}px`;
@@ -333,8 +387,26 @@
   };
   const fmtK = (v) => (v >= 1000 ? `${d3.format('.3~s')(v)}` : d3.format(',.0f')(v));
   dash.draw('chart-tput', (el) => aqLineChart(el, 'output_tok_s', fmtK));
-  dash.draw('chart-ttft', (el) => aqLineChart(el, 'ttft_p50_ms', (v) => d3.format(',.0f')(v)));
-  dash.draw('chart-tpot', (el) => aqLineChart(el, 'tpot_p50_ms', (v) => d3.format(',.1f')(v)));
+  dash.draw('chart-ttft', (el) => aqLineChart(el, 'ttft_p99_ms', (v) => d3.format(',.0f')(v)));
+  dash.draw('chart-tpot', (el) => aqLineChart(el, 'itl_p99_ms', (v) => d3.format(',.1f')(v)));
+
+  // ---- agentic charts
+  const agOpts = { source: 'agentic', x: 'agents', xlabel: 'concurrent agents', filter: () => true };
+  dash.draw('chart-agent-turns', (el) => aqLineChart(el, 'turns_per_min', (v) => d3.format(',.0f')(v), agOpts));
+  dash.draw('chart-agent-ttft', (el) => aqLineChart(el, 'ttft_p99_ms', (v) => d3.format(',.0f')(v), agOpts));
+  dash.draw('chart-agent-itl', (el) => aqLineChart(el, 'itl_p99_ms', (v) => d3.format(',.1f')(v), agOpts));
+  dash.draw('legend-agentic', (el) => {
+    const a = dash.data('agentic');
+    if (a.status !== 'ok') { el.replaceChildren(); return; }
+    const engines = aqEngineOrder([...new Set(a.data.map((r) => r.engine))]);
+    el.replaceChildren(...engines.map((e) => {
+      const s = document.createElement('span');
+      const i = document.createElement('i');
+      i.style.background = aqColor(engines, e);
+      s.append(i, document.createTextNode(e));
+      return s;
+    }));
+  });
 
   // ---- tables
   const td = (text, cls) => { const c = document.createElement('td'); c.textContent = text; if (cls) c.className = cls; return c; };
@@ -347,7 +419,7 @@
     tb.replaceChildren(...rows.map((r) => {
       const tr = document.createElement('tr');
       tr.append(td(r.engine), td(String(r.concurrency), 'n'), td(f0(r.output_tok_s), 'n'), td(f0(r.ttft_p50_ms), 'n'), td(f0(r.ttft_p99_ms), 'n'),
-        td(f2(r.tpot_p50_ms), 'n'), td(f2(r.itl_p99_ms), 'n'), td(r.run), td(r.date));
+        td(f0(r.ttft_p999_ms), 'n'), td(f2(r.tpot_p50_ms), 'n'), td(f2(r.itl_p99_ms), 'n'), td(f2(r.itl_p999_ms), 'n'), td(r.run), td(r.date));
       return tr;
     }));
   });
@@ -371,8 +443,8 @@
     const pct = (v) => (v == null ? '—' : `${d3.format('.2~f')(100 * v)}%`);
     tb.replaceChildren(...c.data.map((r) => {
       const tr = document.createElement('tr');
-      tr.append(td(r.model.replace('Qwen/', '')), td(String(r.prompt_tokens), 'n'), td(pct(r.worst_layer_rel_l2), 'n'), td(pct(r.logits_rel_l2), 'n'),
-        td(r.top5_match), td(r.greedy_match), td(r.batched_match), td(r.build));
+      tr.append(td(r.model.replace('Qwen/', '')), td(String(r.prompt_tokens), 'n'), td(r.teacher_forced_top1), td(String(r.real_misses), 'n'),
+        td(pct(r.worst_logits_rel_l2), 'n'), td(r.free_running), td(r.batched), td(r.session_resume), td(r.shared_prefix_fork), td(r.build));
       return tr;
     }));
   });

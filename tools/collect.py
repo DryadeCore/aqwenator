@@ -19,6 +19,9 @@ def num(x):
     return None if x is None or (isinstance(x, float) and x != x) else round(float(x), 3)
 
 
+GPU = os.environ.get("AQ_GPU_LABEL", "B200")
+
+
 def main():
     root = os.path.expanduser(sys.argv[1])
     rows = []
@@ -45,7 +48,7 @@ def main():
                 "itl_p999_ms": num(r.get("p99.9_itl_ms")),
                 "tpot_p99_ms": num(r.get("p99_tpot_ms")),
                 "run": tag,
-                "gpu": "B200",
+                "gpu": GPU,
                 "date": datetime.datetime.fromtimestamp(os.path.getmtime(f), datetime.UTC).strftime("%Y-%m-%dT%H:%MZ"),
             }
         )
@@ -70,7 +73,7 @@ def main():
                     "cold_start_loaded_s": num(r.get("cold_start_loaded_s")),
                     "cold_start_first_token_s": num(r.get("cold_start_first_token_s")),
                     "run": os.path.basename(f)[:-5],
-                    "gpu": "B200",
+                    "gpu": GPU,
                     "date": datetime.datetime.fromtimestamp(os.path.getmtime(f), datetime.UTC).strftime("%Y-%m-%dT%H:%MZ"),
                 }
             )
@@ -91,7 +94,7 @@ def main():
                 "ttft_p50_ms": num(r["ttft_ms"]["p50"]), "ttft_p99_ms": num(r["ttft_ms"]["p99"]),
                 "ttft_p999_ms": num(r["ttft_ms"]["p99.9"]), "itl_p50_ms": num(r["itl_ms"]["p50"]),
                 "itl_p99_ms": num(r["itl_ms"]["p99"]), "itl_p999_ms": num(r["itl_ms"]["p99.9"]),
-                "turns": r["turns"], "errors": r["errors"], "run": os.path.basename(os.path.dirname(f)),
+                "turns": r["turns"], "errors": r["errors"], "run": os.path.basename(os.path.dirname(f)), "gpu": GPU,
             })
         rows.sort(key=lambda r: (r["model"], r["engine"], r["agents"]))
     json.dump(rows, sys.stdout, indent=1)
