@@ -181,6 +181,9 @@ struct EngineOpts {
     mixed: Option<usize>,
     max_running: Option<usize>,
     session_cache: bool,
+    policy: aq_engine::engine::Policy,
+    max_snapshots: Option<usize>,
+    itl_target_ms: Option<f64>,
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -200,6 +203,12 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         eng.max_running = r;
     }
     eng.session_cache = opts.session_cache;
+    eng.policy = opts.policy;
+    if let Some(n) = opts.max_snapshots {
+        eng.max_snapshots = n;
+    }
+    eng.itl_target_us = opts.itl_target_ms.map(|m| m * 1000.0);
+    eprintln!("policy: {:?} max_snapshots {} itl_target_ms {:?}", eng.policy, eng.max_snapshots, opts.itl_target_ms);
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());
     let _ = ready.send(Ok(()));
@@ -228,8 +237,9 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {}",
-                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} (snapshot {}) deferred {}",
+                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions,
+                c.snapshot_evictions, c.deferred
             );
             last_report = Instant::now();
         }
@@ -280,7 +290,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, policy: Default::default(), max_snapshots: None, itl_target_ms: None };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
@@ -292,6 +302,19 @@ async fn main() -> Result<()> {
             "--mixed-prefill" => opts.mixed = Some(v.parse()?),
             "--max-running" => opts.max_running = Some(v.parse()?),
             "--session-cache" => opts.session_cache = v.parse()?,
+            "--evict" => {
+                opts.policy.evict = match v.as_str() {
+                    "lru" => aq_engine::engine::Evict::Lru,
+                    "mru" => aq_engine::engine::Evict::Mru,
+                    _ => anyhow::bail!("--evict lru|mru"),
+                }
+            }
+            "--pin-snapshots" => opts.policy.pin_snapshots = v.parse()?,
+            "--load-control" => opts.policy.load_control = v.parse()?,
+            "--srpt" => opts.policy.srpt = v.parse()?,
+            "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
+            "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
+            "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
             _ => anyhow::bail!("unknown option {k}"),
         }

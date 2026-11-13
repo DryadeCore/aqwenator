@@ -62,6 +62,38 @@ impl Seq {
     }
 }
 
+/// Which parked session to evict when pages or slots run out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evict {
+    /// Least recently parked first (classic LRU).
+    Lru,
+    /// Most recently parked first. With bounded tool think time, the session parked longest
+    /// ago is the one most likely to come back next, so LRU evicts exactly the wrong one.
+    Mru,
+}
+
+/// Memory and scheduling policy knobs (all default to the original behavior).
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    pub evict: Evict,
+    /// Never evict shared-prefix snapshots to make room (only `max_snapshots` replacement),
+    /// and do not create a snapshot identical to an existing one.
+    pub pin_snapshots: bool,
+    /// Working-set load control: a request that is not a cache hit may not evict parked
+    /// sessions; it waits for free pages unless nothing runs or it has waited `max_wait_ms`.
+    pub load_control: bool,
+    /// Shortest-remaining-uncached-work first, for admission and prefill chunk order, with
+    /// aging past `max_wait_ms`.
+    pub srpt: bool,
+    pub max_wait_ms: u64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self { evict: Evict::Lru, pin_snapshots: false, load_control: false, srpt: false, max_wait_ms: 2000 }
+    }
+}
+
 /// Recurrent state + KV pages at a shared prefix boundary (page aligned).
 struct Snapshot {
     tokens: Vec<u32>,
@@ -92,6 +124,8 @@ pub struct CacheStats {
     pub reused_tokens: u64,
     pub prefilled_tokens: u64,
     pub evictions: u64,
+    pub snapshot_evictions: u64,
+    pub deferred: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -106,7 +140,7 @@ pub struct StepStats {
 
 pub struct Engine {
     pub model: Model,
-    waiting: VecDeque<Request>,
+    waiting: VecDeque<(Request, Instant)>,
     running: Vec<Seq>,
     free_slots: Vec<u32>,
     free_blocks: Vec<u32>,
@@ -128,7 +162,21 @@ pub struct Engine {
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
     pub mixed_prefill_budget: usize,
+    pub policy: Policy,
+    /// Frame pacing: target duration of a step that carries decode tokens (µs).
+    pub itl_target_us: Option<f64>,
+    pace: Pace,
 }
+
+/// Online step-cost model for frame pacing.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    decode_us: f64,
+    prefill_us_per_tok: f64,
+}
+
+/// Smallest prefill chunk frame pacing will schedule next to decodes (keeps prefill moving).
+const PACE_MIN_CHUNK: usize = 256;
 
 impl Engine {
     pub fn new(model: Model, eos: Vec<u32>) -> Self {
@@ -150,6 +198,9 @@ impl Engine {
             session_cache: true,
             max_running: lim.max_seqs,
             mixed_prefill_budget: usize::MAX,
+            policy: Policy::default(),
+            itl_target_us: None,
+            pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
         }
     }
 
@@ -162,7 +213,7 @@ impl Engine {
         if req.prompt.is_empty() || req.prompt.len() + req.max_new_tokens > lim.max_ctx {
             bail!("request {} needs {} tokens of context (max {})", req.id, req.prompt.len() + req.max_new_tokens, lim.max_ctx);
         }
-        self.waiting.push_back(req);
+        self.waiting.push_back((req, Instant::now()));
         Ok(())
     }
 
@@ -189,24 +240,49 @@ impl Engine {
         }
     }
 
-    /// Drop the least-recently-used parked session (or, if none, the least-recently-used
-    /// snapshot), returning its slot and pages.
+    /// Evict one parked session chosen by the policy (or, if none and snapshots are not
+    /// pinned, the least-recently-used snapshot), returning its slot and pages.
     fn evict_lru(&mut self) -> bool {
-        if let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) {
+        let victim = match self.policy.evict {
+            Evict::Lru => (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used),
+            Evict::Mru => (0..self.parked.len()).max_by_key(|&i| self.parked[i].last_used),
+        };
+        if let Some(i) = victim {
             let p = self.parked.swap_remove(i);
             self.free_slots.push(p.slot);
             self.release(p.blocks);
             self.cache.evictions += 1;
             return true;
         }
+        if self.policy.pin_snapshots {
+            return false;
+        }
         if let Some(i) = (0..self.snapshots.len()).min_by_key(|&i| self.snapshots[i].last_used) {
             let sn = self.snapshots.swap_remove(i);
             self.free_slots.push(sn.slot);
             self.release(sn.blocks);
             self.cache.evictions += 1;
+            self.cache.snapshot_evictions += 1;
             return true;
         }
         false
+    }
+
+    /// Test hook: permanently remove up to `n` free pages from the pool (a smaller GPU).
+    pub fn withhold_pages(&mut self, n: usize) {
+        let keep = self.free_blocks.len() - n.min(self.free_blocks.len());
+        self.free_blocks.truncate(keep);
+    }
+
+    pub fn free_pages(&self) -> usize {
+        self.free_blocks.len()
+    }
+
+    /// Test hook: evict every parked session.
+    pub fn evict_all_parked(&mut self) {
+        while !self.parked.is_empty() {
+            self.evict_lru();
+        }
     }
 
     /// Take `n` free KV pages (refcount 1), evicting cached sessions as needed.
@@ -240,6 +316,13 @@ impl Engine {
 
     /// Take a snapshot of running sequence `i` at its current position (page aligned).
     fn snapshot(&mut self, i: usize) -> Result<()> {
+        if self.policy.pin_snapshots {
+            let s = &self.running[i];
+            let n = s.computed;
+            if self.snapshots.iter().any(|sn| sn.tokens.len() == n && (0..n).all(|k| sn.tokens[k] == s.token_at(k))) {
+                return Ok(());
+            }
+        }
         if self.snapshots.len() >= self.max_snapshots {
             if let Some(j) = (0..self.snapshots.len()).min_by_key(|&j| self.snapshots[j].last_used) {
                 let sn = self.snapshots.swap_remove(j);
@@ -263,32 +346,98 @@ impl Engine {
         Ok(())
     }
 
-    /// Admit the request at the head of the queue, resuming a parked session when one is a
-    /// strict prefix of its prompt. Returns false if resources are not available yet.
-    fn admit_one(&mut self) -> Result<bool> {
+    fn find_parked(&self, prompt: &[u32]) -> Option<usize> {
+        if !self.session_cache {
+            return None;
+        }
+        (0..self.parked.len())
+            .filter(|&i| {
+                let t = &self.parked[i].tokens;
+                t.len() < prompt.len() && prompt[..t.len()] == t[..]
+            })
+            .max_by_key(|&i| self.parked[i].tokens.len())
+    }
+
+    fn find_snapshot(&self, prompt: &[u32]) -> Option<usize> {
+        if !self.session_cache {
+            return None;
+        }
+        (0..self.snapshots.len())
+            .filter(|&i| {
+                let t = &self.snapshots[i].tokens;
+                t.len() < prompt.len() && prompt[..t.len()] == t[..]
+            })
+            .max_by_key(|&i| self.snapshots[i].tokens.len())
+    }
+
+    /// Tokens of `prompt` that already have state (parked session or snapshot).
+    fn cached_len(&self, prompt: &[u32]) -> usize {
+        let p = self.find_parked(prompt).map(|i| self.parked[i].tokens.len()).unwrap_or(0);
+        let s = self.find_snapshot(prompt).map(|i| self.snapshots[i].tokens.len()).unwrap_or(0);
+        p.max(s)
+    }
+
+    /// Admit waiting requests while there is room, per the policy.
+    fn admit(&mut self) -> Result<()> {
+        let cap = self.max_running.min(self.limits().max_seqs);
+        let pol = self.policy;
+        if !pol.load_control && !pol.srpt {
+            // Original behavior: strict FIFO, stop at the first request that does not fit.
+            while !self.waiting.is_empty() && self.running.len() < cap {
+                if !self.try_admit(0, true)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        let now = Instant::now();
+        let aged = |t: Instant| now.duration_since(t).as_millis() as u64 >= pol.max_wait_ms;
+        // Candidate order: aged requests first, then by remaining uncached work (SRPT) or FIFO.
+        let mut order: Vec<(bool, usize, usize, u64)> = self
+            .waiting
+            .iter()
+            .enumerate()
+            .map(|(i, (r, t))| {
+                let rem = if pol.srpt { r.prompt.len() - self.cached_len(&r.prompt) } else { 0 };
+                (!aged(*t), rem, i, r.id)
+            })
+            .collect();
+        order.sort();
+        for (not_aged, _, _, id) in order {
+            if self.running.len() >= cap {
+                break;
+            }
+            let Some(wi) = self.waiting.iter().position(|(r, _)| r.id == id) else { continue };
+            let hit = self.find_parked(&self.waiting[wi].0.prompt).is_some();
+            let allow_evict = !pol.load_control || hit || !not_aged || self.running.is_empty();
+            if !self.try_admit(wi, allow_evict)? {
+                self.cache.deferred += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit waiting request `wi`: resume a parked session that is a strict prefix of its
+    /// prompt, else fork a shared-prefix snapshot, else start fresh. With `allow_evict` false
+    /// it only uses free slots and pages. Returns false (changing nothing) when resources are
+    /// not available.
+    fn try_admit(&mut self, wi: usize, allow_evict: bool) -> Result<bool> {
         let bs = self.limits().block_size;
-        let req = self.waiting.front().unwrap();
+        let req = &self.waiting[wi].0;
         let need = (req.prompt.len() + req.max_new_tokens).div_ceil(bs);
-        let best = if self.session_cache {
-            (0..self.parked.len())
-                .filter(|&i| {
-                    let t = &self.parked[i].tokens;
-                    t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..]
-                })
-                .max_by_key(|&i| self.parked[i].tokens.len())
-        } else {
-            None
-        };
-        let fork = if best.is_none() && self.session_cache {
-            (0..self.snapshots.len())
-                .filter(|&i| {
-                    let t = &self.snapshots[i].tokens;
-                    t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..]
-                })
-                .max_by_key(|&i| self.snapshots[i].tokens.len())
-        } else {
-            None
-        };
+        let best = self.find_parked(&req.prompt);
+        let fork = if best.is_none() { self.find_snapshot(&req.prompt) } else { None };
+        if !allow_evict {
+            let have = match (best, fork) {
+                (Some(i), _) => self.parked[i].blocks.len().min(need),
+                (None, Some(i)) => self.snapshots[i].blocks.len().min(need),
+                _ => 0,
+            };
+            let slot_ok = best.is_some() || !self.free_slots.is_empty();
+            if !slot_ok || self.free_blocks.len() < need - have {
+                return Ok(false);
+            }
+        }
         let mut snapshot_at = None;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
@@ -300,10 +449,16 @@ impl Engine {
                     if !self.evict_lru() {
                         return Ok(false);
                     }
-                    self.free_slots.pop().unwrap()
+                    match self.free_slots.pop() {
+                        Some(s) => s,
+                        None => return Ok(false),
+                    }
                 }
             };
-            if let Some(i) = fork.filter(|&i| i < self.snapshots.len()) {
+            // Eviction may have removed or reordered snapshots: look the fork up again by
+            // content, never by a stale index.
+            let fork = if fork.is_some() { self.find_snapshot(&self.waiting[wi].0.prompt) } else { None };
+            if let Some(i) = fork {
                 // Fork from the shared-prefix snapshot: copy its state, share its pages.
                 let clock = self.clock;
                 let sn = &mut self.snapshots[i];
@@ -319,8 +474,7 @@ impl Engine {
             } else {
                 self.model.reset_slot(slot as usize)?;
                 if self.session_cache {
-                    let req = self.waiting.front().unwrap();
-                    let shared = self.shared_prefix(&req.prompt);
+                    let shared = self.shared_prefix(&self.waiting[wi].0.prompt);
                     if shared >= SNAPSHOT_MIN_TOKENS {
                         snapshot_at = Some(shared);
                     }
@@ -339,7 +493,7 @@ impl Engine {
                 // Not enough pages even after evicting everything parked: put the session
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
-                    let tokens = self.waiting.front().unwrap().prompt[..computed].to_vec();
+                    let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
                     self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock });
                 } else {
                     self.free_slots.push(slot);
@@ -348,7 +502,7 @@ impl Engine {
                 return Ok(false);
             }
         }
-        let req = self.waiting.pop_front().unwrap();
+        let (req, _) = self.waiting.remove(wi).unwrap();
         self.cache.admitted += 1;
         if computed > 0 {
             self.cache.hits += 1;
@@ -374,13 +528,9 @@ impl Engine {
         let lim = self.limits();
         let mut budget = lim.max_tokens;
 
-        // Admit waiting requests (FIFO) while there is room to run them.
+        // Admit waiting requests while there is room to run them.
         self.clock += 1;
-        while !self.waiting.is_empty() && self.running.len() < self.max_running.min(lim.max_seqs) {
-            if !self.admit_one()? {
-                break;
-            }
-        }
+        self.admit()?;
 
         // Decode first (1 token each), then prefill chunks in admission order.
         let mut plan: Vec<(usize, usize)> = Vec::new(); // (running index, n tokens)
@@ -393,12 +543,25 @@ impl Engine {
         let decode_seqs = plan.len();
         if decode_seqs > 0 {
             budget = budget.min(self.mixed_prefill_budget);
+            // Frame pacing: size the prefill part so the whole step fits the ITL target,
+            // from online estimates of the decode cost and the per-token prefill cost.
+            if let Some(target) = self.itl_target_us {
+                let room = target - self.pace.decode_us.min(target * 0.8);
+                let tokens = (room / self.pace.prefill_us_per_tok.max(1e-3)) as usize;
+                budget = budget.min(tokens.max(PACE_MIN_CHUNK));
+            }
         }
-        for (i, s) in self.running.iter().enumerate() {
+        // Prefill order: admission order, or shortest remaining prefill first (SRPT).
+        let mut prefill: Vec<usize> = (0..self.running.len()).filter(|&i| self.running[i].computed < self.running[i].req.prompt.len()).collect();
+        if self.policy.srpt {
+            prefill.sort_by_key(|&i| self.running[i].req.prompt.len() - self.running[i].computed);
+        }
+        for i in prefill {
+            let s = &self.running[i];
             if budget == 0 {
                 break;
             }
-            if s.computed < s.req.prompt.len() {
+            {
                 let mut n = (s.req.prompt.len() - s.computed).min(budget);
                 if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
                     n = n.min(at - s.computed);
@@ -439,6 +602,16 @@ impl Engine {
         let t1 = Instant::now();
         let toks = self.model.step(&b, None)?;
         let gpu_us = t1.elapsed().as_micros() as u64;
+        // Update the pacing model: pure-decode steps give the decode cost, mixed steps give
+        // the per-token prefill cost on top of it.
+        let prefill_tokens = b.tokens.len() - decode_seqs;
+        if prefill_tokens == 0 {
+            self.pace.decode_us = 0.9 * self.pace.decode_us + 0.1 * gpu_us as f64;
+        } else if prefill_tokens >= 64 {
+            let base = if decode_seqs > 0 { self.pace.decode_us } else { 0.0 };
+            let per = ((gpu_us as f64 - base).max(0.0)) / prefill_tokens as f64;
+            self.pace.prefill_us_per_tok = 0.8 * self.pace.prefill_us_per_tok + 0.2 * per;
+        }
 
         for &(i, n) in &plan {
             self.running[i].computed += n;
