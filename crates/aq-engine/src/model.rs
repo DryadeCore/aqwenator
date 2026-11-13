@@ -394,6 +394,24 @@ impl Model {
         Ok(())
     }
 
+    /// Copy one slot's recurrent state (DeltaNet + conv) into another, on the stream.
+    pub fn copy_slot(&mut self, dst: usize, src: usize) -> Result<()> {
+        let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;
+        let csz = self.cfg.conv_dim() * 3 * 2;
+        let st = self.gpu.stream.cu_stream();
+        for l in &self.layers {
+            if l.kind == LayerKind::Linear {
+                unsafe {
+                    cuda_core::memory::memcpy_dtod_async(l.delta_state + (dst * dsz) as u64, l.delta_state + (src * dsz) as u64, dsz, st)
+                        .map_err(de)?;
+                    cuda_core::memory::memcpy_dtod_async(l.conv_state + (dst * csz) as u64, l.conv_state + (src * csz) as u64, csz, st)
+                        .map_err(de)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convenience for a single sequence in slot 0 with an identity block table.
     pub fn single(&self, ids: &[u32], pos: usize) -> Batch {
         let n = ids.len() as u32;

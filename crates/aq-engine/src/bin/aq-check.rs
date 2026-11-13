@@ -237,6 +237,46 @@ fn main() -> Result<()> {
     println!("session cache: turn 2 resumed from {reused} cached tokens; {same}/{} tokens identical to a cold prefill", cold.len());
     failed |= reused == 0 || same != cold.len();
 
+    // ---- 5. shared-prefix snapshots: three prompts share a long prefix with different tails.
+    // The second one snapshots the prefix, the third forks from it; the third's tokens must
+    // match a cold engine's.
+    if ids.len() > 1100 {
+        let pre = (ids.len() - 64) / 16 * 16;
+        let tail = |k: u32| -> Vec<u32> { ids[..pre].iter().copied().chain(ids[pre..].iter().map(|&t| t ^ k)).collect() };
+        let prompts = [tail(0), tail(1), tail(2)];
+        let mut run_shared = |eng: &mut Engine, cached: bool| -> Result<Vec<u32>> {
+            eng.session_cache = cached;
+            let mut out = Vec::new();
+            for (k, p) in prompts.iter().enumerate() {
+                eng.add(Request { id: 200 + k as u64, prompt: p.clone(), max_new_tokens: 12, ignore_eos: true })?;
+                if k == 0 {
+                    // Let the first one get going so the second sees it as a known sequence.
+                    eng.step()?;
+                }
+            }
+            while eng.has_work() {
+                for e in eng.step()? {
+                    if e.id == 202 {
+                        out.push(e.token);
+                    }
+                }
+            }
+            Ok(out)
+        };
+        let before = eng.cache;
+        let warm = run_shared(&mut eng, true)?;
+        let after = eng.cache;
+        let cold = run_shared(&mut eng, false)?;
+        let same = warm.iter().zip(&cold).take_while(|(a, b)| a == b).count();
+        println!(
+            "shared prefix ({pre} tokens): {} snapshot(s), {} fork(s); forked request {same}/{} tokens identical to a cold prefill",
+            after.snapshots - before.snapshots,
+            after.forks - before.forks,
+            cold.len()
+        );
+        failed |= after.forks == before.forks || same != cold.len();
+    }
+
     if failed {
         anyhow::bail!("correctness check FAILED");
     }

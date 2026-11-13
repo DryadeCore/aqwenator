@@ -12,6 +12,13 @@
 //! resumes from it and prefills only the new suffix, which is exact: the state is the state
 //! after those tokens. Parked sessions are evicted least-recently-used when a new request
 //! needs their slot or pages.
+//!
+//! Shared prefixes: when a new request shares a long page-aligned prefix with a known sequence
+//! (e.g. the system prompt every agent starts with), its prefill pauses at that boundary and
+//! the engine snapshots the recurrent state into a spare slot, pinning the prefix's KV pages
+//! with reference counts. Later requests with that prefix fork from the snapshot: a state-slot
+//! copy plus shared read-only pages. Exact, because no sequence ever writes below its own
+//! `computed` position, so shared pages are never written.
 
 use crate::model::{Batch, Limits, Model};
 use anyhow::{Result, bail};
@@ -41,6 +48,8 @@ struct Seq {
     blocks: Vec<u32>,
     /// Tokens already fed through the model.
     computed: usize,
+    /// Pause prefill at this position and snapshot the state there (shared prefix).
+    snapshot_at: Option<usize>,
 }
 
 impl Seq {
@@ -52,6 +61,18 @@ impl Seq {
         if i < p { self.req.prompt[i] } else { self.out[i - p] }
     }
 }
+
+/// Recurrent state + KV pages at a shared prefix boundary (page aligned).
+struct Snapshot {
+    tokens: Vec<u32>,
+    slot: u32,
+    blocks: Vec<u32>,
+    last_used: u64,
+    forks: u64,
+}
+
+/// Shared prefixes shorter than this are not worth a snapshot slot.
+pub const SNAPSHOT_MIN_TOKENS: usize = 1024;
 
 /// A finished sequence kept for reuse.
 struct Parked {
@@ -66,6 +87,8 @@ struct Parked {
 pub struct CacheStats {
     pub admitted: u64,
     pub hits: u64,
+    pub forks: u64,
+    pub snapshots: u64,
     pub reused_tokens: u64,
     pub prefilled_tokens: u64,
     pub evictions: u64,
@@ -88,6 +111,11 @@ pub struct Engine {
     free_slots: Vec<u32>,
     free_blocks: Vec<u32>,
     parked: Vec<Parked>,
+    snapshots: Vec<Snapshot>,
+    /// Reference count per KV page (owners: running/parked sequences and snapshots).
+    refcnt: Vec<u32>,
+    /// Max snapshot slots kept at once.
+    pub max_snapshots: usize,
     clock: u64,
     eos: Vec<u32>,
     pub last: StepStats,
@@ -112,6 +140,9 @@ impl Engine {
             free_slots: (0..lim.max_seqs as u32).rev().collect(),
             free_blocks: (0..lim.num_blocks() as u32).rev().collect(),
             parked: Vec::new(),
+            snapshots: Vec::new(),
+            refcnt: vec![0; lim.num_blocks()],
+            max_snapshots: 4,
             clock: 0,
             eos,
             last: StepStats::default(),
@@ -147,24 +178,89 @@ impl Engine {
         self.parked.len()
     }
 
-    /// Drop the least-recently-used parked session, returning its slot and pages.
-    fn evict_lru(&mut self) -> bool {
-        let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) else { return false };
-        let p = self.parked.swap_remove(i);
-        self.free_slots.push(p.slot);
-        self.free_blocks.extend(p.blocks);
-        self.cache.evictions += 1;
-        true
+    /// Drop one owner reference to each page; pages with no owner left go back to the pool.
+    fn release(&mut self, blocks: Vec<u32>) {
+        for b in blocks {
+            let r = &mut self.refcnt[b as usize];
+            *r -= 1;
+            if *r == 0 {
+                self.free_blocks.push(b);
+            }
+        }
     }
 
-    /// Take `n` free KV pages, evicting parked sessions as needed.
+    /// Drop the least-recently-used parked session (or, if none, the least-recently-used
+    /// snapshot), returning its slot and pages.
+    fn evict_lru(&mut self) -> bool {
+        if let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) {
+            let p = self.parked.swap_remove(i);
+            self.free_slots.push(p.slot);
+            self.release(p.blocks);
+            self.cache.evictions += 1;
+            return true;
+        }
+        if let Some(i) = (0..self.snapshots.len()).min_by_key(|&i| self.snapshots[i].last_used) {
+            let sn = self.snapshots.swap_remove(i);
+            self.free_slots.push(sn.slot);
+            self.release(sn.blocks);
+            self.cache.evictions += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Take `n` free KV pages (refcount 1), evicting cached sessions as needed.
     fn take_blocks(&mut self, n: usize) -> Option<Vec<u32>> {
         while self.free_blocks.len() < n {
             if !self.evict_lru() {
                 return None;
             }
         }
-        Some(self.free_blocks.split_off(self.free_blocks.len() - n))
+        let out = self.free_blocks.split_off(self.free_blocks.len() - n);
+        for &b in &out {
+            self.refcnt[b as usize] = 1;
+        }
+        Some(out)
+    }
+
+    /// Longest page-aligned prefix that `prompt` shares with any running or parked sequence.
+    fn shared_prefix(&self, prompt: &[u32]) -> usize {
+        let bs = self.limits().block_size;
+        let lcp = |t: &mut dyn Iterator<Item = u32>| prompt.iter().zip(t).take_while(|(a, b)| **a == *b).count();
+        let mut best = 0;
+        for p in &self.parked {
+            best = best.max(lcp(&mut p.tokens.iter().copied()));
+        }
+        for s in &self.running {
+            best = best.max(lcp(&mut (0..s.known()).map(|k| s.token_at(k))));
+        }
+        // Keep at least one token to feed, and align down to a page.
+        (best.min(prompt.len().saturating_sub(1)) / bs) * bs
+    }
+
+    /// Take a snapshot of running sequence `i` at its current position (page aligned).
+    fn snapshot(&mut self, i: usize) -> Result<()> {
+        if self.snapshots.len() >= self.max_snapshots {
+            if let Some(j) = (0..self.snapshots.len()).min_by_key(|&j| self.snapshots[j].last_used) {
+                let sn = self.snapshots.swap_remove(j);
+                self.free_slots.push(sn.slot);
+                self.release(sn.blocks);
+            }
+        }
+        let Some(slot) = self.free_slots.pop() else { return Ok(()) };
+        let bs = self.limits().block_size;
+        let s = &self.running[i];
+        let n = s.computed;
+        let tokens: Vec<u32> = (0..n).map(|k| s.token_at(k)).collect();
+        let blocks: Vec<u32> = s.blocks[..n / bs].to_vec();
+        let src = s.slot as usize;
+        self.model.copy_slot(slot as usize, src)?;
+        for &b in &blocks {
+            self.refcnt[b as usize] += 1;
+        }
+        self.snapshots.push(Snapshot { tokens, slot, blocks, last_used: self.clock, forks: 0 });
+        self.cache.snapshots += 1;
+        Ok(())
     }
 
     /// Admit the request at the head of the queue, resuming a parked session when one is a
@@ -183,6 +279,17 @@ impl Engine {
         } else {
             None
         };
+        let fork = if best.is_none() && self.session_cache {
+            (0..self.snapshots.len())
+                .filter(|&i| {
+                    let t = &self.snapshots[i].tokens;
+                    t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..]
+                })
+                .max_by_key(|&i| self.snapshots[i].tokens.len())
+        } else {
+            None
+        };
+        let mut snapshot_at = None;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
             (p.slot, p.blocks, p.tokens.len())
@@ -196,11 +303,34 @@ impl Engine {
                     self.free_slots.pop().unwrap()
                 }
             };
-            self.model.reset_slot(slot as usize)?;
-            (slot, Vec::new(), 0)
+            if let Some(i) = fork.filter(|&i| i < self.snapshots.len()) {
+                // Fork from the shared-prefix snapshot: copy its state, share its pages.
+                let clock = self.clock;
+                let sn = &mut self.snapshots[i];
+                sn.last_used = clock;
+                sn.forks += 1;
+                let (src, blocks, n) = (sn.slot as usize, sn.blocks.clone(), sn.tokens.len());
+                self.model.copy_slot(slot as usize, src)?;
+                for &b in &blocks {
+                    self.refcnt[b as usize] += 1;
+                }
+                self.cache.forks += 1;
+                (slot, blocks, n)
+            } else {
+                self.model.reset_slot(slot as usize)?;
+                if self.session_cache {
+                    let req = self.waiting.front().unwrap();
+                    let shared = self.shared_prefix(&req.prompt);
+                    if shared >= SNAPSHOT_MIN_TOKENS {
+                        snapshot_at = Some(shared);
+                    }
+                }
+                (slot, Vec::new(), 0)
+            }
         };
         if blocks.len() > need {
-            self.free_blocks.extend(blocks.split_off(need));
+            let extra = blocks.split_off(need);
+            self.release(extra);
         }
         let more = need - blocks.len();
         match self.take_blocks(more) {
@@ -208,12 +338,12 @@ impl Engine {
             None => {
                 // Not enough pages even after evicting everything parked: put the session
                 // back (or release the fresh slot) and wait for running sequences to finish.
-                if computed > 0 {
+                if best.is_some() {
                     let tokens = self.waiting.front().unwrap().prompt[..computed].to_vec();
                     self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock });
                 } else {
                     self.free_slots.push(slot);
-                    self.free_blocks.extend(blocks);
+                    self.release(blocks);
                 }
                 return Ok(false);
             }
@@ -225,7 +355,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at });
         Ok(true)
     }
 
@@ -269,7 +399,10 @@ impl Engine {
                 break;
             }
             if s.computed < s.req.prompt.len() {
-                let n = (s.req.prompt.len() - s.computed).min(budget);
+                let mut n = (s.req.prompt.len() - s.computed).min(budget);
+                if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
+                    n = n.min(at - s.computed);
+                }
                 plan.push((i, n));
                 budget -= n;
             }
@@ -310,6 +443,12 @@ impl Engine {
         for &(i, n) in &plan {
             self.running[i].computed += n;
         }
+        for &(i, _) in &plan {
+            if self.running[i].snapshot_at == Some(self.running[i].computed) {
+                self.running[i].snapshot_at = None;
+                self.snapshot(i)?;
+            }
+        }
         let mut events = Vec::with_capacity(sampled.len());
         let mut done = Vec::new();
         for (&i, &tok) in sampled.iter().zip(&toks) {
@@ -329,7 +468,7 @@ impl Engine {
                 self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
             } else {
                 self.free_slots.push(s.slot);
-                self.free_blocks.extend(s.blocks);
+                self.release(s.blocks);
             }
         }
         self.last = StepStats {

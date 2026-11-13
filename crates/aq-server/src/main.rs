@@ -228,8 +228,8 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} reused {} prefilled {} evictions {}",
-                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.reused_tokens, c.prefilled_tokens, c.evictions
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {}",
+                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions
             );
             last_report = Instant::now();
         }
