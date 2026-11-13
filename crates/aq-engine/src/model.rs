@@ -623,6 +623,20 @@ impl Model {
         Ok(())
     }
 
+    /// Copy one KV page (every full-attention layer's K and V rows) into another, on the stream.
+    pub fn copy_page(&mut self, dst: usize, src: usize) -> Result<()> {
+        let psz = self.limits.block_size * self.cfg.num_key_value_heads * self.cfg.head_dim * 2;
+        let st = self.gpu.stream.cu_stream();
+        for l in &self.layers {
+            if l.kind == LayerKind::Full {
+                for base in [l.k_cache, l.v_cache] {
+                    unsafe { cuda_core::memory::memcpy_dtod_async(base + (dst * psz) as u64, base + (src * psz) as u64, psz, st) }.map_err(de)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Copy one slot's recurrent state (DeltaNet + conv) into another, on the stream.
     pub fn copy_slot(&mut self, dst: usize, src: usize) -> Result<()> {
         let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;

@@ -63,6 +63,10 @@ struct Seq {
     draft: Option<DraftIndex>,
     /// Turns served since this session last became resident (cache hits keep counting).
     turns: u32,
+    /// Session id: parked entries left by the same chain of turns share it.
+    sid: u64,
+    /// A prompt-end checkpoint was taken (or skipped) for this request.
+    ckpt_done: bool,
 }
 
 /// A prefill batch launched on lane 0 and not collected yet (co-execution). Sequences are
@@ -164,6 +168,7 @@ struct Parked {
     last_used: u64,
     parked_at: Instant,
     turns: u32,
+    sid: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -175,6 +180,7 @@ pub struct CacheStats {
     pub reused_tokens: u64,
     pub prefilled_tokens: u64,
     pub evictions: u64,
+    pub checkpoints: u64,
     pub snapshot_evictions: u64,
     pub deferred: u64,
     /// Scheduler host time (admission + batch building) and steps, cumulative.
@@ -250,6 +256,12 @@ pub struct Engine {
     /// (larger budget, pending-prefill threshold in tokens): switch mixed steps to the larger
     /// prefill budget while more than `threshold` admitted prompt tokens await prefill.
     pub mixed_prefill_adaptive: Option<(usize, usize)>,
+    /// Prompt-end checkpoints: when a request finishes its prompt, keep a copy of the state at
+    /// exactly that point (a parked entry sharing the prompt's KV pages). A later request that
+    /// extends the *prompt* then resumes from it even if it does not extend the tokens this
+    /// engine generated, which is what agent harnesses send: the previous prompt plus the
+    /// assistant turn as the chat template renders it.
+    pub prompt_checkpoints: bool,
     pub policy: Policy,
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
     pub itl_target_us: Option<f64>,
@@ -300,6 +312,7 @@ impl Engine {
             ),
             last_decode: None,
             mixed_prefill_adaptive: None,
+            prompt_checkpoints: std::env::var("AQ_NO_CKPT").is_err(),
             policy: Policy::default(),
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
@@ -509,6 +522,62 @@ impl Engine {
         (best.min(prompt.len().saturating_sub(1)) / bs) * bs
     }
 
+    /// Prompt-end checkpoint of running sequence `i`, whose state is exactly the state after
+    /// its prompt: a parked entry with a copy of the state and shared references to the
+    /// prompt's KV pages. The last page may be partly filled; whoever resumes from a shared
+    /// partial page copies it first (see `try_admit`), so the two owners never write the same
+    /// page. Skipped when no state slot is free.
+    fn checkpoint(&mut self, i: usize) -> Result<()> {
+        self.running[i].ckpt_done = true;
+        if !self.session_cache || !self.prompt_checkpoints {
+            return Ok(());
+        }
+        let Some(slot) = self.free_slots.pop() else { return Ok(()) };
+        let bs = self.limits().block_size;
+        let s = &self.running[i];
+        let n = s.computed;
+        let blocks: Vec<u32> = s.blocks[..n.div_ceil(bs)].to_vec();
+        let (src, sid, turns) = (s.slot as usize, s.sid, s.turns);
+        let tokens = s.req.prompt.clone();
+        self.model.copy_slot(slot as usize, src)?;
+        for &b in &blocks {
+            self.refcnt[b as usize] += 1;
+        }
+        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
+        self.cache.checkpoints += 1;
+        Ok(())
+    }
+
+    /// Take checkpoints and shared-prefix snapshots that became due for these running sequences.
+    fn after_step(&mut self, idx: impl Iterator<Item = usize>) -> Result<()> {
+        for i in idx {
+            let s = &self.running[i];
+            if s.snapshot_at == Some(s.computed) {
+                self.running[i].snapshot_at = None;
+                self.snapshot(i)?;
+            }
+            let s = &self.running[i];
+            if !s.ckpt_done && s.computed == s.req.prompt.len() {
+                self.checkpoint(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop every parked entry of session `sid` (stale once one of them has been resumed).
+    fn drop_session(&mut self, sid: u64) {
+        let mut k = 0;
+        while k < self.parked.len() {
+            if self.parked[k].sid == sid {
+                let p = self.parked.swap_remove(k);
+                self.free_slots.push(p.slot);
+                self.release(p.blocks);
+            } else {
+                k += 1;
+            }
+        }
+    }
+
     /// Take a snapshot of running sequence `i` at its current position (page aligned).
     fn snapshot(&mut self, i: usize) -> Result<()> {
         if self.policy.pin_snapshots {
@@ -644,16 +713,38 @@ impl Engine {
                 slots += 1;
             }
             let slot_ok = best.is_some() || slots > 0;
-            if !slot_ok || avail < need - have {
+            // One more page if the resumed entry ends inside a shared page (copied below).
+            let cow = match best {
+                Some(i) => {
+                    let p = &self.parked[i];
+                    let n = p.tokens.len();
+                    (n % bs != 0 && self.refcnt[p.blocks[n / bs] as usize] > 1) as usize
+                }
+                None => 0,
+            };
+            if !slot_ok || avail < need - have + cow {
+                return Ok(false);
+            }
+        }
+        if best.is_none() && fork.is_none() && self.session_cache {
+            // A running sequence is about to snapshot the prefix this request shares with it:
+            // wait for that snapshot and fork it, rather than prefill the same prefix again
+            // (agents that start together would otherwise each compute the system prompt).
+            let shared = self.shared_prefix(&self.waiting[wi].0.prompt);
+            if shared >= SNAPSHOT_MIN_TOKENS && self.running.iter().any(|s| s.snapshot_at == Some(shared)) {
                 return Ok(false);
             }
         }
         let mut snapshot_at = None;
         let mut forked = false;
         let mut resident_turns = 0;
+        let mut sid = self.waiting[wi].0.id;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
             resident_turns = p.turns;
+            sid = p.sid;
+            // The session's other entries (its checkpoint or its generation end) are stale now.
+            self.drop_session(sid);
             (p.slot, p.blocks, p.tokens.len())
         } else {
             let slot = match self.free_slots.pop() {
@@ -699,15 +790,26 @@ impl Engine {
             let extra = blocks.split_off(need);
             self.release(extra);
         }
-        let more = need - blocks.len();
+        // Copy-on-write: the sequence will write the rest of the page that holds position
+        // `computed`. If another owner still references that page, continue on a private copy.
+        let cow = computed % bs != 0 && self.refcnt[blocks[computed / bs] as usize] > 1;
+        let more = need - blocks.len() + cow as usize;
         match self.take_blocks(more) {
-            Some(b) => blocks.extend(b),
+            Some(mut b) => {
+                if cow {
+                    let fresh = b.pop().unwrap();
+                    let old = std::mem::replace(&mut blocks[computed / bs], fresh);
+                    self.model.copy_page(fresh as usize, old as usize)?;
+                    self.release(vec![old]);
+                }
+                blocks.extend(b)
+            }
             None => {
                 // Not enough pages even after evicting everything parked: put the session
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
                     let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
-                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns });
+                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns, sid });
                 } else {
                     self.free_slots.push(slot);
                     self.release(blocks);
@@ -725,7 +827,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_done: false });
         Ok(true)
     }
 
@@ -820,7 +922,7 @@ impl Engine {
                 let keep = s.computed.div_ceil(bs).min(s.blocks.len());
                 let extra = s.blocks.split_off(keep);
                 self.release(extra);
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now(), turns: s.turns + 1 });
+                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now(), turns: s.turns + 1, sid: s.sid });
             } else {
                 self.free_slots.push(s.slot);
                 self.release(s.blocks);
@@ -950,11 +1052,9 @@ impl Engine {
             let i = self.index_of(id);
             self.running[i].computed += n;
             self.running[i].in_prefill = false;
-            if self.running[i].snapshot_at == Some(self.running[i].computed) {
-                self.running[i].snapshot_at = None;
-                self.snapshot(i)?;
-            }
         }
+        let idx: Vec<usize> = inf.plan.iter().map(|&(id, _)| self.index_of(id)).collect();
+        self.after_step(idx.into_iter())?;
         let sampled: Vec<usize> = inf.sampled.iter().map(|&id| self.index_of(id)).collect();
         let mut done = self.apply_sampled(&sampled, &toks, events);
         done.extend(inf.plan.iter().map(|&(id, _)| self.index_of(id)).filter(|&i| self.running[i].cancelled));
@@ -1180,12 +1280,7 @@ impl Engine {
             }
         }
         self.spec = st;
-        for &(i, _) in &plan {
-            if self.running[i].snapshot_at == Some(self.running[i].computed) {
-                self.running[i].snapshot_at = None;
-                self.snapshot(i)?;
-            }
-        }
+        self.after_step(plan.iter().map(|&(i, _)| i))?;
         self.retire(done);
         self.last = StepStats {
             tokens: b.tokens.len(),

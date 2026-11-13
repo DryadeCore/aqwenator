@@ -308,6 +308,71 @@ fn main() -> Result<()> {
     println!("session cache: turn 2 resumed from {reused} cached tokens; {same}/{} tokens identical to a cold prefill", cold.len());
     failed |= reused == 0 || same != cold.len();
 
+    // ---- 4b. prompt-end checkpoint: a request that extends the previous *prompt* with tokens
+    // other than the ones this engine generated (what a chat template re-render does) must
+    // resume from the checkpoint taken at the end of that prompt, and match a cold engine.
+    {
+        let turn2: Vec<u32> = ids.iter().copied().chain(ids[..ids.len().min(41)].iter().map(|&t| t ^ 5)).collect();
+        // `overlap`: the second request arrives while the first is still generating, so the
+        // checkpoint's last (partly filled) page is shared with a running sequence and must be
+        // copied before the second request writes to it.
+        let run = |eng: &mut Engine, cached: bool, overlap: bool| -> Result<(Vec<Vec<u32>>, u64)> {
+            eng.session_cache = cached;
+            eng.clear_cache();
+            let before = eng.cache.reused_tokens;
+            let mut out = vec![Vec::new(); 2];
+            eng.add(Request { id: 110, prompt: ids.clone(), max_new_tokens: 24, ignore_eos: true })?;
+            let mut added = false;
+            while eng.has_work() || !added {
+                for e in eng.step()? {
+                    out[(e.id - 110) as usize].push(e.token);
+                }
+                let first_done = out[0].len() >= if overlap { 3 } else { 24 };
+                if !added && first_done {
+                    eng.add(Request { id: 111, prompt: turn2.clone(), max_new_tokens: 16, ignore_eos: true })?;
+                    added = true;
+                }
+            }
+            Ok((out, eng.cache.reused_tokens - before))
+        };
+        for overlap in [false, true] {
+            let (warm, reused) = run(&mut eng, true, overlap)?;
+            let (cold, _) = run(&mut eng, false, overlap)?;
+            let mut ok = reused == ids.len() as u64;
+            let mut same_total = 0;
+            for k in 0..2 {
+                let same = warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
+                same_total += same;
+                if same == cold[k].len() && warm[k].len() == cold[k].len() {
+                    continue;
+                }
+                // Resuming changes how the prompt is chunked, which may flip a near-tie:
+                // classify the divergence by the cold logits' top-2 margin at that position.
+                let base = if k == 0 { &ids } else { &turn2 };
+                let p: Vec<u32> = base.iter().chain(&cold[k][..same]).copied().collect();
+                eng.clear_cache();
+                eng.add(Request { id: 119, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+                while eng.has_work() {
+                    eng.step()?;
+                }
+                let (_, a, b) = top2(&eng.model.logits()?);
+                if a - b < NEAR_TIE {
+                    println!("  checkpoint turn {}: identical for {same} tokens, then diverges at a near-tie (margin {:.3}): ok", k + 1, a - b);
+                } else {
+                    ok = false;
+                    println!("  checkpoint turn {}: diverges after {same} tokens where the margin is {:.3}: REAL MISMATCH", k + 1, a - b);
+                }
+            }
+            println!(
+                "prompt checkpoint{}: turn 2 resumed from {reused} of {} prompt tokens; {same_total}/40 tokens identical to a cold engine",
+                if overlap { " (first turn still running)" } else { "" },
+                ids.len()
+            );
+            failed |= !ok;
+        }
+        eng.session_cache = true;
+    }
+
     // ---- 5. shared-prefix snapshots: three prompts share a long prefix with different tails.
     // The second one snapshots the prefix, the third forks from it; the third's tokens must
     // match a cold engine's.
