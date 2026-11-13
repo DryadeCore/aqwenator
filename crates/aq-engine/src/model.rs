@@ -111,8 +111,17 @@ const GDN_TC_SCAN_VB: u32 = 32;
 pub const ATTN_QTILE: usize = 16;
 /// Blocks per row in the two-phase argmax.
 pub const ARGMAX_PARTS: usize = 32;
+/// Capacity of the split-K partials in (row x slice) units: one row per sequence with up to
+/// `MAX_ATTN_SPLITS` slices, or up to `MAX_DECODE_ROWS_PER_SEQ` rows per sequence with
+/// row-local slicing (at most `ROW_LOCAL_SPLITS` slices).
+fn attn_part_rows(max_seqs: usize) -> usize {
+    max_seqs * MAX_ATTN_SPLITS.max(MAX_DECODE_ROWS_PER_SEQ * ROW_LOCAL_SPLITS)
+}
+
 /// Max tokens one decode-path sequence may feed in a step (speculative verification).
 pub const MAX_DECODE_ROWS_PER_SEQ: usize = 9;
+/// Max slices per row with row-local (fixed) decode-attention slicing (must match the kernel).
+pub const ROW_LOCAL_SPLITS: usize = 32;
 /// Upper bound on split-K slices for decode attention.
 pub const MAX_ATTN_SPLITS: usize = 128;
 
@@ -358,8 +367,8 @@ impl Model {
         let s = Scratch {
             amax_v: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
             amax_i: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
-            attn_part: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * cfg.head_dim * 4)?,
-            attn_ml: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * 2 * 4)?,
+            attn_part: gpu.alloc(attn_part_rows(sq) * hq * cfg.head_dim * 4)?,
+            attn_ml: gpu.alloc(attn_part_rows(sq) * hq * 2 * 4)?,
             chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
             chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
             seq_chunk0: gpu.alloc(sq * 4)?,
@@ -611,7 +620,8 @@ impl Model {
         // Every row runs through attention (padding rows read only the dummy page), and the
         // slice count is rounded up so a few graphs cover all context lengths.
         self.cur_nd_rows = rows;
-        self.cur_splits = self.cur_splits.next_power_of_two().min(MAX_ATTN_SPLITS);
+        self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
+        anyhow::ensure!(rows * self.cur_splits <= attn_part_rows(lim.max_seqs), "decode attention partials overflow");
         let key = (bucket * 1000 + w * 10 + 1, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
         if let Some((exec, _)) = self.graphs.get(&key) {
             self.gpu.launch_graph(*exec)?;
@@ -664,15 +674,29 @@ impl Model {
         let max_ctx_rows = if nd == 0 { 0 } else { b.tok_pos[..nd].iter().copied().max().unwrap_or(0) as usize + 1 };
         self.cur_splits = if nd == 0 {
             1
-        } else if self.attn_split_keys > 0 && max_ctx_rows.div_ceil(self.attn_split_keys) <= MAX_ATTN_SPLITS {
-            // Fixed-size slices: a row's result is independent of the other rows.
+        } else if self.attn_split_keys > 0 {
+            // Row-local slice size (see attn_decode_split): a row's result is independent of
+            // the other rows. Slices needed = max over rows of ceil(len / slice(len)) <= 32.
             self.cur_split_keys = self.attn_split_keys as u32;
-            max_ctx_rows.div_ceil(self.attn_split_keys)
+            b.tok_pos[..nd]
+                .iter()
+                .map(|&p| {
+                    let n = p as usize + 1;
+                    n.div_ceil(self.attn_split_keys.max(n.div_ceil(ROW_LOCAL_SPLITS)))
+                })
+                .max()
+                .unwrap_or(1)
         } else {
             let max_ctx = max_ctx_rows;
             let fill = (self.attn_fill * self.num_sms).div_ceil(nd * self.cfg.num_key_value_heads);
-            fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS)
+            let cap = (attn_part_rows(self.limits.max_seqs) / nd).max(1);
+            fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS).min(cap)
         };
+        anyhow::ensure!(
+            nd * self.cur_splits <= attn_part_rows(self.limits.max_seqs),
+            "decode attention partials overflow ({nd} rows x {} slices)",
+            self.cur_splits
+        );
         let (s, g) = (&self.s, &self.gpu);
         if !cs.is_empty() {
             g.upload(s.chunk_start, &cs)?;

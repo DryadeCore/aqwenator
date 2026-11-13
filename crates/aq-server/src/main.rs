@@ -204,7 +204,7 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
     eng.spec_k = opts.spec_k;
     if opts.spec_k > 0 {
         // Fixed decode-attention slices keep speculative and plain decoding numerically aligned.
-        eng.model.attn_split_keys = 256;
+        eng.model.attn_split_keys = 64;
     }
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());

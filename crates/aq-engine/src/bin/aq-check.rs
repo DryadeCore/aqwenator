@@ -298,7 +298,7 @@ fn main() -> Result<()> {
         let saved = (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m);
         eng.session_cache = false;
         eng.clear_cache();
-        eng.model.attn_split_keys = 256;
+        eng.model.attn_split_keys = 64;
         // One GEMM plan for every decode-sized GEMM: rows then compute identically whatever
         // else shares the GEMM, so speculative and plain decoding must match bit for bit.
         // With a small step budget, prefill and decode share steps; pin every GEMM to the full

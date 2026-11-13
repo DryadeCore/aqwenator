@@ -536,9 +536,14 @@ pub mod kernels {
         let group = h / hkv;
         let head = kvh * group + w;
         let n_keys = unsafe { *tok_pos.add(t) } as usize + 1;
-        // split_keys > 0: fixed slice size, so a row's result does not depend on the other
+        // split_keys > 0: the slice size depends only on this row's length,
+        // max(split_keys, ceil(n_keys / 32)), so a row's result does not depend on the other
         // rows of the batch (empty trailing slices contribute exactly nothing to the merge).
-        let chunk = if split_keys > 0 { split_keys as usize } else { n_keys.div_ceil(n_splits) };
+        let chunk = if split_keys > 0 {
+            (split_keys as usize).max(n_keys.div_ceil(32))
+        } else {
+            n_keys.div_ceil(n_splits)
+        };
         let k0 = split * chunk;
         let k1 = (k0 + chunk).min(n_keys);
         let bs = block_size as usize;

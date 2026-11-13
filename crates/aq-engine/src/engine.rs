@@ -221,6 +221,16 @@ impl Engine {
         }
     }
 
+    /// Drop the least-recently-used parked session only (never a snapshot).
+    fn evict_lru_parked(&mut self) -> bool {
+        let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) else { return false };
+        let p = self.parked.swap_remove(i);
+        self.free_slots.push(p.slot);
+        self.release(p.blocks);
+        self.cache.evictions += 1;
+        true
+    }
+
     /// Drop the least-recently-used parked session (or, if none, the least-recently-used
     /// snapshot), returning its slot and pages.
     fn evict_lru(&mut self) -> bool {
@@ -458,9 +468,15 @@ impl Engine {
                 }
             }
             if !d.is_empty() && self.running[i].spare.is_none() {
-                // A spare slot for the speculative state, only if one is free: speculation is
-                // opportunistic and never evicts cached sessions or snapshots.
-                self.running[i].spare = self.free_slots.pop();
+                // A spare slot for the speculative state: a free one, else the least-recently
+                // used parked session's (never a shared-prefix snapshot's).
+                let slot = match self.free_slots.pop() {
+                    Some(x) => Some(x),
+                    None => {
+                        if self.evict_lru_parked() { self.free_slots.pop() } else { None }
+                    }
+                };
+                self.running[i].spare = slot;
             }
             if self.running[i].spare.is_none() {
                 d.clear();
