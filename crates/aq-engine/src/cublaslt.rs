@@ -136,7 +136,7 @@ impl CublasLt {
                     cublasLtMatmulPreferenceSetAttribute(pref, PREF_MAX_WORKSPACE_BYTES, (&ws as *const u64).cast(), 8),
                     "pref ws",
                 )?;
-                const CANDIDATES: usize = 8;
+                const CANDIDATES: usize = 32;
                 let mut res = [std::mem::zeroed::<HeuristicResult>(); CANDIDATES];
                 let mut got = 0;
                 check(

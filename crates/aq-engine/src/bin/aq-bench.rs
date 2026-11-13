@@ -24,6 +24,7 @@ struct Args {
     num_prompts: Option<usize>,
     max_seqs: usize,
     max_tokens: usize,
+    mixed_prefill: Option<usize>,
     out: Option<String>,
 }
 
@@ -38,6 +39,7 @@ fn parse() -> Result<Args> {
         num_prompts: None,
         max_seqs: 64,
         max_tokens: 8192,
+        mixed_prefill: None,
         out: None,
     };
     while let Some(k) = it.next() {
@@ -50,6 +52,7 @@ fn parse() -> Result<Args> {
             "--max-seqs" => a.max_seqs = v.parse()?,
             "--max-tokens" => a.max_tokens = v.parse()?,
             "--out" => a.out = Some(v),
+            "--mixed-prefill" => a.mixed_prefill = Some(v.parse()?),
             _ => anyhow::bail!("unknown option {k}"),
         }
     }
@@ -95,6 +98,9 @@ fn main() -> Result<()> {
     let load = (model.load.open_s, model.load.upload_s, model.load.weight_bytes);
     let vocab = model.cfg.vocab_size as u64;
     let mut eng = Engine::new(model, vec![]);
+    if let Some(m) = a.mixed_prefill {
+        eng.mixed_prefill_budget = m;
+    }
 
     // Cold start: first token of a short request right after load (includes module load,
     // cuBLASLt plan creation, first-touch of every kernel).
@@ -172,6 +178,7 @@ fn main() -> Result<()> {
             "concurrency": c,
             "num_prompts": n,
             "max_tokens_per_step": a.max_tokens,
+            "mixed_prefill_budget": a.mixed_prefill,
             "duration_s": dur,
             "output_throughput": out_tokens as f64 / dur,
             "total_token_throughput": (out_tokens + n * a.input_len) as f64 / dur,

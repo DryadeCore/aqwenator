@@ -64,6 +64,10 @@ pub struct Engine {
     free_blocks: Vec<u32>,
     eos: Vec<u32>,
     pub last: StepStats,
+    /// Max prefill tokens in a step that also carries decode tokens. Bounds how long a running
+    /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
+    /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
+    pub mixed_prefill_budget: usize,
 }
 
 impl Engine {
@@ -77,6 +81,7 @@ impl Engine {
             free_blocks: (0..lim.num_blocks() as u32).rev().collect(),
             eos,
             last: StepStats::default(),
+            mixed_prefill_budget: usize::MAX,
         }
     }
 
@@ -133,6 +138,9 @@ impl Engine {
             }
         }
         let decode_seqs = plan.len();
+        if decode_seqs > 0 {
+            budget = budget.min(self.mixed_prefill_budget);
+        }
         for (i, s) in self.running.iter().enumerate() {
             if budget == 0 {
                 break;

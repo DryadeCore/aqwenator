@@ -1,13 +1,23 @@
-//! Correctness check against transformers reference activations (tools/golden.py).
+//! Correctness check against transformers reference data (tools/golden.py).
 //!
 //!     aq-check <model id or dir> <golden.safetensors>
 //!
-//! Compares the residual stream after every layer, the final logits, and 32 greedy tokens.
+//! 1. Per-layer residual stream after prefill (when the golden has `hidden.*`).
+//! 2. Teacher-forced logits: prefill the prompt, then feed the reference's greedy tokens one at
+//!    a time through the decode path and compare every logits row with the reference. A top-1
+//!    disagreement counts as a near-tie when the reference's own top-2 margin is below 0.25
+//!    (one bf16 ulp at typical logit magnitudes is ~0.06-0.125); anything else is a real miss.
+//! 3. Free-running greedy tokens, single sequence and 3 sequences batched through the scheduler.
+//!
+//! Exit status is non-zero on any real miss.
 
 use anyhow::{Context, Result};
+use aq_engine::engine::{Engine, Request};
 use aq_engine::model::{Limits, Model};
 use aq_engine::weights::resolve_model;
 use std::time::Instant;
+
+const NEAR_TIE: f32 = 0.25;
 
 fn rel_err(a: &[f32], b: &[f32]) -> (f64, f64) {
     let mut num = 0f64;
@@ -22,11 +32,18 @@ fn rel_err(a: &[f32], b: &[f32]) -> (f64, f64) {
     ((num / den.max(1e-30)).sqrt(), max)
 }
 
-fn top_k(x: &[f32], k: usize) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..x.len()).collect();
-    idx.sort_by(|&a, &b| x[b].total_cmp(&x[a]));
-    idx.truncate(k);
-    idx
+fn top2(x: &[f32]) -> (usize, f32, f32) {
+    let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &v) in x.iter().enumerate() {
+        if v > v1 {
+            v2 = v1;
+            v1 = v;
+            i1 = i;
+        } else if v > v2 {
+            v2 = v;
+        }
+    }
+    (i1, v1, v2)
 }
 
 fn main() -> Result<()> {
@@ -34,17 +51,6 @@ fn main() -> Result<()> {
     let model_spec = args.get(1).context("usage: aq-check <model> <golden.safetensors>")?;
     let golden_path = args.get(2).context("usage: aq-check <model> <golden.safetensors>")?;
     let dir = resolve_model(model_spec)?;
-
-    let t0 = Instant::now();
-    let mut m = Model::load(&dir, Limits { max_tokens: 2048, max_seqs: 4, max_ctx: 4096, block_size: 16 })?;
-    println!(
-        "load: {:.2}s total (open {:.3}s, upload {:.2}s), {:.2} GiB on device",
-        t0.elapsed().as_secs_f64(),
-        m.load.open_s,
-        m.load.upload_s,
-        m.load.weight_bytes as f64 / (1u64 << 30) as f64
-    );
-    println!("state per sequence: {:.1} MiB", m.cfg.state_bytes_per_seq() as f64 / (1 << 20) as f64);
 
     let gbytes = std::fs::read(golden_path)?;
     let g = safetensors::SafeTensors::deserialize(&gbytes)?;
@@ -58,64 +64,144 @@ fn main() -> Result<()> {
     };
     let ids = as_u32("input_ids")?;
     let greedy_ref = as_u32("greedy_ids")?;
-    let n_layers = m.cfg.num_hidden_layers;
+    let has_hidden = g.names().iter().any(|n| n.starts_with("hidden."));
+    let has_tf = g.names().contains(&"tf_logits");
 
+    let ctx = (ids.len() + greedy_ref.len() + 64).next_multiple_of(256);
+    let t0 = Instant::now();
+    let mut m = Model::load(&dir, Limits { max_tokens: 8192, max_seqs: 4, max_ctx: ctx, block_size: 16 })?;
+    println!(
+        "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
+        t0.elapsed().as_secs_f64(),
+        m.load.weight_bytes as f64 / (1u64 << 30) as f64,
+        ids.len(),
+        greedy_ref.len()
+    );
+    let n_layers = m.cfg.num_hidden_layers;
+    let vocab = m.cfg.vocab_size;
+    let mut failed = false;
+
+    // ---- 1. prefill (chunked by the step budget) + per-layer comparison
     m.reset_slot(0)?;
     let mut dump = Vec::new();
-    let t1 = Instant::now();
-    let first = m.step(&m.single(&ids, 0), Some(&mut dump))?[0];
-    println!("prefill {} tokens (with dumps): {:.1} ms", ids.len(), t1.elapsed().as_secs_f64() * 1e3);
-
-    let mut worst = 0f64;
-    for (l, ours) in dump.iter().enumerate() {
-        let name = format!("hidden.{}", l + 1);
-        // HF's last hidden_states entry is post final norm; compare it separately.
-        if l + 1 == n_layers {
-            break;
-        }
-        let refv = as_f32(&name)?;
-        let (rel, max) = rel_err(ours, &refv);
-        worst = worst.max(rel);
-        println!("layer {l:3} ({:?}) rel_l2 {rel:.2e} max_abs {max:.3e}", m.layers[l].kind);
+    let mut pos = 0;
+    let mut first = 0;
+    while pos < ids.len() {
+        let n = (ids.len() - pos).min(8192);
+        let want_dump = has_hidden && n == ids.len();
+        first = m.step(&m.single(&ids[pos..pos + n], pos), if want_dump { Some(&mut dump) } else { None })?[0];
+        pos += n;
     }
-    let last_ref = as_f32(&format!("hidden.{n_layers}"))?;
-    let (rel_pre, _) = rel_err(&dump[n_layers - 1], &last_ref);
-    let n = ids.len();
-    let hd = m.cfg.hidden_size;
-    let (rel_post, _) = rel_err(&m.final_hidden()?, &last_ref[(n - 1) * hd..n * hd]);
-    println!("last hidden: rel_l2 vs pre-norm {rel_pre:.2e}, vs post-norm {rel_post:.2e}");
+    if has_hidden && !dump.is_empty() {
+        let mut worst = (0f64, 0usize);
+        for (l, ours) in dump.iter().enumerate().take(n_layers - 1) {
+            let (rel, _) = rel_err(ours, &as_f32(&format!("hidden.{}", l + 1))?);
+            if rel > worst.0 {
+                worst = (rel, l);
+            }
+        }
+        println!("layers: worst rel_l2 {:.2e} (layer {})", worst.0, worst.1);
+    }
+    let lg = m.logits()?;
+    let (rel, _) = rel_err(&lg, &as_f32("logits_last")?);
+    println!("prefill logits rel_l2 {rel:.2e}");
 
-    let logits = m.logits()?;
-    let ref_logits = as_f32("logits_last")?;
-    let (rel, max) = rel_err(&logits, &ref_logits);
-    let (ours5, ref5) = (top_k(&logits, 5), top_k(&ref_logits, 5));
-    println!("logits rel_l2 {rel:.2e} max_abs {max:.3e}; top5 ours {ours5:?} ref {ref5:?}");
+    // ---- 2. teacher-forced decode
+    let tf = if has_tf { as_f32("tf_logits")? } else { Vec::new() };
+    // Reference margin (top1 - top2) at generated position k, and its own top-1.
+    let ref_at = |k: usize| -> Option<(usize, f32)> {
+        (has_tf && k < greedy_ref.len()).then(|| {
+            let (i, a, b) = top2(&tf[k * vocab..(k + 1) * vocab]);
+            (i, a - b)
+        })
+    };
+    if has_tf {
+        let inconsistent: Vec<usize> =
+            (0..greedy_ref.len()).filter(|&k| ref_at(k).unwrap().0 != greedy_ref[k] as usize).collect();
+        if !inconsistent.is_empty() {
+            let k = inconsistent[0];
+            println!(
+                "reference self-check: transformers generate() and its own full forward disagree at {} positions (first k={k}, margin {:.3}); free-running comparisons after that point are against generate()",
+                inconsistent.len(),
+                ref_at(k).unwrap().1
+            );
+        }
+    }
+    if has_tf {
+        let (mut agree, mut ties, mut misses, mut worst_rel) = (0, 0, 0, 0f64);
+        let mut pos = ids.len();
+        for k in 0..greedy_ref.len() {
+            if k > 0 {
+                m.step(&m.single(&[greedy_ref[k - 1]], pos), None)?;
+                pos += 1;
+            }
+            let ours = if k == 0 { lg.clone() } else { m.logits()? };
+            let refr = &tf[k * vocab..(k + 1) * vocab];
+            let (rel, _) = rel_err(&ours, refr);
+            worst_rel = worst_rel.max(rel);
+            let (ro, _, _) = top2(&ours);
+            let (rr, r1, r2) = top2(refr);
+            if ro == rr {
+                agree += 1;
+            } else if r1 - r2 < NEAR_TIE {
+                ties += 1;
+            } else {
+                misses += 1;
+                println!("  MISS at k={k}: ours {ro} ref {rr} (ref margin {:.3})", r1 - r2);
+            }
+        }
+        println!(
+            "teacher-forced: top-1 {agree}/{n} agree, {ties} near-ties, {misses} real misses; worst logits rel_l2 {worst_rel:.2e}",
+            n = greedy_ref.len()
+        );
+        failed |= misses > 0;
+    }
 
-    // Greedy decode, one token per step.
+    // ---- 3. free-running greedy: single, then 3 sequences batched. Teacher forcing advanced
+    // slot 0's recurrent state, so start over from a fresh prefill.
+    m.reset_slot(0)?;
+    let mut pos = 0;
+    while pos < ids.len() {
+        let n = (ids.len() - pos).min(8192);
+        first = m.step(&m.single(&ids[pos..pos + n], pos), None)?[0];
+        pos += n;
+    }
     let mut out = vec![first];
-    let mut pos = ids.len();
-    let t2 = Instant::now();
     while out.len() < greedy_ref.len() {
         let next = m.step(&m.single(&[*out.last().unwrap()], pos), None)?[0];
         pos += 1;
         out.push(next);
     }
-    let dt = t2.elapsed().as_secs_f64();
-    let matched = out.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
-    println!(
-        "greedy: {matched}/{} tokens match; decode {:.1} tok/s (single sequence, M1 kernels)",
-        greedy_ref.len(),
-        (out.len() - 1) as f64 / dt
-    );
-    println!("ours: {out:?}");
-    println!("ref:  {greedy_ref:?}");
-    println!("worst layer rel_l2 {worst:.2e}");
+    // A divergence from a sequence that matched up to k is acceptable only at a near-tie of the
+    // reference (teacher-forced margin at k below NEAR_TIE).
+    let classify = |name: &str, seq: &[u32], against: &[u32]| -> bool {
+        match seq.iter().zip(against).position(|(a, b)| a != b) {
+            None => {
+                println!("{name}: {}/{} identical", seq.len().min(against.len()), against.len());
+                true
+            }
+            Some(k) => match ref_at(k) {
+                Some((_, margin)) if margin < NEAR_TIE => {
+                    println!("{name}: identical for {k}/{} tokens, then diverges at a near-tie (ref margin {margin:.3}): ok", against.len());
+                    true
+                }
+                Some((_, margin)) => {
+                    println!("{name}: diverges at k={k} where the reference margin is {margin:.3}: REAL MISMATCH");
+                    false
+                }
+                None => {
+                    println!("{name}: diverges at k={k} (no reference logits to classify): FAIL");
+                    false
+                }
+            },
+        }
+    };
+    failed |= !classify("greedy vs reference", &out, &greedy_ref);
+    let single = out.clone();
 
-    // Batched consistency: the same prompt in 3 slots at once, plus a decode, through the
-    // scheduler, must produce the same greedy tokens as the single-sequence path.
-    let mut eng = aq_engine::engine::Engine::new(m, vec![]);
+    let mut eng = Engine::new(m, vec![]);
     for id in 0..3u64 {
-        eng.add(aq_engine::engine::Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+        eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::new(); 3];
     while eng.has_work() {
@@ -123,9 +209,13 @@ fn main() -> Result<()> {
             got[e.id as usize].push(e.token);
         }
     }
-    for (i, g) in got.iter().enumerate() {
-        let ok = g.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
-        println!("batched seq {i}: {ok}/{} greedy tokens match", greedy_ref.len());
+    for (i, gseq) in got.iter().enumerate() {
+        failed |= !classify(&format!("batched seq {i} vs single"), gseq, &single);
     }
+
+    if failed {
+        anyhow::bail!("correctness check FAILED");
+    }
+    println!("PASS");
     Ok(())
 }
