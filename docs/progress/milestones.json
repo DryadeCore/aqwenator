@@ -1,0 +1,10 @@
+[
+ {"order": 0, "milestone": "Toolchain and baselines", "status": "done", "detail": "cuda-oxide + CUDA 13 installed in user space on the B200 (no sudo or docker there). vLLM 0.33 baselines for Qwen3.5-0.8B, Qwen3.5-9B and Qwen3.8-27B-FP8.", "updated": "2026-11-13"},
+ {"order": 1, "milestone": "Correct forward pass", "status": "done", "detail": "Rust kernels via cuda-oxide, cuBLASLt bf16 GEMMs, safetensors mmap loading. Matches transformers layer by layer on 0.8B and 9B; greedy tokens identical.", "updated": "2026-11-13"},
+ {"order": 2, "milestone": "Batched engine", "status": "done", "detail": "Continuous batching with chunked prefill, paged KV for full-attention layers, per-sequence DeltaNet state slots, CUDA graphs for decode, autotuned GEMM plans.", "updated": "2026-11-13"},
+ {"order": 3, "milestone": "Fast prefill", "status": "in progress", "detail": "Chunked gated delta rule, tiled attention and token-parallel conv are in (CUDA cores). Next: tensor-core (mma.sync) attention and chunk matmuls.", "updated": "2026-11-13"},
+ {"order": 4, "milestone": "FP8 weights and Qwen3.8-27B", "status": "next", "detail": "Block-scaled FP8 GEMMs (cuBLASLt supports 128x128 block scales), so the 27B checkpoint loads.", "updated": "2026-11-13"},
+ {"order": 5, "milestone": "HTTP server", "status": "next", "detail": "axum OpenAI-compatible API with SSE, OTEL request spans, TTFT measured server side, then the same vllm bench serve client for both engines.", "updated": "2026-11-13"},
+ {"order": 6, "milestone": "Prefix caching and MTP", "status": "later", "detail": "DeltaNet state snapshots at chosen prefix boundaries; speculative decoding with the checkpoint's MTP head.", "updated": "2026-11-13"},
+ {"order": 7, "milestone": "DGX Spark bring-up", "status": "waiting", "detail": "sm_121 build and tuning once access is available. The B200 numbers here are a development proxy.", "updated": "2026-11-13"}
+]

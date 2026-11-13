@@ -1,0 +1,6 @@
+[
+ {"model": "Qwen/Qwen3.5-0.8B", "prompt_tokens": 19, "worst_layer_rel_l2": 0.0118, "logits_rel_l2": 0.0086, "top5_match": "yes", "greedy_match": "32/32", "batched_match": "3 x 32/32", "build": "m3b"},
+ {"model": "Qwen/Qwen3.5-0.8B", "prompt_tokens": 1769, "worst_layer_rel_l2": 0.0139, "logits_rel_l2": 0.0128, "top5_match": "yes", "greedy_match": "32/32", "batched_match": "3 x 32/32", "build": "m3b"},
+ {"model": "Qwen/Qwen3.5-9B", "prompt_tokens": 19, "worst_layer_rel_l2": 0.0113, "logits_rel_l2": 0.0060, "top5_match": "yes", "greedy_match": "32/32", "batched_match": "not run", "build": "m1"},
+ {"model": "Qwen/Qwen3.5-9B", "prompt_tokens": 1769, "worst_layer_rel_l2": 0.111, "logits_rel_l2": 0.0184, "top5_match": "yes", "greedy_match": "32/32", "batched_match": "3 x 32/32", "build": "m3a"}
+]
