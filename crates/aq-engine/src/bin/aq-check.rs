@@ -217,6 +217,7 @@ fn main() -> Result<()> {
                 "pin" => eng.policy.pin_snapshots = true,
                 "load" => eng.policy.load_control = true,
                 "srpt" => eng.policy.srpt = true,
+                "q4" => eng.policy.quantum = 4,
                 _ => {}
             }
         }
