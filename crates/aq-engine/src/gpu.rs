@@ -21,6 +21,9 @@ pub struct Gpu {
     pub allocated_bytes: usize,
     /// True between `begin_capture` and `end_capture`.
     pub capturing: std::cell::Cell<bool>,
+    /// Smallest GEMM M bucket (0 = none). Pinning every GEMM below this size to one plan makes
+    /// a row's result independent of how many other rows share the GEMM (used by tests).
+    pub gemm_min_m: usize,
 }
 
 pub const WORKSPACE_BYTES: usize = 64 << 20;
@@ -33,7 +36,7 @@ impl Gpu {
         let k = aq_kernels::kernels::load(&ctx).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
         let lt = CublasLt::new(ws, WORKSPACE_BYTES)?;
-        let me = Self { ctx, stream, k, lt, allocs: vec![ws], allocated_bytes: WORKSPACE_BYTES, capturing: Default::default() };
+        let me = Self { ctx, stream, k, lt, allocs: vec![ws], allocated_bytes: WORKSPACE_BYTES, capturing: Default::default(), gemm_min_m: 0 };
         if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
             me.print_kernel_info()?;
         }
@@ -100,6 +103,7 @@ impl Gpu {
         } else {
             m.next_multiple_of(512)
         }
+        .max(self.gemm_min_m)
         .min(cap)
         .max(m);
         let s = self.raw_stream();

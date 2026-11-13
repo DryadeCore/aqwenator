@@ -76,6 +76,7 @@ pub struct Scratch {
     seq_start: u64,
     seq_len: u64,
     seq_slot: u64,
+    seq_slot_out: u64,
     rows: u64,
     tables: u64,
     hfinal: u64,
@@ -110,6 +111,17 @@ const GDN_TC_SCAN_VB: u32 = 32;
 pub const ATTN_QTILE: usize = 16;
 /// Blocks per row in the two-phase argmax.
 pub const ARGMAX_PARTS: usize = 32;
+/// Capacity of the split-K partials in (row x slice) units: one row per sequence with up to
+/// `MAX_ATTN_SPLITS` slices, or up to `MAX_DECODE_ROWS_PER_SEQ` rows per sequence with
+/// row-local slicing (at most `ROW_LOCAL_SPLITS` slices).
+fn attn_part_rows(max_seqs: usize) -> usize {
+    max_seqs * MAX_ATTN_SPLITS.max(MAX_DECODE_ROWS_PER_SEQ * ROW_LOCAL_SPLITS)
+}
+
+/// Max tokens one decode-path sequence may feed in a step (speculative verification).
+pub const MAX_DECODE_ROWS_PER_SEQ: usize = 9;
+/// Max slices per row with row-local (fixed) decode-attention slicing (must match the kernel).
+pub const ROW_LOCAL_SPLITS: usize = 32;
 /// Upper bound on split-K slices for decode attention.
 pub const MAX_ATTN_SPLITS: usize = 128;
 
@@ -132,6 +144,11 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// Token rows a step may hold: the token budget plus headroom for speculative draft rows
+    /// (drafts do not count against the budget).
+    pub fn max_rows(&self) -> usize {
+        self.max_tokens + self.max_seqs * (MAX_DECODE_ROWS_PER_SEQ - 1)
+    }
     pub fn max_chunks(&self) -> usize {
         self.max_tokens / GDN_CHUNK + self.max_seqs
     }
@@ -163,8 +180,13 @@ pub struct Batch {
     pub seq_slot: Vec<u32>,
     pub block_tables: Vec<u32>,
     pub sample_rows: Vec<u32>,
-    /// Sequences `0..n_decode` feed exactly one token (decode fast path).
+    /// Sequences `0..n_decode` take the decode path: DeltaNet layers run them token by token
+    /// with the state in registers, attention runs one split-K row per token. Normally one
+    /// token each; a speculative step feeds pending tokens plus drafts.
     pub n_decode: usize,
+    /// Slot each sequence's updated state is written to (empty = same as `seq_slot`). A
+    /// speculative step writes to a spare slot so the old state survives a rejection.
+    pub seq_slot_out: Vec<u32>,
 }
 
 pub struct Model {
@@ -186,6 +208,13 @@ pub struct Model {
     attn_fill: usize,
     /// Split-K slices for this step's decode attention (set by `upload`).
     cur_splits: usize,
+    /// Decode-path token rows of this step (set by `upload`).
+    cur_nd_rows: usize,
+    /// Fixed decode-attention slice size in use this step (0 = slices sized per step).
+    cur_split_keys: u32,
+    /// Fixed decode-attention slice size (keys); 0 = size slices from the batch. Fixed slices
+    /// make decode attention batch-invariant (AQ_ATTN_SPLIT_KEYS, or set by speculation).
+    pub attn_split_keys: usize,
     pub use_graphs: bool,
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
@@ -328,7 +357,7 @@ impl Model {
         let hd = cfg.hidden_size;
         let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
         let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
-        let t = lim.max_tokens;
+        let t = lim.max_rows();
         let sq = lim.max_seqs;
         let hvd = cfg.linear_num_value_heads * 128;
         let hq = cfg.num_attention_heads;
@@ -336,10 +365,10 @@ impl Model {
         // Only the selected chunked-GDN path gets real scratch; the other gets a stub.
         let (cct, tcc) = if cc_gdn { (t, 0) } else { (0, lim.max_tc_chunks() * cfg.linear_num_value_heads) };
         let s = Scratch {
-            amax_v: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
-            amax_i: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
-            attn_part: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * cfg.head_dim * 4)?,
-            attn_ml: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * 2 * 4)?,
+            amax_v: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
+            amax_i: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
+            attn_part: gpu.alloc(attn_part_rows(sq) * hq * cfg.head_dim * 4)?,
+            attn_ml: gpu.alloc(attn_part_rows(sq) * hq * 2 * 4)?,
             chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
             chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
             seq_chunk0: gpu.alloc(sq * 4)?,
@@ -363,12 +392,13 @@ impl Model {
             ids: gpu.alloc(t * 4)?,
             tok_pos: gpu.alloc(t * 4)?,
             tok_seq: gpu.alloc(t * 4)?,
-            seq_start: gpu.alloc(sq * 4)?,
-            seq_len: gpu.alloc(sq * 4)?,
-            seq_slot: gpu.alloc(sq * 4)?,
-            rows: gpu.alloc(sq * 4)?,
-            tables: gpu.alloc(sq * lim.max_blocks_per_seq() * 4)?,
-            hfinal: gpu.alloc(sq * hd * 2)?,
+            seq_start: gpu.alloc((sq + 1) * 4)?,
+            seq_len: gpu.alloc((sq + 1) * 4)?,
+            seq_slot: gpu.alloc((sq + 1) * 4)?,
+            seq_slot_out: gpu.alloc((sq + 1) * 4)?,
+            rows: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
+            tables: gpu.alloc((sq + 1) * lim.max_blocks_per_seq() * 4)?,
+            hfinal: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * hd * 2)?,
             x: gpu.alloc(t * hd * 2)?,
             h: gpu.alloc(t * hd * 2)?,
             proj: gpu.alloc(t * wide * 2)?,
@@ -376,8 +406,8 @@ impl Model {
             mix: gpu.alloc(t * mixw * 2)?,
             delta: gpu.alloc(t * hd * 2)?,
             q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
-            logits: gpu.alloc(sq * cfg.vocab_size * 2)?,
-            tok: gpu.alloc(sq * 4)?,
+            logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
+            tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
         };
         gpu.sync()?;
         let num_sms = gpu.num_sms()?;
@@ -406,6 +436,9 @@ impl Model {
             cur_chunks: 0,
             cur_tiles: 0,
             cur_splits: 1,
+            cur_nd_rows: 0,
+            cur_split_keys: 0,
+            attn_split_keys: std::env::var("AQ_ATTN_SPLIT_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             num_sms,
             attn_fill: std::env::var("AQ_ATTN_FILL").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
@@ -461,6 +494,7 @@ impl Model {
             block_tables: (0..self.limits.max_blocks_per_seq() as u32).collect(),
             sample_rows: vec![n - 1],
             n_decode: (n == 1) as usize,
+            seq_slot_out: Vec::new(),
         }
     }
 
@@ -470,11 +504,16 @@ impl Model {
         let nseq = b.seq_start.len();
         let ns = b.sample_rows.len();
         let lim = self.limits;
-        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_tokens, "{} tokens exceeds max_tokens", b.tokens.len());
+        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_rows(), "{} tokens exceeds max_rows", b.tokens.len());
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
-        let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq;
+        anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
+        let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
         if self.use_graphs && pure_decode && dump.is_none() {
             return self.step_graph(b);
+        }
+        let decode_only = nseq > 0 && b.n_decode == nseq && b.tokens.len() > nseq;
+        if self.use_graphs && decode_only && dump.is_none() && self.attn_split_keys > 0 {
+            return self.step_graph_spec(b);
         }
         self.upload(b)?;
         self.forward(b.tokens.len(), nseq, ns, b.n_decode, dump)?;
@@ -503,12 +542,15 @@ impl Model {
             p.seq_start.push(k as u32);
             p.seq_len.push(1);
             p.seq_slot.push(lim.max_seqs as u32);
+            if !p.seq_slot_out.is_empty() {
+                p.seq_slot_out.push(lim.max_seqs as u32);
+            }
             p.block_tables.extend(std::iter::repeat_n(lim.num_blocks() as u32, mb));
             p.sample_rows.push(k as u32);
         }
         p.n_decode = bucket;
         self.upload(&p)?;
-        let key = (bucket, self.cur_splits);
+        let key = (bucket, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
         if let Some((exec, names)) = self.graphs.get(&key) {
             if let Some(p) = self.prof.as_mut() {
                 // The graph replays the event records captured with it.
@@ -539,6 +581,77 @@ impl Model {
         Ok(toks)
     }
 
+    /// Decode-only step where some sequences feed several tokens (speculative verification),
+    /// through a captured graph of fixed shape: the sequence count is padded to a bucket, every
+    /// sequence gets W rows of room (W = max tokens of any sequence), and the leftover rows go
+    /// to a padding sequence of length 0 on the dummy slot and dummy KV page. All rows are
+    /// sampled; the caller's sample rows are picked out afterwards. Needs fixed-size attention
+    /// slices, so padding the slice count is exact (empty slices add nothing).
+    fn step_graph_spec(&mut self, b: &Batch) -> Result<Vec<u32>> {
+        let lim = self.limits;
+        let n = b.seq_start.len();
+        let w = *b.seq_len.iter().max().unwrap() as usize;
+        let bucket = DECODE_BUCKETS.iter().copied().find(|&x| x >= n).unwrap_or(n).min(lim.max_seqs).max(n);
+        // Rows padded to a multiple of 16 (not bucket * W): sequences keep their own lengths,
+        // so the padding is only the round-up, bounded by `max_rows`.
+        let rows = b
+            .tokens
+            .len()
+            .next_multiple_of(16)
+            .max(bucket)
+            .min(lim.max_rows())
+            .min(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ)
+            .max(b.tokens.len());
+        let _ = w;
+        let used = b.tokens.len();
+        let mb = lim.max_blocks_per_seq();
+        let dummy_slot = lim.max_seqs as u32;
+        let dummy_page = lim.num_blocks() as u32;
+        let mut p = b.clone();
+        if p.seq_slot_out.is_empty() {
+            p.seq_slot_out = p.seq_slot.clone();
+        }
+        // Empty dummy sequences up to the bucket, then the padding sequence (index `bucket`).
+        for _ in n..=bucket {
+            p.seq_start.push(used as u32);
+            p.seq_len.push(0);
+            p.seq_slot.push(dummy_slot);
+            p.seq_slot_out.push(dummy_slot);
+            p.block_tables.extend(std::iter::repeat_n(dummy_page, mb));
+        }
+        for r in used..rows {
+            p.tokens.push(0);
+            p.tok_pos.push(((r - used) % lim.block_size) as u32);
+            p.tok_seq.push(bucket as u32);
+        }
+        p.sample_rows = (0..rows as u32).collect();
+        p.n_decode = bucket + 1;
+        self.upload(&p)?;
+        // Every row runs through attention (padding rows read only the dummy page), and the
+        // slice count is rounded up so a few graphs cover all context lengths.
+        self.cur_nd_rows = rows;
+        self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
+        anyhow::ensure!(rows * self.cur_splits <= attn_part_rows(lim.max_seqs), "decode attention partials overflow");
+        let key = (bucket * 100_000 + rows * 10 + 1, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        if let Some((exec, _)) = self.graphs.get(&key) {
+            self.gpu.launch_graph(*exec)?;
+        } else {
+            self.forward(rows, bucket + 1, rows, bucket + 1, None)?;
+            if let Some(pr) = self.prof.as_mut() {
+                pr.finish()?;
+            }
+            self.gpu.sync()?;
+            self.gpu.begin_capture()?;
+            let r = self.forward(rows, bucket + 1, rows, bucket + 1, None);
+            let exec = self.gpu.end_capture()?;
+            r?;
+            let names = self.prof.as_mut().map(|pr| std::mem::take(&mut pr.names)).unwrap_or_default();
+            self.graphs.insert(key, (exec, names));
+        }
+        let all = self.gpu.download(self.s.tok, rows)?;
+        Ok(b.sample_rows.iter().map(|&r| all[r as usize]).collect())
+    }
+
     fn upload(&mut self, b: &Batch) -> Result<()> {
         // Prefill work lists: GDN chunks and attention query tiles for sequences n_decode..
         let (mut cs, mut cl, mut c0, mut cn, mut ts, mut tl) = (vec![], vec![], vec![], vec![], vec![], vec![]);
@@ -564,14 +677,36 @@ impl Model {
         self.cur_tiles = ts.len();
         // Split-K slices for decode attention: enough blocks to fill the GPU twice, at least
         // 64 keys per slice, power of two (bounds the number of captured graphs).
-        let nd = b.n_decode;
+        let nd_seqs = b.n_decode;
+        let nd = if nd_seqs == 0 { 0 } else { (b.seq_start[nd_seqs - 1] + b.seq_len[nd_seqs - 1]) as usize };
+        self.cur_nd_rows = nd;
+        self.cur_split_keys = 0;
+        let max_ctx_rows = if nd == 0 { 0 } else { b.tok_pos[..nd].iter().copied().max().unwrap_or(0) as usize + 1 };
         self.cur_splits = if nd == 0 {
             1
+        } else if self.attn_split_keys > 0 {
+            // Row-local slice size (see attn_decode_split): a row's result is independent of
+            // the other rows. Slices needed = max over rows of ceil(len / slice(len)) <= 32.
+            self.cur_split_keys = self.attn_split_keys as u32;
+            b.tok_pos[..nd]
+                .iter()
+                .map(|&p| {
+                    let n = p as usize + 1;
+                    n.div_ceil(self.attn_split_keys.max(n.div_ceil(ROW_LOCAL_SPLITS)))
+                })
+                .max()
+                .unwrap_or(1)
         } else {
-            let max_ctx = b.tok_pos[..nd].iter().copied().max().unwrap_or(0) as usize + 1;
+            let max_ctx = max_ctx_rows;
             let fill = (self.attn_fill * self.num_sms).div_ceil(nd * self.cfg.num_key_value_heads);
-            fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS)
+            let cap = (attn_part_rows(self.limits.max_seqs) / nd).max(1);
+            fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS).min(cap)
         };
+        anyhow::ensure!(
+            nd * self.cur_splits <= attn_part_rows(self.limits.max_seqs),
+            "decode attention partials overflow ({nd} rows x {} slices)",
+            self.cur_splits
+        );
         let (s, g) = (&self.s, &self.gpu);
         if !cs.is_empty() {
             g.upload(s.chunk_start, &cs)?;
@@ -587,6 +722,7 @@ impl Model {
         g.upload(s.seq_start, &b.seq_start)?;
         g.upload(s.seq_len, &b.seq_len)?;
         g.upload(s.seq_slot, &b.seq_slot)?;
+        g.upload(s.seq_slot_out, if b.seq_slot_out.is_empty() { &b.seq_slot } else { &b.seq_slot_out })?;
         g.upload(s.tables, &b.block_tables)?;
         g.upload(s.rows, &b.sample_rows)?;
         Ok(())
@@ -647,7 +783,7 @@ impl Model {
                 LayerKind::Linear => {
                     let n = c.gdn_proj_ld();
                     mark!("norm");
-                    g.gemm(t, lim.max_tokens, n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_gdn_in");
                     let cd = c.conv_dim() as u32;
                     unsafe {
@@ -676,6 +812,7 @@ impl Model {
                             s.seq_start as *const u32,
                             s.seq_len as *const u32,
                             s.seq_slot as *const u32,
+                            s.seq_slot_out as *const u32,
                             cd,
                         )
                     }
@@ -704,7 +841,9 @@ impl Model {
                                 l.delta_state as *mut f32,
                                 s.mix as *mut u16,
                                 s.seq_start as *const u32,
+                                s.seq_len as *const u32,
                                 s.seq_slot as *const u32,
+                                s.seq_slot_out as *const u32,
                                 hk_u,
                                 hv_u,
                                 eps,
@@ -878,14 +1017,14 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("gdn");
-                    g.gemm(t, lim.max_tokens, c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_gdn_out");
                 }
                 LayerKind::Full => {
                     let n = c.attn_proj_dim();
                     let (h, hkv) = (c.num_attention_heads as u32, c.num_key_value_heads as u32);
                     mark!("norm");
-                    g.gemm(t, lim.max_tokens, n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_qkv");
                     unsafe {
                         g.k.attn_prep(
@@ -940,7 +1079,7 @@ impl Model {
                         unsafe {
                             g.k.attn_decode_split(
                                 &st,
-                                LaunchConfig { grid_dim: (nd_total as u32, hkv, ns), block_dim: (32 * (h / hkv), 1, 1), shared_mem_bytes: 0 },
+                                LaunchConfig { grid_dim: (self.cur_nd_rows as u32, hkv, ns), block_dim: (32 * (h / hkv), 1, 1), shared_mem_bytes: 0 },
                                 s.q as *const u16,
                                 l.k_cache as *const u16,
                                 l.v_cache as *const u16,
@@ -954,6 +1093,7 @@ impl Model {
                                 scale,
                                 s.attn_part as *mut f32,
                                 s.attn_ml as *mut f32,
+                                self.cur_split_keys,
                             )
                         }
                         .map_err(de)?;
@@ -961,7 +1101,7 @@ impl Model {
                         unsafe {
                             g.k.attn_decode_combine(
                                 &st,
-                                cfg((nd_total as u32, h, 1), 256),
+                                cfg((self.cur_nd_rows as u32, h, 1), 256),
                                 s.attn_part as *const f32,
                                 s.attn_ml as *const f32,
                                 ns,
@@ -1031,7 +1171,7 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("attn_prefill");
-                    g.gemm(t, lim.max_tokens, c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, lim.max_rows(), c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_o");
                 }
             }
@@ -1052,7 +1192,7 @@ impl Model {
             .map_err(de)?;
             mark!("norm");
             let inter = c.intermediate_size;
-            g.gemm(t, lim.max_tokens, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
+            g.gemm(t, lim.max_rows(), 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
             mark!("gemm_gate_up");
             let nvec = (t * inter / 8) as u32;
             unsafe {
@@ -1060,7 +1200,7 @@ impl Model {
             }
             .map_err(de)?;
             mark!("silu_mul");
-            g.gemm(t, lim.max_tokens, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
+            g.gemm(t, lim.max_rows(), c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
             mark!("gemm_down");
 
             if let Some(d) = dump.as_deref_mut() {
@@ -1095,7 +1235,7 @@ impl Model {
         }
         .map_err(de)?;
         mark!("final_norm");
-        g.gemm(ns, lim.max_seqs, c.vocab_size, c.hidden_size, s.hfinal, self.lm_head, s.logits, CUDA_R_16BF)?;
+        g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, c.vocab_size, c.hidden_size, s.hfinal, self.lm_head, s.logits, CUDA_R_16BF)?;
         mark!("gemm_lm_head");
         unsafe {
             g.k.argmax_part(

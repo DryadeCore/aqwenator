@@ -18,6 +18,8 @@ use aq_engine::weights::resolve_model;
 use std::time::Instant;
 
 const NEAR_TIE: f32 = 0.25;
+/// Tokens generated per request in the speculative-decoding identity test.
+const SPEC_TEST_LEN: usize = 256;
 
 fn rel_err(a: &[f32], b: &[f32]) -> (f64, f64) {
     let mut num = 0f64;
@@ -67,14 +69,14 @@ fn main() -> Result<()> {
     let has_hidden = g.names().iter().any(|n| n.starts_with("hidden."));
     let has_tf = g.names().contains(&"tf_logits");
 
-    let ctx = (ids.len() + greedy_ref.len() + 64).next_multiple_of(256);
+    let ctx = (ids.len() + greedy_ref.len().max(SPEC_TEST_LEN) + 64).next_multiple_of(256);
     // Prefill chunk per step (AQ_CHECK_CHUNK): small, unaligned values exercise sequences whose
     // prefill spans steps at arbitrary positions.
     let chunk: usize = std::env::var("AQ_CHECK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
         .min(std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192));
     let t0 = Instant::now();
     let budget: usize = std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 4, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
+    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 8, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
     println!(
         "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
         t0.elapsed().as_secs_f64(),
@@ -218,6 +220,9 @@ fn main() -> Result<()> {
     if std::env::var("AQ_CHECK_NOCACHE").is_ok() {
         eng.session_cache = false;
     }
+    // AQ_SPEC_K: run the engine-level checks below with speculative decoding on.
+    let spec_env: usize = std::env::var("AQ_SPEC_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    eng.spec_k = spec_env;
     for id in 0..3u64 {
         eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
     }
@@ -294,6 +299,79 @@ fn main() -> Result<()> {
             cold.len()
         );
         failed |= after.forks == before.forks || same != cold.len();
+    }
+
+    // ---- 6. speculative decoding: with fixed decode-attention slices, greedy output with
+    // speculation on must be token-identical to speculation off, single and batched.
+    {
+        let k = if spec_env > 0 { spec_env } else { 4 };
+        let prompts: Vec<Vec<u32>> = vec![ids.clone(), ids[..ids.len() * 3 / 4].to_vec(), ids[ids.len() / 4..].to_vec()];
+        let saved = (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m);
+        eng.session_cache = false;
+        eng.clear_cache();
+        eng.model.attn_split_keys = 64;
+        // One GEMM plan for every decode-sized GEMM: rows then compute identically whatever
+        // else shares the GEMM, so speculative and plain decoding must match bit for bit.
+        // With a small step budget, prefill and decode share steps; pin every GEMM to the full
+        // row capacity so no row's plan depends on what else is in the step.
+        eng.model.gpu.gemm_min_m = if budget < 8192 { eng.model.limits.max_rows() } else { 64 };
+        let mut run = |eng: &mut Engine, spec: usize, which: &[usize]| -> Result<Vec<Vec<u32>>> {
+            eng.spec_k = spec;
+            for &w in which {
+                eng.add(Request { id: 300 + w as u64, prompt: prompts[w].clone(), max_new_tokens: SPEC_TEST_LEN, ignore_eos: true })?;
+            }
+            let mut out = vec![Vec::new(); 3];
+            while eng.has_work() {
+                for e in eng.step()? {
+                    out[(e.id - 300) as usize].push(e.token);
+                }
+            }
+            Ok(out)
+        };
+        for (name, which) in [("single", vec![0usize]), ("batched x3", vec![0, 1, 2])] {
+            let off = run(&mut eng, 0, &which)?;
+            let before = eng.spec;
+            let t = Instant::now();
+            let on = run(&mut eng, k, &which)?;
+            let dt = t.elapsed().as_secs_f64();
+            let st = eng.spec;
+            let (drafted, accepted) = (st.drafted - before.drafted, st.accepted - before.accepted);
+            let (entries, emitted) = (st.decode_entries - before.decode_entries, st.emitted - before.emitted);
+            let mut ok = true;
+            let mut ties = 0;
+            for &w in &which {
+                let same = on[w].iter().zip(&off[w]).take_while(|(a, b)| a == b).count();
+                if same == SPEC_TEST_LEN && on[w].len() == SPEC_TEST_LEN {
+                    continue;
+                }
+                // Classify the divergence by the non-speculative logits at that position: run
+                // prompt + common prefix alone and look at its top-2 margin.
+                eng.spec_k = 0;
+                let p: Vec<u32> = prompts[w].iter().chain(&off[w][..same]).copied().collect();
+                eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+                while eng.has_work() {
+                    eng.step()?;
+                }
+                let lg = eng.model.logits()?;
+                let (_, a, b) = top2(&lg);
+                if a - b < NEAR_TIE {
+                    ties += 1;
+                    println!("  spec {name} seq {w}: identical for {same}/{SPEC_TEST_LEN} tokens, then diverges at a near-tie (margin {:.3}): ok", a - b);
+                } else {
+                    ok = false;
+                    println!("  spec {name} seq {w}: diverges after {same}/{SPEC_TEST_LEN} tokens where the margin is {:.3}: REAL MISMATCH", a - b);
+                }
+            }
+            println!(
+                "speculative ({name}, k={k}): {} identical to non-speculative; drafted {drafted}, accepted {accepted} ({:.0}%), {:.2} tokens per decode step, {:.2}s",
+                if !ok { "NOT" } else if ties > 0 { "up to near-ties" } else { "all tokens" },
+                100.0 * accepted as f64 / drafted.max(1) as f64,
+                emitted as f64 / entries.max(1) as f64,
+                dt
+            );
+            failed |= !ok;
+        }
+        (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m) = saved;
     }
 
     if failed {

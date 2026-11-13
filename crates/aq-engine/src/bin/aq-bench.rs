@@ -25,6 +25,8 @@ struct Args {
     max_seqs: usize,
     max_tokens: usize,
     mixed_prefill: Option<usize>,
+    spec_k: usize,
+    prompts_file: Option<String>,
     out: Option<String>,
 }
 
@@ -40,6 +42,8 @@ fn parse() -> Result<Args> {
         max_seqs: 64,
         max_tokens: 8192,
         mixed_prefill: None,
+        spec_k: 0,
+        prompts_file: None,
         out: None,
     };
     while let Some(k) = it.next() {
@@ -53,6 +57,8 @@ fn parse() -> Result<Args> {
             "--max-tokens" => a.max_tokens = v.parse()?,
             "--out" => a.out = Some(v),
             "--mixed-prefill" => a.mixed_prefill = Some(v.parse()?),
+            "--spec-k" => a.spec_k = v.parse()?,
+            "--prompts-file" => a.prompts_file = Some(v),
             _ => anyhow::bail!("unknown option {k}"),
         }
     }
@@ -103,6 +109,11 @@ fn main() -> Result<()> {
     if let Some(m) = a.mixed_prefill {
         eng.mixed_prefill_budget = m;
     }
+    eng.spec_k = a.spec_k;
+    if a.spec_k > 0 || std::env::var("AQ_ATTN_SPLIT_KEYS").is_ok() {
+        // Fixed decode-attention slices (required by the speculative graph path).
+        eng.model.attn_split_keys = std::env::var("AQ_ATTN_SPLIT_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    }
 
     // Cold start: first token of a short request right after load (includes module load,
     // cuBLASLt plan creation, first-touch of every kernel).
@@ -119,6 +130,11 @@ fn main() -> Result<()> {
     );
 
     let mut rng = Rng(0x5eed_1234_abcd_0001);
+    // Real prompts (token ids), cycled; otherwise random tokens of --input-len.
+    let file_prompts: Vec<Vec<u32>> = match &a.prompts_file {
+        Some(f) => serde_json::from_str(&std::fs::read_to_string(f)?)?,
+        None => Vec::new(),
+    };
     let mut results = Vec::new();
     for &c in &a.concurrency {
         let n = a.num_prompts.unwrap_or((16 * c).max(200));
@@ -132,10 +148,15 @@ fn main() -> Result<()> {
         let mut first: HashMap<u64, f64> = HashMap::new();
         let mut out_tokens = 0usize;
         let mut steps = 0usize;
+        let spec0 = eng.spec;
         let mut host_us = 0u64;
         let start = Instant::now();
         let mut submit = |eng: &mut Engine, next_id: &mut u64, arrive: &mut HashMap<u64, Instant>| -> Result<()> {
-            let prompt = (0..a.input_len).map(|_| (1000 + rng.next() % (vocab - 2000)) as u32).collect();
+            let prompt = if file_prompts.is_empty() {
+                (0..a.input_len).map(|_| (1000 + rng.next() % (vocab - 2000)) as u32).collect()
+            } else {
+                file_prompts[*next_id as usize % file_prompts.len()].clone()
+            };
             eng.add(Request { id: *next_id, prompt, max_new_tokens: a.output_len, ignore_eos: true })?;
             arrive.insert(*next_id, Instant::now());
             *next_id += 1;
@@ -188,6 +209,10 @@ fn main() -> Result<()> {
             "host_us_per_step": host_us as f64 / steps.max(1) as f64,
             "cold_start_loaded_s": loaded_s,
             "cold_start_first_token_s": first_token_s,
+            "spec_k": a.spec_k,
+            "spec_drafted": eng.spec.drafted - spec0.drafted,
+            "spec_accepted": eng.spec.accepted - spec0.accepted,
+            "spec_tokens_per_decode_step": (eng.spec.emitted - spec0.emitted) as f64 / (eng.spec.decode_entries - spec0.decode_entries).max(1) as f64,
         });
         for (name, v) in [("ttft", &mut ttft), ("tpot", &mut tpot), ("itl", &mut itl), ("e2el", &mut e2el)] {
             r[format!("mean_{name}_ms")] = serde_json::json!(mean(v));
@@ -208,6 +233,14 @@ fn main() -> Result<()> {
             g("p99_tpot_ms"),
             g("host_us_per_step"),
         );
+        if a.spec_k > 0 {
+            println!(
+                "      spec: drafted {} accepted {} ({:.0}%), {:.2} tokens per decode step",
+                r["spec_drafted"], r["spec_accepted"],
+                100.0 * r["spec_accepted"].as_f64().unwrap_or(0.0) / r["spec_drafted"].as_f64().unwrap_or(1.0).max(1.0),
+                g("spec_tokens_per_decode_step")
+            );
+        }
         if let Some(p) = eng.model.prof.as_mut() {
             println!("{}", p.report());
         }
