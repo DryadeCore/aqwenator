@@ -108,6 +108,12 @@ pub struct CublasLt {
 unsafe impl Send for CublasLt {}
 
 impl CublasLt {
+    /// Switch the workspace used by subsequent GEMMs (one workspace per stream: GEMMs on two
+    /// streams running concurrently must never share one).
+    pub fn set_workspace(&mut self, workspace: u64) {
+        self.workspace = workspace;
+    }
+
     pub fn new(workspace: u64, workspace_size: usize) -> Result<Self> {
         let mut handle = std::ptr::null_mut();
         check(unsafe { cublasLtCreate(&mut handle) }, "create")?;

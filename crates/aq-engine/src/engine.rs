@@ -52,6 +52,19 @@ struct Seq {
     snapshot_at: Option<usize>,
     /// Spare state slot a speculative step writes into (swapped in on full acceptance).
     spare: Option<u32>,
+    /// Part of the prefill batch currently in flight on lane 0 (co-execution).
+    in_prefill: bool,
+}
+
+/// A prefill batch launched on lane 0 and not collected yet (co-execution). Sequences are
+/// named by request id: running indices shift while decode steps retire sequences.
+struct Inflight {
+    /// (request id, tokens fed) per sequence, in batch order.
+    plan: Vec<(u64, usize)>,
+    /// Request ids that sample a token from this batch, in sample-row order.
+    sampled: Vec<u64>,
+    ns: usize,
+    tokens: usize,
 }
 
 impl Seq {
@@ -151,12 +164,22 @@ pub struct Engine {
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
     pub mixed_prefill_budget: usize,
+    /// Decode/prefill co-execution (AQ_COEXEC=1): prefill batches run asynchronously on lane 0
+    /// while decode steps for the other sequences run on a high-priority lane 1.
+    pub coexec: bool,
+    inflight: Option<Inflight>,
+    /// Decode steps that ran while a prefill batch was in flight (co-execution).
+    pub overlap_steps: u64,
+    /// Minimum time between decode steps while a prefill batch is in flight (AQ_COEXEC_PACE_US):
+    /// leaves the GPU to prefill between decode steps, trading inter-token latency for TTFT.
+    pub pace: std::time::Duration,
+    last_decode: Option<Instant>,
 }
 
 impl Engine {
     pub fn new(model: Model, eos: Vec<u32>) -> Self {
         let lim = model.limits;
-        Self {
+        let mut eng = Self {
             model,
             waiting: VecDeque::new(),
             running: Vec::new(),
@@ -177,7 +200,25 @@ impl Engine {
             spec_min_ngram: 2,
             spec: SpecStats::default(),
             mixed_prefill_budget: usize::MAX,
+            coexec: false,
+            inflight: None,
+            overlap_steps: 0,
+            pace: std::time::Duration::from_micros(
+                std::env::var("AQ_COEXEC_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
+            last_decode: None,
+        };
+        if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
+            eng.enable_coexec().expect("could not create the decode lane for AQ_COEXEC=1");
         }
+        eng
+    }
+
+    /// Turn on decode/prefill co-execution (creates the model's decode lane).
+    pub fn enable_coexec(&mut self) -> Result<()> {
+        self.model.enable_decode_lane()?;
+        self.coexec = true;
+        Ok(())
     }
 
     pub fn limits(&self) -> Limits {
@@ -397,7 +438,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false });
         Ok(true)
     }
 
@@ -435,8 +476,223 @@ impl Engine {
         Ok(())
     }
 
+    /// Build the batch for `plan` (running index, tokens to feed). Returns the batch and the
+    /// running indices that sample a token from it, in sample-row order.
+    fn build_batch(&mut self, plan: &[(usize, usize)]) -> Result<(Batch, Vec<usize>)> {
+        let mb = self.limits().max_blocks_per_seq();
+        let mut b = Batch::default();
+        let mut sampled = Vec::new();
+        for (k, &(i, n)) in plan.iter().enumerate() {
+            let upto = self.running[i].computed + n;
+            self.ensure_blocks(i, upto)?;
+            let s = &self.running[i];
+            b.seq_start.push(b.tokens.len() as u32);
+            b.seq_len.push(n as u32);
+            b.seq_slot.push(s.slot);
+            for p in s.computed..upto {
+                b.tokens.push(s.token_at(p));
+                b.tok_pos.push(p as u32);
+                b.tok_seq.push(k as u32);
+            }
+            let mut row = s.blocks.clone();
+            row.resize(mb, 0);
+            b.block_tables.extend_from_slice(&row);
+            if upto == s.known() {
+                b.sample_rows.push(b.tokens.len() as u32 - 1);
+                sampled.push(i);
+            }
+        }
+        Ok((b, sampled))
+    }
+
+    /// Append sampled tokens, emit events; returns running indices that finished.
+    fn apply_sampled(&mut self, sampled: &[usize], toks: &[u32], events: &mut Vec<TokenEvent>) -> Vec<usize> {
+        let mut done = Vec::new();
+        for (&i, &tok) in sampled.iter().zip(toks) {
+            let s = &mut self.running[i];
+            s.out.push(tok);
+            let finished = s.out.len() >= s.req.max_new_tokens || (!s.req.ignore_eos && self.eos.contains(&tok));
+            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished });
+            if finished {
+                done.push(i);
+            }
+        }
+        done
+    }
+
+    /// Park (session cache) or free finished sequences, given their running indices.
+    fn retire(&mut self, mut done: Vec<usize>) {
+        done.sort_unstable_by(|a, b| b.cmp(a));
+        for i in done {
+            let s = self.running.swap_remove(i);
+            if let Some(sp) = s.spare {
+                self.free_slots.push(sp);
+            }
+            if self.session_cache {
+                let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
+                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
+            } else {
+                self.free_slots.push(s.slot);
+                self.release(s.blocks);
+            }
+        }
+    }
+
+    fn index_of(&self, id: u64) -> usize {
+        self.running.iter().position(|s| s.req.id == id).expect("in-flight sequence missing")
+    }
+
+    /// Co-execution step: keep one prefill batch in flight on lane 0 and run a decode step for
+    /// every other ready sequence on the high-priority lane 1. Decode tokens never wait for a
+    /// prefill chunk; a prefill batch is collected once its lane-0 event completes (or waited
+    /// for when nothing is decoding).
+    ///
+    /// Ordering: admission (slot reset/copy) and snapshots are enqueued on lane 0, the lane of
+    /// every sequence until its prefill completes; a sequence moves to lane 1 only after the
+    /// host has observed its prefill batch complete, and back to lane 0 (a later turn) only
+    /// after it finished decoding, which is synchronous. KV pages and state slots are per
+    /// sequence, so the two lanes never write the same memory.
+    fn step_coexec(&mut self) -> Result<Vec<TokenEvent>> {
+        let t0 = Instant::now();
+        let lim = self.limits();
+        self.model.set_lane(0);
+        self.clock += 1;
+        while !self.waiting.is_empty() && self.running.len() < self.max_running.min(lim.max_seqs) {
+            if !self.admit_one()? {
+                break;
+            }
+        }
+        let mut events = Vec::new();
+
+        // 1. Launch a prefill batch on lane 0 if none is in flight.
+        let mut prefill_tokens = 0;
+        if self.inflight.is_none() {
+            let mut budget = lim.max_tokens;
+            let mut plan = Vec::new();
+            for (i, s) in self.running.iter().enumerate() {
+                if budget == 0 {
+                    break;
+                }
+                if !s.in_prefill && s.computed < s.req.prompt.len() {
+                    let mut n = (s.req.prompt.len() - s.computed).min(budget);
+                    if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
+                        n = n.min(at - s.computed);
+                    }
+                    plan.push((i, n));
+                    budget -= n;
+                }
+            }
+            if !plan.is_empty() {
+                let (b, sampled) = self.build_batch(&plan)?;
+                let ns = self.model.launch(&b)?;
+                prefill_tokens = b.tokens.len();
+                for &(i, _) in &plan {
+                    self.running[i].in_prefill = true;
+                }
+                self.inflight = Some(Inflight {
+                    plan: plan.iter().map(|&(i, n)| (self.running[i].req.id, n)).collect(),
+                    sampled: sampled.iter().map(|&i| self.running[i].req.id).collect(),
+                    ns,
+                    tokens: b.tokens.len(),
+                });
+            }
+        }
+
+        // 2. One decode step on lane 1 for every ready sequence outside the in-flight batch.
+        let dplan: Vec<(usize, usize)> = self
+            .running
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.in_prefill && s.computed >= s.req.prompt.len() && s.known() > s.computed)
+            // Normally one pending token; more after a rejected speculative step (spec_k
+            // switched off since), which the decode path also handles.
+            .map(|(i, s)| (i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ)))
+            .collect();
+        let decode_seqs = dplan.len();
+        if decode_seqs > 0 && self.inflight.is_some() && !self.pace.is_zero() {
+            // Pacing: give the in-flight prefill the GPU until the next decode step is due.
+            if let Some(last) = self.last_decode {
+                let due = last + self.pace;
+                while Instant::now() < due {
+                    if self.model.lane_done(0)? {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+        }
+        let t1 = Instant::now();
+        if decode_seqs > 0 {
+            self.last_decode = Some(t1);
+            if self.inflight.is_some() {
+                self.overlap_steps += 1;
+            }
+            let (mut b, sampled) = self.build_batch(&dplan)?;
+            b.n_decode = decode_seqs;
+            self.model.set_lane(1);
+            let toks = self.model.step(&b, None);
+            self.model.set_lane(0);
+            let toks = toks?;
+            for &(i, n) in &dplan {
+                self.running[i].computed += n;
+            }
+            let done = self.apply_sampled(&sampled, &toks, &mut events);
+            self.retire(done);
+        }
+
+        // 3. Collect the prefill batch when it is done; wait for it if nothing else can run.
+        if self.inflight.is_some() && (decode_seqs == 0 || self.model.lane_done(0)?) {
+            prefill_tokens = prefill_tokens.max(self.collect_inflight(&mut events)?);
+        }
+        self.last = StepStats {
+            tokens: decode_seqs + prefill_tokens,
+            decode_seqs,
+            prefill_tokens,
+            seqs: decode_seqs,
+            host_us: t1.duration_since(t0).as_micros() as u64,
+            gpu_us: t1.elapsed().as_micros() as u64,
+        };
+        Ok(events)
+    }
+
+    /// Wait for the in-flight prefill batch (co-execution), apply it and emit its sampled tokens.
+    /// Returns the batch's token count (0 if none was in flight).
+    fn collect_inflight(&mut self, events: &mut Vec<TokenEvent>) -> Result<usize> {
+        let Some(inf) = self.inflight.take() else { return Ok(0) };
+        let toks = self.model.collect(inf.ns)?;
+        for &(id, n) in &inf.plan {
+            let i = self.index_of(id);
+            self.running[i].computed += n;
+            self.running[i].in_prefill = false;
+            if self.running[i].snapshot_at == Some(self.running[i].computed) {
+                self.running[i].snapshot_at = None;
+                self.snapshot(i)?;
+            }
+        }
+        let sampled: Vec<usize> = inf.sampled.iter().map(|&id| self.index_of(id)).collect();
+        let done = self.apply_sampled(&sampled, &toks, events);
+        self.retire(done);
+        Ok(inf.tokens)
+    }
+
     /// Run one step. Returns one event per sampled token.
+    ///
+    /// Co-execution and speculative decoding do not combine: with `spec_k > 0` the engine
+    /// takes the normal (single-stream, lane 0) path, after draining any prefill batch still
+    /// in flight from an earlier co-execution step.
     pub fn step(&mut self) -> Result<Vec<TokenEvent>> {
+        if self.coexec {
+            if self.spec_k == 0 {
+                return self.step_coexec();
+            }
+            if self.inflight.is_some() {
+                let mut events = Vec::new();
+                self.collect_inflight(&mut events)?;
+                if !events.is_empty() {
+                    return Ok(events);
+                }
+            }
+        }
         let t0 = Instant::now();
         let lim = self.limits();
         let mut budget = lim.max_tokens;
