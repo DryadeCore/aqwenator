@@ -152,6 +152,16 @@ pub struct Model {
     /// A/B switches back to the reference kernels (AQ_GDN_RECURRENT=1, AQ_ATTN_NAIVE=1).
     ref_gdn: bool,
     ref_attn: bool,
+    /// AQ_ATTN_TILE=1: use the CUDA-core tiled prefill attention instead of tensor cores.
+    tile_attn: bool,
+    /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
+    attn_tc_smem: u32,
+}
+
+/// Shared-memory bytes of `attention_tc`: Q rows (16 per query head of the group) plus one
+/// 32-key K tile and one V tile, all 256-wide bf16.
+fn attention_tc_smem(group: usize) -> u32 {
+    ((group * 16 + 2 * 32) * 256 * 2) as u32
 }
 
 /// Padded batch sizes that get a captured decode graph.
@@ -299,6 +309,11 @@ impl Model {
             tok: gpu.alloc(sq * 4)?,
         };
         gpu.sync()?;
+        let attn_tc_smem = attention_tc_smem(cfg.num_attention_heads / cfg.num_key_value_heads);
+        gpu.opt_in_dynamic_smem(
+            <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
+            attn_tc_smem,
+        )?;
         let upload_s = t1.elapsed().as_secs_f64();
         Ok(Self {
             cfg,
@@ -317,6 +332,8 @@ impl Model {
             cur_tiles: 0,
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
+            tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
+            attn_tc_smem,
         })
     }
 
@@ -721,7 +738,38 @@ impl Model {
                         }
                         .map_err(de)?;
                     }
-                    if self.cur_tiles > 0 && !self.ref_attn {
+                    if self.cur_tiles > 0 && !self.ref_attn && !self.tile_attn {
+                        let grp = (h / hkv) as u32;
+                        let launch = cuda_core::LaunchConfig {
+                            grid_dim: (self.cur_tiles as u32, hkv, 1),
+                            block_dim: (32 * grp, 1, 1),
+                            shared_mem_bytes: self.attn_tc_smem,
+                        };
+                        unsafe {
+                            g.k.attention_tc(
+                                &st,
+                                launch,
+                                s.q as *const u16,
+                                l.k_cache as *const u16,
+                                l.v_cache as *const u16,
+                                s.proj as *const u16,
+                                n as u32,
+                                s.mix as *mut u16,
+                                s.tile_start as *const u32,
+                                s.tile_len as *const u32,
+                                s.tok_pos as *const u32,
+                                s.tok_seq as *const u32,
+                                s.tables as *const u32,
+                                mb,
+                                bs,
+                                h,
+                                hkv,
+                                scale,
+                            )
+                        }
+                        .map_err(de)?;
+                    }
+                    if self.cur_tiles > 0 && !self.ref_attn && self.tile_attn {
                         unsafe {
                             g.k.attention_tile(
                                 &st,
