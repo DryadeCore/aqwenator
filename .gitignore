@@ -3,3 +3,4 @@ target/
 *.ptx
 *.ll
 bench-results/
+.claude/

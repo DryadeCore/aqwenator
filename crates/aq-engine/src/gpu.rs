@@ -105,6 +105,9 @@ unsafe extern "C" {
     fn cuGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
     fn cuGraphDestroy(graph: *mut c_void) -> i32;
     fn cuDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> i32;
+    fn cuModuleGetFunction(f: *mut *mut c_void, module: *mut c_void, name: *const std::ffi::c_char) -> i32;
+    fn cuFuncSetAttribute(f: *mut c_void, attr: i32, value: i32) -> i32;
+    fn cuFuncGetAttribute(value: *mut i32, attr: i32, f: *mut c_void) -> i32;
 }
 
 fn drv(r: i32, what: &str) -> Result<()> {
@@ -140,6 +143,29 @@ impl Gpu {
 
     pub fn launch_graph(&self, exec: u64) -> Result<()> {
         drv(unsafe { cuGraphLaunch(exec as *mut c_void, self.raw_stream()) }, "cuGraphLaunch")
+    }
+
+    /// Allow `kernel` to launch with up to `bytes` of dynamic shared memory (needed above 48 KiB;
+    /// the raw launch path does not opt in by itself).
+    pub fn opt_in_dynamic_smem(&self, kernel: &str, bytes: u32) -> Result<()> {
+        const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+        let name = std::ffi::CString::new(kernel)?;
+        let mut f = std::ptr::null_mut();
+        let module = self.k.as_cuda_module().cu_module() as *mut c_void;
+        drv(unsafe { cuModuleGetFunction(&mut f, module, name.as_ptr()) }, "cuModuleGetFunction")?;
+        if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
+            // CU_FUNC_ATTRIBUTE_*: 1 static smem, 3 local (spill) bytes, 4 registers per thread.
+            let get = |a: i32| {
+                let mut v = 0;
+                unsafe { cuFuncGetAttribute(&mut v, a, f) };
+                v
+            };
+            eprintln!("kernel {kernel}: {} regs/thread, {} B local, {} B static smem, {bytes} B dynamic smem", get(4), get(3), get(1));
+        }
+        drv(
+            unsafe { cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32) },
+            "cuFuncSetAttribute",
+        )
     }
 }
 
