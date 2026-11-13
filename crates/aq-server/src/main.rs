@@ -190,6 +190,11 @@ struct EngineOpts {
     max_running: Option<usize>,
     session_cache: bool,
     spec_k: usize,
+    policy: aq_engine::engine::Policy,
+    max_snapshots: Option<usize>,
+    itl_target_ms: Option<f64>,
+    adaptive: Option<(usize, usize)>,
+    prewarm: bool,
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -201,6 +206,17 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
             return;
         }
     };
+    let mut model = model;
+    if opts.prewarm {
+        let t = Instant::now();
+        match model.prewarm_gemms() {
+            Ok(n) => eprintln!("prewarmed GEMM plans for {n} M buckets in {:.1}s", t.elapsed().as_secs_f64()),
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        }
+    }
     let mut eng = Engine::new(model, eos);
     if let Some(m) = opts.mixed {
         eng.mixed_prefill_budget = m;
@@ -214,6 +230,13 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         // Fixed decode-attention slices keep speculative and plain decoding numerically aligned.
         eng.model.attn_split_keys = 64;
     }
+    eng.policy = opts.policy;
+    if let Some(n) = opts.max_snapshots {
+        eng.max_snapshots = n;
+    }
+    eng.itl_target_us = opts.itl_target_ms.map(|m| m * 1000.0);
+    eng.mixed_prefill_adaptive = opts.adaptive;
+    eprintln!("policy: {:?} max_snapshots {} itl_target_ms {:?}", eng.policy, eng.max_snapshots, opts.itl_target_ms);
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());
     let _ = ready.send(Ok(()));
@@ -242,8 +265,9 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} | spec drafted {} accepted {} tok/step {:.2}",
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} (snapshot {}) deferred {} host {:.0}us/step | spec drafted {} accepted {} tok/step {:.2}",
                 eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions,
+                c.snapshot_evictions, c.deferred, c.host_us as f64 / c.steps.max(1) as f64,
                 eng.spec.drafted, eng.spec.accepted, eng.spec.emitted as f64 / eng.spec.decode_entries.max(1) as f64
             );
             last_report = Instant::now();
@@ -304,7 +328,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4 };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
@@ -317,6 +341,28 @@ async fn main() -> Result<()> {
             "--max-running" => opts.max_running = Some(v.parse()?),
             "--session-cache" => opts.session_cache = v.parse()?,
             "--spec-k" => opts.spec_k = v.parse()?,
+            "--evict" => {
+                opts.policy.evict = match v.as_str() {
+                    "lru" => aq_engine::engine::Evict::Lru,
+                    "mru" => aq_engine::engine::Evict::Mru,
+                    "idle" => aq_engine::engine::Evict::Idle,
+                    _ => anyhow::bail!("--evict lru|mru|idle"),
+                }
+            }
+            "--pin-snapshots" => opts.policy.pin_snapshots = v.parse()?,
+            "--load-control" => opts.policy.load_control = v.parse()?,
+            "--srpt" => opts.policy.srpt = v.parse()?,
+            "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
+            "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
+            "--quantum" => opts.policy.quantum = v.parse()?,
+            "--prewarm" => opts.prewarm = v.parse()?,
+            "--mixed-prefill-adaptive" => {
+                // "HI:THRESHOLD", e.g. 8192:16384
+                let (a, b) = v.split_once(':').context("--mixed-prefill-adaptive HI:THRESHOLD")?;
+                opts.adaptive = Some((a.parse()?, b.parse()?));
+            }
+            "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
+            "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
             _ => anyhow::bail!("unknown option {k}"),
         }

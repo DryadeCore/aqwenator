@@ -223,6 +223,21 @@ fn main() -> Result<()> {
     // AQ_SPEC_K: run the engine-level checks below with speculative decoding on.
     let spec_env: usize = std::env::var("AQ_SPEC_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     eng.spec_k = spec_env;
+    // AQ_CHECK_POLICY=mru,pin,load,srpt: run the engine-level tests under these policies.
+    if let Ok(p) = std::env::var("AQ_CHECK_POLICY") {
+        for f in p.split(',') {
+            match f {
+                "mru" => eng.policy.evict = aq_engine::engine::Evict::Mru,
+                "idle" => eng.policy.evict = aq_engine::engine::Evict::Idle,
+                "pin" => eng.policy.pin_snapshots = true,
+                "load" => eng.policy.load_control = true,
+                "srpt" => eng.policy.srpt = true,
+                "q4" => eng.policy.quantum = 4,
+                _ => {}
+            }
+        }
+        println!("policy: {:?}", eng.policy);
+    }
     for id in 0..3u64 {
         eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
     }
@@ -410,6 +425,58 @@ fn main() -> Result<()> {
         }
         (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m) = saved;
         eng.coexec = coexec_saved;
+    }
+
+    // ---- 7. memory pressure: shrink the page pool to about two sessions, then interleave
+    // two-turn sessions of three different prompts so admissions evict parked sessions and
+    // snapshots and later re-admit them. Every request must match a cold run (no cache).
+    if ids.len() > 1100 {
+        let bs = eng.limits().block_size;
+        let per = (ids.len() + 64 + 64).div_ceil(bs);
+        eng.evict_all_parked();
+        let free_now = eng.free_pages();
+        eng.withhold_pages(free_now.saturating_sub(per * 2 + per / 2));
+        let pre = (ids.len() - 64) / 16 * 16;
+        let prompt = |k: u32| -> Vec<u32> { ids[..pre].iter().copied().chain(ids[pre..].iter().map(|&t| t ^ k)).collect() };
+        let run = |eng: &mut Engine, cached: bool| -> Result<Vec<Vec<u32>>> {
+            eng.session_cache = cached;
+            let mut outs: Vec<Vec<u32>> = vec![Vec::new(); 6];
+            // Turn 1 for all three, two at a time; turn 2 extends each with its own output.
+            for (k, round) in [[0u32, 1], [2, 0], [1, 2]].iter().enumerate() {
+                for &a in round.iter() {
+                    let first = outs[a as usize].is_empty();
+                    let p = if first {
+                        prompt(a + 1)
+                    } else {
+                        let mut p = prompt(a + 1);
+                        p.extend(&outs[a as usize][..7]);
+                        p.extend(ids[..40].iter().map(|&t| t ^ (a + 7)));
+                        p
+                    };
+                    let id = if first { a as u64 } else { 3 + a as u64 };
+                    eng.add(Request { id: 300 + id, prompt: p, max_new_tokens: 8, ignore_eos: true })?;
+                }
+                let _ = k;
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        outs[(e.id - 300) as usize].push(e.token);
+                    }
+                }
+            }
+            Ok(outs)
+        };
+        let before = eng.cache;
+        let warm = run(&mut eng, true)?;
+        let after = eng.cache;
+        let cold = run(&mut eng, false)?;
+        let ok = warm == cold;
+        println!(
+            "memory pressure: {} evictions, {} hits during the run; 6 requests {}",
+            after.evictions - before.evictions,
+            after.hits - before.hits,
+            if ok { "identical to a cold run" } else { "DIFFER from a cold run" }
+        );
+        failed |= !ok;
     }
 
     if failed {

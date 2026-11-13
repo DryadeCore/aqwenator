@@ -61,6 +61,8 @@ struct Seq {
     cancelled: bool,
     /// Prompt-lookup index over the known tokens, built on the first speculative step.
     draft: Option<DraftIndex>,
+    /// Turns served since this session last became resident (cache hits keep counting).
+    turns: u32,
 }
 
 /// A prefill batch launched on lane 0 and not collected yet (co-execution). Sequences are
@@ -84,6 +86,63 @@ impl Seq {
     }
 }
 
+/// `t` is a strict prefix of `prompt`. Cheap rejects first (last and middle token), so the
+/// full comparison usually runs only for the request's own session.
+#[inline]
+fn is_strict_prefix(t: &[u32], prompt: &[u32]) -> bool {
+    let n = t.len();
+    n < prompt.len() && (n == 0 || (t[n - 1] == prompt[n - 1] && t[n / 2] == prompt[n / 2])) && prompt[..n] == t[..]
+}
+
+/// Which parked session to evict when pages or slots run out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evict {
+    /// Least recently parked first (classic LRU).
+    Lru,
+    /// Most recently parked first. With bounded tool think time, the session parked longest
+    /// ago is the one most likely to come back next, so LRU evicts exactly the wrong one.
+    Mru,
+    /// Idle-aware: sessions idle longer than `dead_after_ms` are presumed finished and go
+    /// first (oldest first); among the live ones, most recently parked first.
+    Idle,
+}
+
+/// Memory and scheduling policy knobs (all default to the original behavior).
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    pub evict: Evict,
+    /// Never evict shared-prefix snapshots to make room (only `max_snapshots` replacement),
+    /// and do not create a snapshot identical to an existing one.
+    pub pin_snapshots: bool,
+    /// Working-set load control: a request that is not a cache hit may not evict parked
+    /// sessions; it waits for free pages unless nothing runs or it has waited `max_wait_ms`.
+    pub load_control: bool,
+    /// Shortest-remaining-uncached-work first, for admission and prefill chunk order, with
+    /// aging past `max_wait_ms`.
+    pub srpt: bool,
+    pub max_wait_ms: u64,
+    /// `Evict::Idle`: idle time after which a parked session is presumed finished.
+    pub dead_after_ms: u64,
+    /// Load control residency quantum: a waiting non-hit request may evict a live parked
+    /// session once that session has been served this many turns since it became resident
+    /// (0 = never; only finished sessions).
+    pub quantum: u32,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            evict: Evict::Lru,
+            pin_snapshots: false,
+            load_control: false,
+            srpt: false,
+            max_wait_ms: 2000,
+            dead_after_ms: 6000,
+            quantum: 0,
+        }
+    }
+}
+
 /// Recurrent state + KV pages at a shared prefix boundary (page aligned).
 struct Snapshot {
     tokens: Vec<u32>,
@@ -103,6 +162,8 @@ struct Parked {
     slot: u32,
     blocks: Vec<u32>,
     last_used: u64,
+    parked_at: Instant,
+    turns: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -114,6 +175,11 @@ pub struct CacheStats {
     pub reused_tokens: u64,
     pub prefilled_tokens: u64,
     pub evictions: u64,
+    pub snapshot_evictions: u64,
+    pub deferred: u64,
+    /// Scheduler host time (admission + batch building) and steps, cumulative.
+    pub host_us: u64,
+    pub steps: u64,
 }
 
 /// Speculative decoding counters.
@@ -140,7 +206,7 @@ pub struct StepStats {
 
 pub struct Engine {
     pub model: Model,
-    waiting: VecDeque<Request>,
+    waiting: VecDeque<(Request, Instant)>,
     running: Vec<Seq>,
     free_slots: Vec<u32>,
     free_blocks: Vec<u32>,
@@ -179,9 +245,28 @@ pub struct Engine {
     pub overlap_steps: u64,
     /// Minimum time between decode steps while a prefill batch is in flight (AQ_COEXEC_PACE_US):
     /// leaves the GPU to prefill between decode steps, trading inter-token latency for TTFT.
-    pub pace: std::time::Duration,
+    pub coexec_pace: std::time::Duration,
     last_decode: Option<Instant>,
+    /// (larger budget, pending-prefill threshold in tokens): switch mixed steps to the larger
+    /// prefill budget while more than `threshold` admitted prompt tokens await prefill.
+    pub mixed_prefill_adaptive: Option<(usize, usize)>,
+    pub policy: Policy,
+    /// Frame pacing: target duration of a step that carries decode tokens (µs).
+    pub itl_target_us: Option<f64>,
+    pace: Pace,
+    /// Set during an admission that may only evict sessions presumed finished.
+    dead_only: bool,
 }
+
+/// Online step-cost model for frame pacing.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    decode_us: f64,
+    prefill_us_per_tok: f64,
+}
+
+/// Smallest prefill chunk frame pacing will schedule next to decodes (keeps prefill moving).
+const PACE_MIN_CHUNK: usize = 256;
 
 impl Engine {
     pub fn new(model: Model, eos: Vec<u32>) -> Self {
@@ -210,10 +295,15 @@ impl Engine {
             coexec: false,
             inflight: None,
             overlap_steps: 0,
-            pace: std::time::Duration::from_micros(
+            coexec_pace: std::time::Duration::from_micros(
                 std::env::var("AQ_COEXEC_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
             last_decode: None,
+            mixed_prefill_adaptive: None,
+            policy: Policy::default(),
+            itl_target_us: None,
+            pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
+            dead_only: false,
         };
         if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
             eng.enable_coexec().expect("could not create the decode lane for AQ_COEXEC=1");
@@ -249,7 +339,7 @@ impl Engine {
                 lim.num_blocks()
             );
         }
-        self.waiting.push_back(req);
+        self.waiting.push_back((req, Instant::now()));
         Ok(())
     }
 
@@ -258,7 +348,7 @@ impl Engine {
     /// is on), or, if its prefill batch is in flight, as soon as that batch is collected.
     /// Returns false if the request is not known (already finished).
     pub fn cancel(&mut self, id: u64) -> bool {
-        if let Some(i) = self.waiting.iter().position(|r| r.id == id) {
+        if let Some(i) = self.waiting.iter().position(|(r, _)| r.id == id) {
             self.waiting.remove(i);
             return true;
         }
@@ -309,24 +399,85 @@ impl Engine {
         true
     }
 
-    /// Drop the least-recently-used parked session (or, if none, the least-recently-used
-    /// snapshot), returning its slot and pages.
+    fn is_dead(&self, i: usize, now: Instant) -> bool {
+        now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms
+    }
+
+    /// May a restricted admission (load control, non-hit) evict parked session `i`? Sessions
+    /// presumed finished always; with a residency quantum, also sessions that have been served
+    /// `quantum` turns since they last became resident (working-set rotation).
+    fn evictable_restricted(&self, i: usize, now: Instant) -> bool {
+        self.is_dead(i, now) || (self.policy.quantum > 0 && self.parked[i].turns >= self.policy.quantum)
+    }
+
+    /// Evict one parked session chosen by the policy (or, if none and snapshots are not
+    /// pinned, the least-recently-used snapshot), returning its slot and pages.
+    /// With `self.dead_only`, only sessions presumed finished may go.
     fn evict_lru(&mut self) -> bool {
-        if let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) {
+        if self.dead_only {
+            // Restricted: finished sessions first (oldest first), then the sessions that have
+            // used up their residency quantum (most served first).
+            let now = Instant::now();
+            let dead = (0..self.parked.len()).filter(|&i| self.is_dead(i, now)).min_by_key(|&i| self.parked[i].parked_at);
+            let Some(i) = dead.or_else(|| {
+                (0..self.parked.len()).filter(|&i| self.evictable_restricted(i, now)).max_by_key(|&i| self.parked[i].turns)
+            }) else {
+                return false;
+            };
             let p = self.parked.swap_remove(i);
             self.free_slots.push(p.slot);
             self.release(p.blocks);
             self.cache.evictions += 1;
             return true;
         }
+        let victim = match self.policy.evict {
+            Evict::Lru => (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used),
+            Evict::Mru => (0..self.parked.len()).max_by_key(|&i| self.parked[i].last_used),
+            Evict::Idle => {
+                let now = Instant::now();
+                let dead = |i: usize| now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms;
+                (0..self.parked.len())
+                    .filter(|&i| dead(i))
+                    .min_by_key(|&i| self.parked[i].parked_at)
+                    .or_else(|| (0..self.parked.len()).max_by_key(|&i| self.parked[i].parked_at))
+            }
+        };
+        if let Some(i) = victim {
+            let p = self.parked.swap_remove(i);
+            self.free_slots.push(p.slot);
+            self.release(p.blocks);
+            self.cache.evictions += 1;
+            return true;
+        }
+        if self.policy.pin_snapshots {
+            return false;
+        }
         if let Some(i) = (0..self.snapshots.len()).min_by_key(|&i| self.snapshots[i].last_used) {
             let sn = self.snapshots.swap_remove(i);
             self.free_slots.push(sn.slot);
             self.release(sn.blocks);
             self.cache.evictions += 1;
+            self.cache.snapshot_evictions += 1;
             return true;
         }
         false
+    }
+
+    /// Test hook: permanently remove up to `n` free pages from the pool (a smaller GPU).
+    pub fn withhold_pages(&mut self, n: usize) {
+        let keep = self.free_blocks.len() - n.min(self.free_blocks.len());
+        self.free_blocks.truncate(keep);
+    }
+
+    pub fn free_pages(&self) -> usize {
+        self.free_blocks.len()
+    }
+
+    /// Test hook: evict every parked session.
+    pub fn evict_all_parked(&mut self) {
+        while !self.parked.is_empty() {
+            self.evict_lru();
+        }
     }
 
     /// Take `n` free KV pages (refcount 1), evicting cached sessions as needed.
@@ -360,6 +511,13 @@ impl Engine {
 
     /// Take a snapshot of running sequence `i` at its current position (page aligned).
     fn snapshot(&mut self, i: usize) -> Result<()> {
+        if self.policy.pin_snapshots {
+            let s = &self.running[i];
+            let n = s.computed;
+            if self.snapshots.iter().any(|sn| sn.tokens.len() == n && (0..n).all(|k| sn.tokens[k] == s.token_at(k))) {
+                return Ok(());
+            }
+        }
         if self.snapshots.len() >= self.max_snapshots {
             if let Some(j) = (0..self.snapshots.len()).min_by_key(|&j| self.snapshots[j].last_used) {
                 let sn = self.snapshots.swap_remove(j);
@@ -383,35 +541,119 @@ impl Engine {
         Ok(())
     }
 
-    /// Admit the request at the head of the queue, resuming a parked session when one is a
-    /// strict prefix of its prompt. Returns false if resources are not available yet.
-    fn admit_one(&mut self) -> Result<bool> {
+    fn find_parked(&self, prompt: &[u32]) -> Option<usize> {
+        if !self.session_cache {
+            return None;
+        }
+        (0..self.parked.len())
+            .filter(|&i| is_strict_prefix(&self.parked[i].tokens, prompt))
+            .max_by_key(|&i| self.parked[i].tokens.len())
+    }
+
+    fn find_snapshot(&self, prompt: &[u32]) -> Option<usize> {
+        if !self.session_cache {
+            return None;
+        }
+        (0..self.snapshots.len())
+            .filter(|&i| is_strict_prefix(&self.snapshots[i].tokens, prompt))
+            .max_by_key(|&i| self.snapshots[i].tokens.len())
+    }
+
+    /// Tokens of `prompt` that already have state (parked session or snapshot).
+    fn cached_len(&self, prompt: &[u32]) -> usize {
+        let p = self.find_parked(prompt).map(|i| self.parked[i].tokens.len()).unwrap_or(0);
+        let s = self.find_snapshot(prompt).map(|i| self.snapshots[i].tokens.len()).unwrap_or(0);
+        p.max(s)
+    }
+
+    /// Admit waiting requests while there is room, per the policy.
+    fn admit(&mut self) -> Result<()> {
+        let cap = self.max_running.min(self.limits().max_seqs);
+        let pol = self.policy;
+        if !pol.load_control && !pol.srpt {
+            // Original behavior: strict FIFO, stop at the first request that does not fit.
+            while !self.waiting.is_empty() && self.running.len() < cap {
+                if !self.try_admit(0, true)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        let now = Instant::now();
+        let aged = |t: Instant| now.duration_since(t).as_millis() as u64 >= pol.max_wait_ms;
+        // Candidate order: aged requests first, then by remaining uncached work (SRPT) or FIFO.
+        let mut order: Vec<(bool, usize, usize, u64)> = self
+            .waiting
+            .iter()
+            .enumerate()
+            .map(|(i, (r, t))| {
+                let rem = if pol.srpt { r.prompt.len() - self.cached_len(&r.prompt) } else { 0 };
+                (!aged(*t), rem, i, r.id)
+            })
+            .collect();
+        order.sort();
+        for (not_aged, _, _, id) in order {
+            if self.running.len() >= cap {
+                break;
+            }
+            let Some(wi) = self.waiting.iter().position(|(r, _)| r.id == id) else { continue };
+            let hit = self.find_parked(&self.waiting[wi].0.prompt).is_some();
+            // Hits may evict freely unless a residency quantum is set (then everyone rotates
+            // through the same restricted victims); anyone waiting past max_wait may.
+            let hit_ok = hit && pol.quantum == 0;
+            let allow_evict = !pol.load_control || hit_ok || !not_aged || self.running.is_empty();
+            // Without permission to evict live sessions, sessions presumed finished may still go.
+            self.dead_only = !allow_evict;
+            let ok = self.try_admit(wi, allow_evict);
+            self.dead_only = false;
+            if !ok? {
+                self.cache.deferred += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit waiting request `wi`: resume a parked session that is a strict prefix of its
+    /// prompt, else fork a shared-prefix snapshot, else start fresh. With `allow_evict` false
+    /// it only uses free slots and pages plus those of sessions presumed finished (the caller
+    /// sets `dead_only` to match). Checks feasibility first and returns false, changing
+    /// nothing, when the request cannot fit even after the evictions it is allowed.
+    fn try_admit(&mut self, wi: usize, allow_evict: bool) -> Result<bool> {
         let bs = self.limits().block_size;
-        let req = self.waiting.front().unwrap();
+        let req = &self.waiting[wi].0;
         let need = (req.prompt.len() + req.max_new_tokens).div_ceil(bs);
-        let best = if self.session_cache {
-            (0..self.parked.len())
-                .filter(|&i| {
-                    let t = &self.parked[i].tokens;
-                    t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..]
-                })
-                .max_by_key(|&i| self.parked[i].tokens.len())
-        } else {
-            None
-        };
-        let fork = if best.is_none() && self.session_cache {
-            (0..self.snapshots.len())
-                .filter(|&i| {
-                    let t = &self.snapshots[i].tokens;
-                    t.len() < req.prompt.len() && req.prompt[..t.len()] == t[..]
-                })
-                .max_by_key(|&i| self.snapshots[i].tokens.len())
-        } else {
-            None
-        };
+        let best = self.find_parked(&req.prompt);
+        let fork = if best.is_none() { self.find_snapshot(&req.prompt) } else { None };
+        {
+            // Feasibility before touching anything: free pages, plus (if eviction is allowed)
+            // the pages evicting other parked sessions would actually return (refcount 1).
+            // Without this, a request that cannot fit evicts the whole cache and then fails.
+            let have = match (best, fork) {
+                (Some(i), _) => self.parked[i].blocks.len().min(need),
+                (None, Some(i)) => self.snapshots[i].blocks.len().min(need),
+                _ => 0,
+            };
+            let mut avail = self.free_blocks.len();
+            let mut slots = self.free_slots.len();
+            let now = Instant::now();
+            for (k, p) in self.parked.iter().enumerate() {
+                if Some(k) == best || (!allow_evict && !self.evictable_restricted(k, now)) {
+                    continue;
+                }
+                avail += p.blocks.iter().filter(|&&b| self.refcnt[b as usize] == 1).count();
+                slots += 1;
+            }
+            let slot_ok = best.is_some() || slots > 0;
+            if !slot_ok || avail < need - have {
+                return Ok(false);
+            }
+        }
         let mut snapshot_at = None;
+        let mut forked = false;
+        let mut resident_turns = 0;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
+            resident_turns = p.turns;
             (p.slot, p.blocks, p.tokens.len())
         } else {
             let slot = match self.free_slots.pop() {
@@ -420,10 +662,16 @@ impl Engine {
                     if !self.evict_lru() {
                         return Ok(false);
                     }
-                    self.free_slots.pop().unwrap()
+                    match self.free_slots.pop() {
+                        Some(s) => s,
+                        None => return Ok(false),
+                    }
                 }
             };
-            if let Some(i) = fork.filter(|&i| i < self.snapshots.len()) {
+            // Eviction may have removed or reordered snapshots: look the fork up again by
+            // content, never by a stale index.
+            let fork = if fork.is_some() { self.find_snapshot(&self.waiting[wi].0.prompt) } else { None };
+            if let Some(i) = fork {
                 // Fork from the shared-prefix snapshot: copy its state, share its pages.
                 let clock = self.clock;
                 let sn = &mut self.snapshots[i];
@@ -434,13 +682,12 @@ impl Engine {
                 for &b in &blocks {
                     self.refcnt[b as usize] += 1;
                 }
-                self.cache.forks += 1;
+                forked = true;
                 (slot, blocks, n)
             } else {
                 self.model.reset_slot(slot as usize)?;
                 if self.session_cache {
-                    let req = self.waiting.front().unwrap();
-                    let shared = self.shared_prefix(&req.prompt);
+                    let shared = self.shared_prefix(&self.waiting[wi].0.prompt);
                     if shared >= SNAPSHOT_MIN_TOKENS {
                         snapshot_at = Some(shared);
                     }
@@ -459,8 +706,8 @@ impl Engine {
                 // Not enough pages even after evicting everything parked: put the session
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
-                    let tokens = self.waiting.front().unwrap().prompt[..computed].to_vec();
-                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock });
+                    let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
+                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns });
                 } else {
                     self.free_slots.push(slot);
                     self.release(blocks);
@@ -468,14 +715,17 @@ impl Engine {
                 return Ok(false);
             }
         }
-        let req = self.waiting.pop_front().unwrap();
+        let (req, _) = self.waiting.remove(wi).unwrap();
         self.cache.admitted += 1;
+        if forked {
+            self.cache.forks += 1;
+        }
         if computed > 0 {
             self.cache.hits += 1;
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns });
         Ok(true)
     }
 
@@ -570,7 +820,7 @@ impl Engine {
                 let keep = s.computed.div_ceil(bs).min(s.blocks.len());
                 let extra = s.blocks.split_off(keep);
                 self.release(extra);
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
+                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now(), turns: s.turns + 1 });
             } else {
                 self.free_slots.push(s.slot);
                 self.release(s.blocks);
@@ -597,11 +847,7 @@ impl Engine {
         let lim = self.limits();
         self.model.set_lane(0);
         self.clock += 1;
-        while !self.waiting.is_empty() && self.running.len() < self.max_running.min(lim.max_seqs) {
-            if !self.admit_one()? {
-                break;
-            }
-        }
+        self.admit()?;
         let mut events = Vec::new();
 
         // 1. Launch a prefill batch on lane 0 if none is in flight.
@@ -649,10 +895,10 @@ impl Engine {
             .map(|(i, s)| (i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ)))
             .collect();
         let decode_seqs = dplan.len();
-        if decode_seqs > 0 && self.inflight.is_some() && !self.pace.is_zero() {
+        if decode_seqs > 0 && self.inflight.is_some() && !self.coexec_pace.is_zero() {
             // Pacing: give the in-flight prefill the GPU until the next decode step is due.
             if let Some(last) = self.last_decode {
-                let due = last + self.pace;
+                let due = last + self.coexec_pace;
                 while Instant::now() < due {
                     if self.model.lane_done(0)? {
                         break;
@@ -738,13 +984,9 @@ impl Engine {
         let lim = self.limits();
         let mut budget = lim.max_tokens;
 
-        // Admit waiting requests (FIFO) while there is room to run them.
+        // Admit waiting requests while there is room to run them.
         self.clock += 1;
-        while !self.waiting.is_empty() && self.running.len() < self.max_running.min(lim.max_seqs) {
-            if !self.admit_one()? {
-                break;
-            }
-        }
+        self.admit()?;
 
         // Decode-path entries first (pending tokens + optional drafts), then prefill chunks in
         // admission order.
@@ -788,13 +1030,40 @@ impl Engine {
         }
         let decode_seqs = plan.len();
         if decode_seqs > 0 {
-            budget = budget.min(self.mixed_prefill_budget);
+            // Adaptive: while admitted prefill work is backed up past the threshold, use the
+            // larger budget (throughput and TTFT under overload); otherwise the small one
+            // (inter-token latency when prefill is light).
+            let mixed = match self.mixed_prefill_adaptive {
+                Some((hi, threshold)) => {
+                    let pending: usize = self
+                        .running
+                        .iter()
+                        .map(|s| s.req.prompt.len().saturating_sub(s.computed))
+                        .sum();
+                    if pending > threshold { hi } else { self.mixed_prefill_budget }
+                }
+                None => self.mixed_prefill_budget,
+            };
+            budget = budget.min(mixed);
+            // Frame pacing: size the prefill part so the whole step fits the ITL target,
+            // from online estimates of the decode cost and the per-token prefill cost.
+            if let Some(target) = self.itl_target_us {
+                let room = target - self.pace.decode_us.min(target * 0.8);
+                let tokens = (room / self.pace.prefill_us_per_tok.max(1e-3)) as usize;
+                budget = budget.min(tokens.max(PACE_MIN_CHUNK));
+            }
         }
-        for (i, s) in self.running.iter().enumerate() {
+        // Prefill order: admission order, or shortest remaining prefill first (SRPT).
+        let mut prefill: Vec<usize> = (0..self.running.len()).filter(|&i| self.running[i].computed < self.running[i].req.prompt.len()).collect();
+        if self.policy.srpt {
+            prefill.sort_by_key(|&i| self.running[i].req.prompt.len() - self.running[i].computed);
+        }
+        for i in prefill {
+            let s = &self.running[i];
             if budget == 0 {
                 break;
             }
-            if s.computed < s.req.prompt.len() {
+            {
                 let mut n = (s.req.prompt.len() - s.computed).min(budget);
                 if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
                     n = n.min(at - s.computed);
@@ -847,9 +1116,21 @@ impl Engine {
         }
         b.n_decode = decode_seqs;
         let host_us = t0.elapsed().as_micros() as u64;
+        self.cache.host_us += host_us;
+        self.cache.steps += 1;
         let t1 = Instant::now();
         let toks = self.model.step(&b, None)?;
         let gpu_us = t1.elapsed().as_micros() as u64;
+        // Update the pacing model: pure-decode steps give the decode cost, mixed steps give
+        // the per-token prefill cost on top of it.
+        let prefill_tokens = b.tokens.len() - decode_seqs;
+        if prefill_tokens == 0 {
+            self.pace.decode_us = 0.9 * self.pace.decode_us + 0.1 * gpu_us as f64;
+        } else if prefill_tokens >= 64 {
+            let base = if decode_seqs > 0 { self.pace.decode_us } else { 0.0 };
+            let per = ((gpu_us as f64 - base).max(0.0)) / prefill_tokens as f64;
+            self.pace.prefill_us_per_tok = 0.8 * self.pace.prefill_us_per_tok + 0.2 * per;
+        }
 
         let mut events = Vec::new();
         let mut done = Vec::new();

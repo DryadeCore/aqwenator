@@ -570,6 +570,47 @@ impl Model {
 
     /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
     /// before they are read and need no reset).
+    /// Tune every cuBLASLt plan the engine can hit (each M bucket up to `max_tokens` for every
+    /// weight shape, and the LM head up to `max_seqs`) on scratch buffers, so no step ever
+    /// stalls on a first-use autotune mid-run. Results in the scratch buffers are garbage and
+    /// are overwritten by the next real step. Returns the number of M values tried.
+    pub fn prewarm_gemms(&mut self) -> Result<usize> {
+        let c = self.cfg.clone();
+        let lim = self.limits;
+        let mut ms: Vec<usize> = (1..=16).map(|i| i * 16).collect();
+        ms.extend((3..=16).map(|i| i * 128));
+        ms.extend((5..=16).map(|i| i * 512));
+        ms.retain(|&m| m <= lim.max_tokens);
+        let (s, g) = (&self.s, &mut self.gpu);
+        let mut shapes: Vec<(usize, usize, u64, u64)> = Vec::new(); // (n, k, x, y)
+        let mut seen = std::collections::HashSet::new();
+        for l in &self.layers {
+            let w = match l.kind {
+                LayerKind::Linear => vec![(c.gdn_proj_ld(), c.hidden_size, s.h, s.proj, l.gdn_proj), (c.hidden_size, c.value_dim(), s.mix, s.delta, l.out_proj)],
+                LayerKind::Full => vec![
+                    (c.attn_proj_dim(), c.hidden_size, s.h, s.proj, l.qkv),
+                    (c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, s.delta, l.o_proj),
+                ],
+            };
+            for (n, k, x, y, wt) in w.into_iter().chain([
+                (2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up),
+                (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down),
+            ]) {
+                if seen.insert((n, k)) {
+                    shapes.push((n, k, x, y));
+                    for &m in &ms {
+                        g.gemm(m, lim.max_tokens, n, k, x, wt, y, CUDA_R_16BF)?;
+                    }
+                }
+            }
+        }
+        for m in 1..=lim.max_seqs {
+            g.gemm(m, lim.max_seqs, c.vocab_size, c.hidden_size, s.hfinal, self.lm_head, s.logits, CUDA_R_16BF)?;
+        }
+        g.sync()?;
+        Ok(ms.len())
+    }
+
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
         let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;
         let csz = self.cfg.conv_dim() * 3 * 2;
