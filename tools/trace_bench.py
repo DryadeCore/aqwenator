@@ -143,7 +143,7 @@ def summary(xs):
     }
 
 
-async def one_turn(http, args, turn, new_tokens, turns_out, errors, t0_measure):
+async def one_turn(http, args, turn, new_tokens, first, turns_out, errors, t0_measure):
     body = {
         "model": args.model,
         "prompt": turn["prompt"],
@@ -179,6 +179,7 @@ async def one_turn(http, args, turn, new_tokens, turns_out, errors, t0_measure):
                 "t": t_send,
                 "ctx": len(turn["prompt"]),
                 "new_prompt": new_tokens,
+                "first": first,
                 "ttft": times[0] - t_send,
                 # Tokens that arrive together (speculation) count as one gap shared between them.
                 "itl": [b - a for a, b in zip(times, times[1:])],
@@ -202,7 +203,7 @@ async def agent(i, args, sessions, turns_out, errors, t0_measure, t_end):
             for turn in s["turns"]:
                 if time.perf_counter() >= t_end:
                     break
-                await one_turn(http, args, turn, len(turn["prompt"]) - prev, turns_out, errors, t0_measure)
+                await one_turn(http, args, turn, len(turn["prompt"]) - prev, prev == 0, turns_out, errors, t0_measure)
                 prev = len(turn["prompt"])
                 await asyncio.sleep(rng.uniform(*args.think_ms) / 1000)
 
@@ -229,6 +230,9 @@ async def run(args):
         "itl_ms": summary([g * 1e3 for t in turns for g in t["itl"]]),
         "tpot_ms": summary([(t["e2e"] - t["ttft"]) / max(1, t["gen"] - 1) * 1e3 for t in turns if t["gen"] > 1]),
         "e2e_ms": summary([t["e2e"] * 1e3 for t in turns]),
+        # One row per turn: [context, new prompt tokens, first turn of its session, TTFT ms,
+        # output tokens, end-to-end ms], for comparisons at equal turn size.
+        "per_turn": [[t["ctx"], t["new_prompt"], int(t["first"]), round(t["ttft"] * 1e3, 1), t["gen"], round(t["e2e"] * 1e3, 1)] for t in turns],
         "errors": len(errors),
         "error_samples": errors[:3],
     }
