@@ -1,0 +1,10 @@
+[package]
+name = "aq-kernels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+libm.workspace = true

@@ -1,0 +1,4 @@
+# cuda-oxide's codegen backend needs this exact toolchain (rustc_private).
+[toolchain]
+channel = "1.99.1"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "rustfmt", "llvm-tools"]
