@@ -68,8 +68,13 @@ fn main() -> Result<()> {
     let has_tf = g.names().contains(&"tf_logits");
 
     let ctx = (ids.len() + greedy_ref.len() + 64).next_multiple_of(256);
+    // Prefill chunk per step (AQ_CHECK_CHUNK): small, unaligned values exercise sequences whose
+    // prefill spans steps at arbitrary positions.
+    let chunk: usize = std::env::var("AQ_CHECK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
+        .min(std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192));
     let t0 = Instant::now();
-    let mut m = Model::load(&dir, Limits { max_tokens: 8192, max_seqs: 4, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
+    let budget: usize = std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 4, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
     println!(
         "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
         t0.elapsed().as_secs_f64(),
@@ -87,7 +92,7 @@ fn main() -> Result<()> {
     let mut pos = 0;
     let mut first = 0;
     while pos < ids.len() {
-        let n = (ids.len() - pos).min(8192);
+        let n = (ids.len() - pos).min(chunk);
         let want_dump = has_hidden && n == ids.len();
         first = m.step(&m.single(&ids[pos..pos + n], pos), if want_dump { Some(&mut dump) } else { None })?[0];
         pos += n;
@@ -162,7 +167,7 @@ fn main() -> Result<()> {
     m.reset_slot(0)?;
     let mut pos = 0;
     while pos < ids.len() {
-        let n = (ids.len() - pos).min(8192);
+        let n = (ids.len() - pos).min(chunk);
         first = m.step(&m.single(&ids[pos..pos + n], pos), None)?[0];
         pos += n;
     }
@@ -200,6 +205,9 @@ fn main() -> Result<()> {
     let single = out.clone();
 
     let mut eng = Engine::new(m, vec![]);
+    if std::env::var("AQ_CHECK_NOCACHE").is_ok() {
+        eng.session_cache = false;
+    }
     for id in 0..3u64 {
         eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
     }

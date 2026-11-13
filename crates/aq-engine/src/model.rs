@@ -6,7 +6,7 @@
 
 use crate::config::{LayerKind, TextConfig};
 use crate::cublaslt::CUDA_R_16BF;
-use crate::gpu::{Gpu, Prof, cfg, de};
+use crate::gpu::{Gpu, Prof, cfg, cfg_smem, de};
 use cuda_core::LaunchConfig;
 use crate::weights::Checkpoint;
 use anyhow::Result;
@@ -62,6 +62,14 @@ pub struct Scratch {
     gintra: u64,
     gdecay: u64,
     go: u64,
+    // tensor-core chunked GDN (per chunk-head: Qn, Kn, U, W, G, h snapshot, Vn^T)
+    tqn: u64,
+    tkn: u64,
+    tu: u64,
+    tw: u64,
+    tg: u64,
+    tht: u64,
+    tvnt: u64,
     ids: u64,
     tok_pos: u64,
     tok_seq: u64,
@@ -88,8 +96,16 @@ pub struct LoadStats {
     pub weight_bytes: usize,
 }
 
-/// Chunk length of the chunked gated delta rule (must match the kernels).
+/// Chunk length of the CUDA-core chunked gated delta rule (must match the kernels).
 pub const GDN_CHUNK: usize = 32;
+/// Chunk length of the tensor-core chunked gated delta rule (must match the kernels).
+pub const GDN_TC_CHUNK: usize = 64;
+/// Dynamic shared memory of the tensor-core GDN kernels (bytes; must match the kernels).
+const GDN_TC_PREP_SMEM: u32 = 70672;
+const GDN_TC_SCAN_SMEM: u32 = 93696;
+const GDN_TC_OUT_SMEM: u32 = 88832;
+/// Value columns per `gdn_tc_scan` block (must match the kernel).
+const GDN_TC_SCAN_VB: u32 = 32;
 /// Query rows per tile of the prefill attention kernel (must match the kernels).
 pub const ATTN_QTILE: usize = 16;
 /// Blocks per row in the two-phase argmax.
@@ -118,6 +134,10 @@ pub struct Limits {
 impl Limits {
     pub fn max_chunks(&self) -> usize {
         self.max_tokens / GDN_CHUNK + self.max_seqs
+    }
+    /// Upper bound on 64-token chunks in one step: full chunks plus one partial per sequence.
+    pub fn max_tc_chunks(&self) -> usize {
+        self.max_tokens / GDN_TC_CHUNK + self.max_seqs.min(self.max_tokens)
     }
     pub fn max_tiles(&self) -> usize {
         self.max_tokens / ATTN_QTILE + self.max_seqs
@@ -170,13 +190,15 @@ pub struct Model {
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
     cur_tiles: usize,
-    /// A/B switches back to the reference kernels (AQ_GDN_RECURRENT=1, AQ_ATTN_NAIVE=1).
+    /// A/B switches back to the reference kernels (AQ_GDN_RECURRENT=1, AQ_ATTN_NAIVE=1,
+    /// AQ_GDN_CHUNK_CC=1 for the CUDA-core chunked GDN).
     ref_gdn: bool,
     ref_attn: bool,
     /// AQ_ATTN_TILE=1: use the CUDA-core tiled prefill attention instead of tensor cores.
     tile_attn: bool,
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
+    cc_gdn: bool,
 }
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per query head of the group) plus one
@@ -310,6 +332,9 @@ impl Model {
         let sq = lim.max_seqs;
         let hvd = cfg.linear_num_value_heads * 128;
         let hq = cfg.num_attention_heads;
+        let cc_gdn = std::env::var("AQ_GDN_CHUNK_CC").as_deref() == Ok("1");
+        // Only the selected chunked-GDN path gets real scratch; the other gets a stub.
+        let (cct, tcc) = if cc_gdn { (t, 0) } else { (0, lim.max_tc_chunks() * cfg.linear_num_value_heads) };
         let s = Scratch {
             amax_v: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
             amax_i: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
@@ -321,13 +346,20 @@ impl Model {
             seq_nchunk: gpu.alloc(sq * 4)?,
             tile_start: gpu.alloc(lim.max_tiles() * 4)?,
             tile_len: gpu.alloc(lim.max_tiles() * 4)?,
-            gu: gpu.alloc(t * hvd * 4)?,
-            gw: gpu.alloc(t * hvd * 4)?,
-            gqp: gpu.alloc(t * hvd * 4)?,
-            gkp: gpu.alloc(t * hvd * 4)?,
-            gintra: gpu.alloc(lim.max_chunks() * cfg.linear_num_value_heads * GDN_CHUNK * GDN_CHUNK * 4)?,
+            gu: gpu.alloc(cct * hvd * 4)?,
+            gw: gpu.alloc(cct * hvd * 4)?,
+            gqp: gpu.alloc(cct * hvd * 4)?,
+            gkp: gpu.alloc(cct * hvd * 4)?,
+            gintra: gpu.alloc(if cc_gdn { lim.max_chunks() * cfg.linear_num_value_heads * GDN_CHUNK * GDN_CHUNK * 4 } else { 0 })?,
             gdecay: gpu.alloc(lim.max_chunks() * cfg.linear_num_value_heads * 4)?,
-            go: gpu.alloc(t * hvd * 2)?,
+            go: gpu.alloc(cct * hvd * 2)?,
+            tqn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+            tkn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+            tu: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+            tw: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+            tg: gpu.alloc(tcc * GDN_TC_CHUNK * 4)?,
+            tht: gpu.alloc(tcc * 128 * 128 * 2)?,
+            tvnt: gpu.alloc(tcc * 128 * GDN_TC_CHUNK * 2)?,
             ids: gpu.alloc(t * 4)?,
             tok_pos: gpu.alloc(t * 4)?,
             tok_seq: gpu.alloc(t * 4)?,
@@ -354,6 +386,9 @@ impl Model {
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
             attn_tc_smem,
         )?;
+        gpu.set_max_dynamic_smem("gdn_tc_prep", GDN_TC_PREP_SMEM)?;
+        gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
+        gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
         let upload_s = t1.elapsed().as_secs_f64();
         Ok(Self {
             cfg,
@@ -377,6 +412,7 @@ impl Model {
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
+            cc_gdn,
         })
     }
 
@@ -506,14 +542,15 @@ impl Model {
     fn upload(&mut self, b: &Batch) -> Result<()> {
         // Prefill work lists: GDN chunks and attention query tiles for sequences n_decode..
         let (mut cs, mut cl, mut c0, mut cn, mut ts, mut tl) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+        let chunk = if self.cc_gdn { GDN_CHUNK } else { GDN_TC_CHUNK };
         for k in b.n_decode..b.seq_start.len() {
             let (start, len) = (b.seq_start[k] as usize, b.seq_len[k] as usize);
             c0.push(cs.len() as u32);
             let mut o = 0;
             while o < len {
                 cs.push((start + o) as u32);
-                cl.push((len - o).min(GDN_CHUNK) as u32);
-                o += GDN_CHUNK;
+                cl.push((len - o).min(chunk) as u32);
+                o += chunk;
             }
             cn.push(cs.len() as u32 - *c0.last().unwrap());
             let mut o = 0;
@@ -702,6 +739,75 @@ impl Model {
                             )
                         }
                         .map_err(de)?;
+                    } else if (nseq as u32) > nd && !self.cc_gdn {
+                        let nc = self.cur_chunks as u32;
+                        unsafe {
+                            g.k.gdn_tc_prep(
+                                &st,
+                                cfg_smem((nc, hv_u, 1), 128, GDN_TC_PREP_SMEM),
+                                s.conv as *const u16,
+                                cd,
+                                s.proj as *const u16,
+                                n as u32,
+                                b_off,
+                                a_off,
+                                l.a_log as *const f32,
+                                l.dt_bias as *const f32,
+                                s.chunk_start as *const u32,
+                                s.chunk_len as *const u32,
+                                s.tqn as *mut u16,
+                                s.tkn as *mut u16,
+                                s.tu as *mut u16,
+                                s.tw as *mut u16,
+                                s.tg as *mut f32,
+                                hk_u,
+                                hv_u,
+                            )
+                        }
+                        .map_err(de)?;
+                        mark!("gdn_prep");
+                        unsafe {
+                            g.k.gdn_tc_scan(
+                                &st,
+                                cfg_smem((128 / GDN_TC_SCAN_VB, hv_u, nseq as u32 - nd), 256, GDN_TC_SCAN_SMEM),
+                                s.tkn as *const u16,
+                                s.tu as *const u16,
+                                s.tw as *const u16,
+                                s.tg as *const f32,
+                                s.seq_chunk0 as *const u32,
+                                s.seq_nchunk as *const u32,
+                                s.seq_slot as *const u32,
+                                nd,
+                                l.delta_state as *mut f32,
+                                s.tht as *mut u16,
+                                s.tvnt as *mut u16,
+                                hv_u,
+                            )
+                        }
+                        .map_err(de)?;
+                        mark!("gdn_scan");
+                        unsafe {
+                            g.k.gdn_tc_out(
+                                &st,
+                                cfg_smem((nc, hv_u, 1), 128, GDN_TC_OUT_SMEM),
+                                s.tqn as *const u16,
+                                s.tkn as *const u16,
+                                s.tg as *const f32,
+                                s.tht as *const u16,
+                                s.tvnt as *const u16,
+                                s.chunk_start as *const u32,
+                                s.chunk_len as *const u32,
+                                s.proj as *const u16,
+                                n as u32,
+                                z_off,
+                                l.gnorm as *const f32,
+                                s.mix as *mut u16,
+                                hv_u,
+                                eps,
+                            )
+                        }
+                        .map_err(de)?;
+                        mark!("gdn_out");
                     } else if (nseq as u32) > nd {
                         let nc = self.cur_chunks as u32;
                         unsafe {

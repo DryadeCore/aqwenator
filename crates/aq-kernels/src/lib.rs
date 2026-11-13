@@ -98,10 +98,90 @@ fn sw256(row: usize, chunk: usize) -> usize {
     row * 256 + ((chunk ^ (row & 7)) * 8)
 }
 
+// ---------------------------------------------------------------------------------------
+// Warp MMA helpers (mma.sync.m16n8k16 bf16 -> f32; sm_80+, portable to sm_120/121).
+//
+// Every product is written as C = X . Y^T with X [M][K] and Y [N][K] both row-major bf16
+// in shared memory (K contiguous), so A and B fragments are plain u32 pair loads. Rows are
+// padded by 8 bf16 so the 8 rows a fragment touches land in distinct banks.
+// ---------------------------------------------------------------------------------------
+
+#[inline(always)]
+unsafe fn lds32(p: *const u16, idx: usize) -> u32 {
+    unsafe { *(p.add(idx) as *const u32) }
+}
+
+/// A fragment of the 16x16 tile at (r0, k0) of row-major X (row stride `ld`).
+#[inline(always)]
+unsafe fn frag_a(p: *const u16, ld: usize, r0: usize, k0: usize, g: usize, t: usize) -> [u32; 4] {
+    unsafe {
+        [
+            lds32(p, (r0 + g) * ld + k0 + 2 * t),
+            lds32(p, (r0 + g + 8) * ld + k0 + 2 * t),
+            lds32(p, (r0 + g) * ld + k0 + 2 * t + 8),
+            lds32(p, (r0 + g + 8) * ld + k0 + 2 * t + 8),
+        ]
+    }
+}
+
+/// B fragment (k16 x n8) for Y stored [N][K] row-major: rows n0..n0+8, cols k0..k0+16.
+#[inline(always)]
+unsafe fn frag_b(p: *const u16, ld: usize, n0: usize, k0: usize, g: usize, t: usize) -> [u32; 2] {
+    unsafe { [lds32(p, (n0 + g) * ld + k0 + 2 * t), lds32(p, (n0 + g) * ld + k0 + 2 * t + 8)] }
+}
+
+/// Two f32 -> packed bf16x2 (round to nearest even), low half first.
+#[inline(always)]
+fn pk(lo: f32, hi: f32) -> u32 {
+    (f32_to_bf16_rne(lo) as u32) | ((f32_to_bf16_rne(hi) as u32) << 16)
+}
+
+#[inline(always)]
+unsafe fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2]) -> [f32; 4] {
+    unsafe { cuda_device::wmma::mma_m16n8k16_f32_bf16(c, a, b) }
+}
+
+/// Asynchronous (cp.async.cg, 16 bytes per op) copy of a [rows][cols] bf16 tile from global
+/// to shared memory by `nthr` threads. `cols` must be a multiple of 8 and both row strides
+/// (in bytes) and base addresses 16-byte aligned. The caller commits and waits.
+#[inline(always)]
+unsafe fn tile_cp_async(dst: *mut u16, ldd: usize, src: *const u16, lds: usize, rows: usize, cols: usize, tid: usize, nthr: usize) {
+    let cpr = cols / 8;
+    let total = rows * cpr;
+    let mut idx = tid;
+    while idx < total {
+        let r = idx / cpr;
+        let c = idx % cpr;
+        unsafe {
+            cuda_device::async_copy::cp_async_cg_16(dst.add(r * ldd + c * 8) as *mut u32, src.add(r * lds + c * 8) as *const u32)
+        };
+        idx += nthr;
+    }
+}
+
+/// Issue (and commit as one group) the cp.async loads of one chunk for `gdn_tc_scan` (256
+/// threads), into the stage buffer at `sb`: W and Kn [64][136], this block's 32 U columns
+/// [64][40], G [64].
+#[inline(always)]
+unsafe fn gdn_scan_issue(sb: *mut u8, kn_in: *const u16, u_in: *const u16, w_in: *const u16, g_in: *const f32, ib: usize, vb: usize, tid: usize) {
+    const C: usize = 64;
+    const D: usize = 128;
+    const VB: usize = 32;
+    unsafe {
+        tile_cp_async(sb.cast::<u16>(), D + 8, w_in.add(ib * C * D), D, C, D, tid, 256);
+        tile_cp_async(sb.add(17408).cast::<u16>(), D + 8, kn_in.add(ib * C * D), D, C, D, tid, 256);
+        tile_cp_async(sb.add(34816).cast::<u16>(), VB + 8, u_in.add(ib * C * D + VB * vb), D, C, VB, tid, 256);
+        if tid < 16 {
+            cuda_device::async_copy::cp_async_cg_16(sb.add(39936 + 16 * tid) as *mut u32, g_in.add(ib * C + 4 * tid) as *const u32);
+        }
+        cuda_device::async_copy::cp_async_commit_group();
+    }
+}
+
 #[cuda_device::cuda_module]
 pub mod kernels {
     use super::*;
-    use cuda_device::{SharedArray, kernel};
+    use cuda_device::{DynamicSharedArray, SharedArray, kernel};
 
     /// out[t, :] = table[ids[t], :]. grid = (T), block = (256).
     #[kernel]
@@ -1793,6 +1873,690 @@ pub mod kernels {
                     let g1 = rb(sigmoid(unsafe { ld(qkv, gbase + d + 1) }));
                     let packed = (f32_to_bf16_rne(o0 * g0) as u32) | ((f32_to_bf16_rne(o1 * g1) as u32) << 16);
                     unsafe { *(out.add(obase + d) as *mut u32) = packed };
+                }
+            }
+        }
+    }
+
+    // ====================================================================================
+    // Tensor-core chunked gated delta rule (prefill). Chunk = 64 tokens, Dk = Dv = 128.
+    // Operands bf16, accumulation f32, recurrent state f32 (as FLA does).
+    //
+    //   gdn_tc_prep  (chunk, head)            : Qn, Kn (L2-normed), G = cumsum(g),
+    //                                           X = (I + A)^-1, U = X(bV), W = X(b e^G Kn)
+    //   gdn_tc_scan  (v-block, head, sequence): per chunk, snapshot h, then
+    //                                           Vn = U - W h;  h = e^{G_last} h + Kn^T (e^{G_last-G} Vn)
+    //   gdn_tc_out   (chunk, head)            : o = e^G (Qn h) + mask(e^{Gi-Gj} Qn Kn^T) Vn,
+    //                                           fused gated RMSNorm
+    //
+    // Scratch (per chunk-head ib = chunk * Hv + h): Qn, Kn, U, W [64][128] bf16, G [64] f32,
+    // hT [128 v][128 k] bf16 (state before the chunk), VnT [128 v][64 c] bf16.
+    // All global->shared copies go through `tile_g2s`, which keeps 16 loads in flight.
+    // ====================================================================================
+
+    /// grid = (n_chunks, Hv), block = (128), dynamic shared memory = 70672 bytes.
+    #[kernel]
+    pub unsafe fn gdn_tc_prep(
+        conv: *const u16,
+        conv_dim: u32,
+        proj: *const u16,
+        ld_proj: u32,
+        b_off: u32,
+        a_off: u32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        chunk_start: *const u32,
+        chunk_len: *const u32,
+        qn_out: *mut u16,
+        kn_out: *mut u16,
+        u_out: *mut u16,
+        w_out: *mut u16,
+        g_out: *mut f32,
+        n_k_heads: u32,
+        n_v_heads: u32,
+    ) {
+        const C: usize = 64;
+        const D: usize = 128;
+        const LK: usize = D + 8;
+        const LC: usize = C + 8;
+        const LA: usize = C + 1;
+        let sm = DynamicSharedArray::<u8, 16>::get_raw();
+        let ks = sm.cast::<u16>(); // [64][136] bf16: raw then normalized keys
+        let am = unsafe { sm.add(17408) }.cast::<f32>(); // R1 [64][65] f32: A
+        let xbv = unsafe { sm.add(17408) }.cast::<u16>(); // R1 (later) [64][72] bf16: X diag(beta)
+        let xbk = unsafe { sm.add(26624) }.cast::<u16>(); // R1 (later) [64][72] bf16: X diag(beta e^G)
+        let xm = unsafe { sm.add(35840) }.cast::<f32>(); // [64][65] f32: X = (I + A)^-1
+        let r3 = unsafe { sm.add(52480) }.cast::<u16>(); // R3 [64][136] bf16: raw q, later raw v
+        let gs = unsafe { sm.add(69888) }.cast::<f32>(); // [64] G
+        let bsm = unsafe { sm.add(70144) }.cast::<f32>(); // [64] beta
+        let fac = unsafe { sm.add(70400) }.cast::<f32>(); // [64] beta e^G
+        let tot = unsafe { sm.add(70656) }.cast::<f32>(); // [4] scan carry
+
+        let ci = thread::blockIdx_x() as usize;
+        let h = thread::blockIdx_y() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let w = tid / 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let hk = n_k_heads as usize;
+        let hv = n_v_heads as usize;
+        let kh = h / (hv / hk);
+        let cd = conv_dim as usize;
+        let key_dim = hk * D;
+        let c0 = unsafe { *chunk_start.add(ci) } as usize;
+        let len = unsafe { *chunk_len.add(ci) } as usize;
+        let ib = ci * hv + h;
+        let row0 = unsafe { conv.add(c0 * cd) };
+
+        // 1. Stage raw k (R0) and q (R3) rows; rows past the chunk end are zeroed. Warps 0-1
+        //    compute g and beta for the 64 rows and an in-warp inclusive scan of g.
+        unsafe {
+            tile_cp_async(ks, LK, row0.add(key_dim + kh * D), cd, len, D, tid, 128);
+            tile_cp_async(r3, LK, row0.add(kh * D), cd, len, D, tid, 128);
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+        let mut idx = len * 64 + tid;
+        while idx < C * 64 {
+            let r = idx / 64;
+            let cp = idx % 64;
+            unsafe {
+                *(ks.add(r * LK + 2 * cp) as *mut u32) = 0;
+                *(r3.add(r * LK + 2 * cp) as *mut u32) = 0;
+            }
+            idx += 128;
+        }
+        if tid < C {
+            let (gv, beta) = if tid < len {
+                let prow = (c0 + tid) * ld_proj as usize;
+                let a = unsafe { ld(proj, prow + a_off as usize + h) };
+                let b = unsafe { ld(proj, prow + b_off as usize + h) };
+                (-libm::expf(unsafe { *a_log.add(h) }) * softplus(a + unsafe { *dt_bias.add(h) }), rb(sigmoid(b)))
+            } else {
+                (0.0, 0.0)
+            };
+            let mut s = gv;
+            let mut off = 1u32;
+            while off < 32 {
+                let o = f32::from_bits(warp::shuffle_up_sync(FULL, s.to_bits(), off));
+                if lane as u32 >= off {
+                    s += o;
+                }
+                off *= 2;
+            }
+            unsafe {
+                *gs.add(tid) = s;
+                *bsm.add(tid) = beta;
+            }
+            if lane == 31 {
+                unsafe { *tot.add(w) = s };
+            }
+        }
+        unsafe { cuda_device::async_copy::cp_async_wait_all() };
+        thread::sync_threads();
+
+        // 2. Finish the scan (rows 32..63 add warp 0's total) and beta e^G; L2-normalize rows
+        //    (warp w: rows 16w..16w+16; q also gets 1/sqrt(D)) and write Qn, Kn to global.
+        if tid < C {
+            let gg = if tid >= 32 { unsafe { *gs.add(tid) + *tot.add(0) } } else { unsafe { *gs.add(tid) } };
+            unsafe {
+                *gs.add(tid) = gg;
+                *fac.add(tid) = *bsm.add(tid) * libm::expf(gg);
+            }
+        }
+        // Four rows at a time so their shuffle reductions overlap.
+        let mut rq = 0usize;
+        while rq < 4 {
+            let mut kv = [[0.0f32; 4]; 4];
+            let mut qv = [[0.0f32; 4]; 4];
+            let mut sk = [0.0f32; 4];
+            let mut sq = [0.0f32; 4];
+            #[unroll]
+            for u in 0..4 {
+                let r = 16 * w + 4 * rq + u;
+                let k01 = unsafe { lds32(ks, r * LK + 4 * lane) };
+                let k23 = unsafe { lds32(ks, r * LK + 4 * lane + 2) };
+                let q01 = unsafe { lds32(r3, r * LK + 4 * lane) };
+                let q23 = unsafe { lds32(r3, r * LK + 4 * lane + 2) };
+                kv[u] = [
+                    bf16_to_f32((k01 & 0xffff) as u16),
+                    bf16_to_f32((k01 >> 16) as u16),
+                    bf16_to_f32((k23 & 0xffff) as u16),
+                    bf16_to_f32((k23 >> 16) as u16),
+                ];
+                qv[u] = [
+                    bf16_to_f32((q01 & 0xffff) as u16),
+                    bf16_to_f32((q01 >> 16) as u16),
+                    bf16_to_f32((q23 & 0xffff) as u16),
+                    bf16_to_f32((q23 >> 16) as u16),
+                ];
+                sk[u] = kv[u][0] * kv[u][0] + kv[u][1] * kv[u][1] + kv[u][2] * kv[u][2] + kv[u][3] * kv[u][3];
+                sq[u] = qv[u][0] * qv[u][0] + qv[u][1] * qv[u][1] + qv[u][2] * qv[u][2] + qv[u][3] * qv[u][3];
+            }
+            #[unroll]
+            for m in 0..5 {
+                let off = 16u32 >> m;
+                #[unroll]
+                for u in 0..4 {
+                    sk[u] += warp::shuffle_xor_f32_sync(FULL, sk[u], off);
+                    sq[u] += warp::shuffle_xor_f32_sync(FULL, sq[u], off);
+                }
+            }
+            #[unroll]
+            for u in 0..4 {
+                let r = 16 * w + 4 * rq + u;
+                let ik = 1.0 / libm::sqrtf(sk[u] + 1.0e-6);
+                let iq = 1.0 / libm::sqrtf(sq[u] + 1.0e-6) / libm::sqrtf(D as f32);
+                let kn01 = pk(kv[u][0] * ik, kv[u][1] * ik);
+                let kn23 = pk(kv[u][2] * ik, kv[u][3] * ik);
+                let o = (ib * C + r) * D + 4 * lane;
+                unsafe {
+                    *(ks.add(r * LK + 4 * lane) as *mut u32) = kn01;
+                    *(ks.add(r * LK + 4 * lane + 2) as *mut u32) = kn23;
+                    *(kn_out.add(o) as *mut u32) = kn01;
+                    *(kn_out.add(o + 2) as *mut u32) = kn23;
+                    *(qn_out.add(o) as *mut u32) = pk(qv[u][0] * iq, qv[u][1] * iq);
+                    *(qn_out.add(o + 2) as *mut u32) = pk(qv[u][2] * iq, qv[u][3] * iq);
+                }
+            }
+            rq += 1;
+        }
+        thread::sync_threads();
+
+        // 3. Raw V streams into R3 (queries are done) while A is computed.
+        //    A = strict_lower(beta_i e^{G_i - G_j} Kn Kn^T): warp w owns rows 16w..16w+16.
+        unsafe {
+            tile_cp_async(r3, LK, row0.add(2 * key_dim + h * D), cd, len, D, tid, 128);
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+        let mut idx = len * 64 + tid;
+        while idx < C * 64 {
+            unsafe { *(r3.add((idx / 64) * LK + 2 * (idx % 64)) as *mut u32) = 0 };
+            idx += 128;
+        }
+        let r0 = w * 16;
+        let mut acc = [[0.0f32; 4]; 8];
+        #[unroll]
+        for kk in 0..8 {
+            let a = unsafe { frag_a(ks, LK, r0, kk * 16, g, t) };
+            #[unroll]
+            for nt in 0..8 {
+                let b = unsafe { frag_b(ks, LK, nt * 8, kk * 16, g, t) };
+                acc[nt] = unsafe { mma(acc[nt], a, b) };
+            }
+        }
+        #[unroll]
+        for nt in 0..8 {
+            #[unroll]
+            for e in 0..4 {
+                let i = r0 + g + if e >= 2 { 8 } else { 0 };
+                let j = nt * 8 + 2 * t + (e & 1);
+                let v = if j < i {
+                    let f = unsafe { *bsm.add(i) * libm::expf(*gs.add(i) - *gs.add(j)) };
+                    f * acc[nt][e]
+                } else {
+                    0.0
+                };
+                unsafe { *am.add(i * LA + j) = v };
+            }
+        }
+        thread::sync_threads();
+
+        // 4a. Invert the four 16x16 diagonal blocks of L = I + A: warp w takes block w, lane m
+        //     keeps column m of the inverse in registers (it only depends on itself).
+        if lane < 16 {
+            let base = 16 * w;
+            let m = lane;
+            let mut x = [0.0f32; 16];
+            #[unroll]
+            for i in 0..16 {
+                let mut s = if i == m { 1.0f32 } else { 0.0 };
+                if i > m {
+                    s = -unsafe { *am.add((base + i) * LA + base + m) };
+                    #[unroll]
+                    for j in 0..16 {
+                        if j > m && j < i {
+                            s -= unsafe { *am.add((base + i) * LA + base + j) } * x[j];
+                        }
+                    }
+                }
+                x[i] = s;
+            }
+            #[unroll]
+            for i in 0..16 {
+                unsafe { *xm.add((base + i) * LA + base + m) = x[i] };
+            }
+        }
+        thread::sync_threads();
+
+        // 4b. Off-diagonal blocks by distance dd: X_ij = -X_ii sum_{k=j}^{i-1} A_ik X_kj.
+        //     Warp w < 4 - dd computes block (w + dd, w). Lane owns row rr = lane / 2 and 8
+        //     columns ch..ch+8; the intermediate T is exchanged with shuffles.
+        let rr = lane / 2;
+        let ch = (lane % 2) * 8;
+        let mut dd = 1usize;
+        while dd < 4 {
+            if w + dd < 4 {
+                let bi = w + dd;
+                let bj = w;
+                let mut tv = [0.0f32; 8];
+                let mut kb = bj;
+                while kb < bi {
+                    #[unroll]
+                    for q in 0..16 {
+                        let a = unsafe { *am.add((16 * bi + rr) * LA + 16 * kb + q) };
+                        #[unroll]
+                        for c in 0..8 {
+                            tv[c] += a * unsafe { *xm.add((16 * kb + q) * LA + 16 * bj + ch + c) };
+                        }
+                    }
+                    kb += 1;
+                }
+                let mut s = [0.0f32; 8];
+                #[unroll]
+                for q in 0..16 {
+                    let xq = if q <= rr { unsafe { *xm.add((16 * bi + rr) * LA + 16 * bi + q) } } else { 0.0 };
+                    let src = (2 * q + (lane % 2)) as u32;
+                    #[unroll]
+                    for c in 0..8 {
+                        s[c] += xq * warp::shuffle_f32_sync(FULL, tv[c], src);
+                    }
+                }
+                #[unroll]
+                for c in 0..8 {
+                    unsafe { *xm.add((16 * bi + rr) * LA + 16 * bj + ch + c) = -s[c] };
+                }
+            }
+            thread::sync_threads();
+            dd += 1;
+        }
+
+        // 4c. X diag(beta) and X diag(beta e^G) -> bf16 (lower triangle incl. unit diagonal),
+        //     over the dead A region.
+        #[unroll]
+        for e in 0..32 {
+            let idx = tid + 128 * e;
+            let i = idx / C;
+            let j = idx % C;
+            let x = if j < i {
+                unsafe { *xm.add(i * LA + j) }
+            } else if j == i {
+                1.0
+            } else {
+                0.0
+            };
+            unsafe {
+                *xbv.add(i * LC + j) = f32_to_bf16_rne(x * *bsm.add(j));
+                *xbk.add(i * LC + j) = f32_to_bf16_rne(x * *fac.add(j));
+            }
+        }
+        unsafe { cuda_device::async_copy::cp_async_wait_all() };
+        thread::sync_threads();
+
+        // 5. U = (X diag beta) V, W = (X diag beta e^G) Kn: warp w owns rows 16w..16w+16,
+        //    16 n-tiles over D. B fragments come straight from the row-major V / Kn tiles via
+        //    ldmatrix.trans, two n-tiles per instruction.
+        let lrow = (lane & 7) + 8 * ((lane >> 3) & 1);
+        let lcol = 8 * (lane >> 4);
+        let mut pass = 0usize;
+        while pass < 2 {
+            let (xb, src, dst) = if pass == 0 { (xbv, r3, u_out) } else { (xbk, ks, w_out) };
+            let mut acc = [[0.0f32; 4]; 16];
+            #[unroll]
+            for kk in 0..4 {
+                let a = unsafe { frag_a(xb, LC, r0, kk * 16, g, t) };
+                #[unroll]
+                for np in 0..8 {
+                    let b4 = unsafe {
+                        cuda_device::wmma::ldmatrix_x4_trans(src.add((kk * 16 + lrow) * LK + np * 16 + lcol) as *const u32)
+                    };
+                    acc[2 * np] = unsafe { mma(acc[2 * np], a, [b4[0], b4[1]]) };
+                    acc[2 * np + 1] = unsafe { mma(acc[2 * np + 1], a, [b4[2], b4[3]]) };
+                }
+            }
+            #[unroll]
+            for nt in 0..16 {
+                let col = nt * 8 + 2 * t;
+                unsafe {
+                    *(dst.add((ib * C + r0 + g) * D + col) as *mut u32) = pk(acc[nt][0], acc[nt][1]);
+                    *(dst.add((ib * C + r0 + g + 8) * D + col) as *mut u32) = pk(acc[nt][2], acc[nt][3]);
+                }
+            }
+            pass += 1;
+        }
+        if tid < C {
+            unsafe { *g_out.add(ib * C + tid) = *gs.add(tid) };
+        }
+    }
+
+    /// grid = (Dv / 32, Hv, n_prefill_seqs), block = (256), dynamic shared memory = 93696.
+    /// Warp w (8 warps) keeps state rows k in 16w..16w+16 for the block's 32 value columns as
+    /// MMA accumulators. Chunk i+1's W, Kn, U and G stream in with cp.async (double buffer)
+    /// while chunk i is processed.
+    #[kernel]
+    pub unsafe fn gdn_tc_scan(
+        kn_in: *const u16,
+        u_in: *const u16,
+        w_in: *const u16,
+        g_in: *const f32,
+        seq_chunk0: *const u32,
+        seq_nchunk: *const u32,
+        seq_slot: *const u32,
+        seq_off: u32,
+        state_base: *mut f32,
+        ht_out: *mut u16,
+        vnt_out: *mut u16,
+        n_v_heads: u32,
+    ) {
+        const C: usize = 64;
+        const D: usize = 128;
+        const VB: usize = 32;
+        const LK: usize = D + 8;
+        const LC: usize = C + 8;
+        const LU: usize = VB + 8;
+        const STAGE: usize = 40192;
+        let sm = DynamicSharedArray::<u8, 16>::get_raw();
+        let hts = unsafe { sm.add(2 * STAGE) }.cast::<u16>(); // [32 v][136 k] bf16: h^T
+        let vns = unsafe { sm.add(2 * STAGE + 8704) }.cast::<u16>(); // [32 v][72 c]: (e^{Gl-G} Vn)^T
+
+        let vb = thread::blockIdx_x() as usize;
+        let h = thread::blockIdx_y() as usize;
+        let p = thread::blockIdx_z() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let w = tid / 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let hv = n_v_heads as usize;
+        let slot = unsafe { *seq_slot.add(p + seq_off as usize) } as usize;
+        let sp = unsafe { state_base.add((slot * hv + h) * D * D) };
+        let c_first = unsafe { *seq_chunk0.add(p) } as usize;
+        let n_chunks = unsafe { *seq_nchunk.add(p) } as usize;
+        // (b) work split: rows c in 16 (w % 4).., n-tiles 2 (w / 4)..+2
+        let vr0 = 16 * (w % 4);
+        let vn0 = 2 * (w / 4);
+
+        if n_chunks > 0 {
+            unsafe { gdn_scan_issue(sm, kn_in, u_in, w_in, g_in, c_first * hv + h, vb, tid) };
+        }
+        // state fragment (nt, e): k = 16w + g (+8 for e >= 2), v = 32vb + 8nt + 2t + (e & 1)
+        let mut hs = [[0.0f32; 4]; 4];
+        #[unroll]
+        for nt in 0..4 {
+            #[unroll]
+            for e in 0..4 {
+                let k = 16 * w + g + if e >= 2 { 8 } else { 0 };
+                let v = VB * vb + 8 * nt + 2 * t + (e & 1);
+                hs[nt][e] = unsafe { *sp.add(k * D + v) };
+            }
+        }
+        // ldmatrix.x4.trans lanes for A = Kn^T: rows c = kk*16 + (l & 7) + 8 (l >> 4), cols k0 + 8 ((l >> 3) & 1)
+        let arow = (lane & 7) + 8 * (lane >> 4);
+        let acol = 8 * ((lane >> 3) & 1);
+
+        let mut cc = 0usize;
+        while cc < n_chunks {
+            let s = cc % 2;
+            let sb = unsafe { sm.add(s * STAGE) };
+            let wsm = sb.cast::<u16>();
+            let kns = unsafe { sb.add(17408) }.cast::<u16>();
+            let us = unsafe { sb.add(34816) }.cast::<u16>();
+            let gs = unsafe { sb.add(39936) }.cast::<f32>();
+            let ib = (c_first + cc) * hv + h;
+            if cc + 1 < n_chunks {
+                unsafe {
+                    gdn_scan_issue(sm.add((1 - s) * STAGE), kn_in, u_in, w_in, g_in, (c_first + cc + 1) * hv + h, vb, tid);
+                    cuda_device::async_copy::cp_async_wait_group(1);
+                }
+            } else {
+                unsafe { cuda_device::async_copy::cp_async_wait_all() };
+            }
+            // (a) h^T (state before this chunk) into shared memory.
+            #[unroll]
+            for nt in 0..4 {
+                #[unroll]
+                for e in 0..4 {
+                    let k = 16 * w + g + if e >= 2 { 8 } else { 0 };
+                    let vl = 8 * nt + 2 * t + (e & 1);
+                    unsafe { *hts.add(vl * LK + k) = f32_to_bf16_rne(hs[nt][e]) };
+                }
+            }
+            thread::sync_threads();
+            // Snapshot h^T to global, coalesced.
+            #[unroll]
+            for m in 0..8 {
+                let idx = tid + 256 * m;
+                let row = idx / 64;
+                let cp = idx % 64;
+                unsafe {
+                    *(ht_out.add((ib * D + VB * vb + row) * D + 2 * cp) as *mut u32) = lds32(hts, row * LK + 2 * cp);
+                }
+            }
+            let glast = unsafe { *gs.add(C - 1) };
+            // (b) Vn = U - W h: 16 rows x 2 n-tiles per warp, K = 128.
+            let mut vn = [[0.0f32; 4]; 2];
+            #[unroll]
+            for kk in 0..8 {
+                let a = unsafe { frag_a(wsm, LK, vr0, kk * 16, g, t) };
+                #[unroll]
+                for j in 0..2 {
+                    let b = unsafe { frag_b(hts, LK, (vn0 + j) * 8, kk * 16, g, t) };
+                    vn[j] = unsafe { mma(vn[j], a, b) };
+                }
+            }
+            #[unroll]
+            for half in 0..2 {
+                let c = vr0 + g + 8 * half;
+                let f = libm::expf(glast - unsafe { *gs.add(c) });
+                #[unroll]
+                for j in 0..2 {
+                    let vl = 8 * (vn0 + j) + 2 * t;
+                    let u = unsafe { lds32(us, c * LU + vl) };
+                    let x0 = bf16_to_f32((u & 0xffff) as u16) - vn[j][2 * half];
+                    let x1 = bf16_to_f32((u >> 16) as u16) - vn[j][2 * half + 1];
+                    let b0 = f32_to_bf16_rne(x0);
+                    let b1 = f32_to_bf16_rne(x1);
+                    unsafe {
+                        *vnt_out.add((ib * D + VB * vb + vl) * C + c) = b0;
+                        *vnt_out.add((ib * D + VB * vb + vl + 1) * C + c) = b1;
+                        *vns.add(vl * LC + c) = f32_to_bf16_rne(bf16_to_f32(b0) * f);
+                        *vns.add((vl + 1) * LC + c) = f32_to_bf16_rne(bf16_to_f32(b1) * f);
+                    }
+                }
+            }
+            thread::sync_threads();
+            // (c) h = e^{G_last} h + Kn^T (e^{G_last - G} Vn): warp w rows k 16w..16w+16, N = 32, K = 64.
+            let dec = libm::expf(glast);
+            #[unroll]
+            for nt in 0..4 {
+                #[unroll]
+                for e in 0..4 {
+                    hs[nt][e] *= dec;
+                }
+            }
+            #[unroll]
+            for kk in 0..4 {
+                let a = unsafe { cuda_device::wmma::ldmatrix_x4_trans(kns.add((kk * 16 + arow) * LK + 16 * w + acol) as *const u32) };
+                #[unroll]
+                for nt in 0..4 {
+                    let b = unsafe { frag_b(vns, LC, nt * 8, kk * 16, g, t) };
+                    hs[nt] = unsafe { mma(hs[nt], a, b) };
+                }
+            }
+            thread::sync_threads();
+            cc += 1;
+        }
+        #[unroll]
+        for nt in 0..4 {
+            #[unroll]
+            for e in 0..4 {
+                let k = 16 * w + g + if e >= 2 { 8 } else { 0 };
+                let v = VB * vb + 8 * nt + 2 * t + (e & 1);
+                unsafe { *sp.add(k * D + v) = hs[nt][e] };
+            }
+        }
+    }
+
+    /// grid = (n_chunks, Hv), block = (128), dynamic shared memory = 88832.
+    /// Warp w owns chunk rows 16w..16w+16 and all 128 value columns, so the gated RMSNorm
+    /// over a row is a reduction across the 4 lanes of a quad.
+    #[kernel]
+    pub unsafe fn gdn_tc_out(
+        qn_in: *const u16,
+        kn_in: *const u16,
+        g_in: *const f32,
+        ht_in: *const u16,
+        vnt_in: *const u16,
+        chunk_start: *const u32,
+        chunk_len: *const u32,
+        proj: *const u16,
+        ld_proj: u32,
+        z_off: u32,
+        norm_w: *const f32,
+        out: *mut u16,
+        n_v_heads: u32,
+        eps: f32,
+    ) {
+        const C: usize = 64;
+        const D: usize = 128;
+        const LK: usize = D + 8;
+        const LC: usize = C + 8;
+        let sm = DynamicSharedArray::<u8, 16>::get_raw();
+        let qs = sm.cast::<u16>(); // [64][136]
+        let ks = unsafe { sm.add(17408) }.cast::<u16>(); // [64][136]
+        let hts = unsafe { sm.add(34816) }.cast::<u16>(); // [128 v][136 k]
+        let vns = unsafe { sm.add(69632) }.cast::<u16>(); // [128 v][72 c]
+        let gs = unsafe { sm.add(88064) }.cast::<f32>(); // [64]
+        let nw = unsafe { sm.add(88320) }.cast::<f32>(); // [128] norm weight
+
+        let ci = thread::blockIdx_x() as usize;
+        let h = thread::blockIdx_y() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let w = tid / 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let hv = n_v_heads as usize;
+        let ib = ci * hv + h;
+        let c0 = unsafe { *chunk_start.add(ci) } as usize;
+        let len = unsafe { *chunk_len.add(ci) } as usize;
+
+        // Group 0: q, k, h^T, G (the first products). Group 1: Vn^T and the norm weight.
+        unsafe {
+            tile_cp_async(qs, LK, qn_in.add(ib * C * D), D, C, D, tid, 128);
+            tile_cp_async(ks, LK, kn_in.add(ib * C * D), D, C, D, tid, 128);
+            tile_cp_async(hts, LK, ht_in.add(ib * D * D), D, D, D, tid, 128);
+            if tid < 16 {
+                cuda_device::async_copy::cp_async_cg_16(gs.add(4 * tid) as *mut u32, g_in.add(ib * C + 4 * tid) as *const u32);
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+            tile_cp_async(vns, LC, vnt_in.add(ib * D * C), C, D, C, tid, 128);
+            if tid >= 16 && tid < 48 {
+                cuda_device::async_copy::cp_async_cg_16(nw.add(4 * (tid - 16)) as *mut u32, norm_w.add(4 * (tid - 16)) as *const u32);
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+        // The gate values for this thread's outputs, loaded while the tiles stream in.
+        let r0 = 16 * w;
+        let i0 = r0 + g;
+        let i1 = r0 + g + 8;
+        let ldp = ld_proj as usize;
+        let mut zz = [0u32; 32];
+        #[unroll]
+        for nt in 0..16 {
+            #[unroll]
+            for half in 0..2 {
+                let i = if half == 0 { i0 } else { i1 };
+                if i < len {
+                    zz[2 * nt + half] = unsafe { lds32(proj, (c0 + i) * ldp + z_off as usize + h * D + nt * 8 + 2 * t) };
+                }
+            }
+        }
+        unsafe { cuda_device::async_copy::cp_async_wait_group(1) };
+        thread::sync_threads();
+
+        let mut o = [[0.0f32; 4]; 16];
+        let mut sc = [[0.0f32; 4]; 8];
+        #[unroll]
+        for kk in 0..8 {
+            let a = unsafe { frag_a(qs, LK, r0, kk * 16, g, t) };
+            #[unroll]
+            for nt in 0..16 {
+                let b = unsafe { frag_b(hts, LK, nt * 8, kk * 16, g, t) };
+                o[nt] = unsafe { mma(o[nt], a, b) };
+            }
+            #[unroll]
+            for nt in 0..8 {
+                let b = unsafe { frag_b(ks, LK, nt * 8, kk * 16, g, t) };
+                sc[nt] = unsafe { mma(sc[nt], a, b) };
+            }
+        }
+        let g0 = unsafe { *gs.add(i0) };
+        let g1 = unsafe { *gs.add(i1) };
+        let e0 = libm::expf(g0);
+        let e1 = libm::expf(g1);
+        #[unroll]
+        for nt in 0..16 {
+            o[nt][0] *= e0;
+            o[nt][1] *= e0;
+            o[nt][2] *= e1;
+            o[nt][3] *= e1;
+        }
+        // P = causal mask(e^{Gi-Gj} S), straight from accumulators into A fragments.
+        #[unroll]
+        for nt in 0..8 {
+            #[unroll]
+            for e in 0..4 {
+                let (i, gi) = if e >= 2 { (i1, g1) } else { (i0, g0) };
+                let j = nt * 8 + 2 * t + (e & 1);
+                sc[nt][e] = if j <= i { sc[nt][e] * libm::expf(gi - unsafe { *gs.add(j) }) } else { 0.0 };
+            }
+        }
+        unsafe { cuda_device::async_copy::cp_async_wait_all() };
+        thread::sync_threads();
+        #[unroll]
+        for kk in 0..4 {
+            let a = [
+                pk(sc[2 * kk][0], sc[2 * kk][1]),
+                pk(sc[2 * kk][2], sc[2 * kk][3]),
+                pk(sc[2 * kk + 1][0], sc[2 * kk + 1][1]),
+                pk(sc[2 * kk + 1][2], sc[2 * kk + 1][3]),
+            ];
+            #[unroll]
+            for nt in 0..16 {
+                let b = unsafe { frag_b(vns, LC, nt * 8, kk * 16, g, t) };
+                o[nt] = unsafe { mma(o[nt], a, b) };
+            }
+        }
+        // Gated RMSNorm per row (the reference rounds core output to bf16 first).
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        #[unroll]
+        for nt in 0..16 {
+            #[unroll]
+            for e in 0..4 {
+                o[nt][e] = rb(o[nt][e]);
+            }
+            s0 += o[nt][0] * o[nt][0] + o[nt][1] * o[nt][1];
+            s1 += o[nt][2] * o[nt][2] + o[nt][3] * o[nt][3];
+        }
+        s0 += warp::shuffle_xor_f32_sync(FULL, s0, 1);
+        s0 += warp::shuffle_xor_f32_sync(FULL, s0, 2);
+        s1 += warp::shuffle_xor_f32_sync(FULL, s1, 1);
+        s1 += warp::shuffle_xor_f32_sync(FULL, s1, 2);
+        let inv0 = 1.0 / libm::sqrtf(s0 / D as f32 + eps);
+        let inv1 = 1.0 / libm::sqrtf(s1 / D as f32 + eps);
+        #[unroll]
+        for nt in 0..16 {
+            #[unroll]
+            for half in 0..2 {
+                let (i, inv) = if half == 0 { (i0, inv0) } else { (i1, inv1) };
+                if i < len {
+                    let col = nt * 8 + 2 * t;
+                    let z = zz[2 * nt + half];
+                    let y0 = unsafe { *nw.add(col) } * rb(o[nt][2 * half] * inv) * silu(bf16_to_f32((z & 0xffff) as u16));
+                    let y1 = unsafe { *nw.add(col + 1) } * rb(o[nt][2 * half + 1] * inv) * silu(bf16_to_f32((z >> 16) as u16));
+                    unsafe { *(out.add((c0 + i) * hv * D + h * D + col) as *mut u32) = pk(y0, y1) };
                 }
             }
         }

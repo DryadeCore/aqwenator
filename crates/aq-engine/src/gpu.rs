@@ -54,8 +54,12 @@ impl Gpu {
         Ok(p)
     }
 
+    /// Host-to-device copy, enqueued on the compute stream so it is ordered after every kernel
+    /// already queued there (a synchronous copy on the legacy default stream is not, and once
+    /// overwrote a step's metadata while that step's kernels were still reading it). The
+    /// source is pageable, so the driver stages it before returning and `src` may be dropped.
     pub fn upload<T>(&self, dst: u64, src: &[T]) -> Result<()> {
-        unsafe { memory::memcpy_htod_sync(dst, src.as_ptr(), std::mem::size_of_val(src)) }.map_err(de)
+        unsafe { memory::memcpy_htod_async(dst, src.as_ptr(), std::mem::size_of_val(src), self.stream.cu_stream()) }.map_err(de)
     }
 
     pub fn alloc_upload<T>(&mut self, src: &[T]) -> Result<u64> {
@@ -120,6 +124,9 @@ unsafe extern "C" {
     fn cuEventRecordWithFlags(event: *mut c_void, stream: *mut c_void, flags: u32) -> i32;
 }
 
+/// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+
 fn drv(r: i32, what: &str) -> Result<()> {
     if r != 0 {
         anyhow::bail!("{what} failed: CUresult {r}");
@@ -157,8 +164,6 @@ impl Gpu {
         drv(unsafe { cuGraphLaunch(exec as *mut c_void, self.raw_stream()) }, "cuGraphLaunch")
     }
 
-    /// Allow `kernel` to launch with up to `bytes` of dynamic shared memory (needed above 48 KiB;
-    /// the raw launch path does not opt in by itself).
     /// `AQ_KINFO=1`: print registers / spills / static smem of every kernel in the module.
     pub fn print_kernel_info(&self) -> Result<()> {
         let module = self.k.as_cuda_module().cu_module() as *mut c_void;
@@ -205,6 +210,21 @@ impl Gpu {
             "cuFuncSetAttribute",
         )
     }
+
+    /// Opt a kernel into more than 48 KiB of dynamic shared memory (raw launches do not go
+    /// through cuda-oxide's launch contracts, which would otherwise do this).
+    pub fn set_max_dynamic_smem(&self, kernel: &str, bytes: u32) -> Result<()> {
+        let module = self.k.as_cuda_module().cu_module() as *mut c_void;
+        let name = std::ffi::CString::new(kernel)?;
+        let mut f = std::ptr::null_mut();
+        drv(unsafe { cuModuleGetFunction(&mut f, module, name.as_ptr()) }, "cuModuleGetFunction")?;
+        drv(unsafe { cuFuncSetAttribute(f, MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32) }, "cuFuncSetAttribute")
+    }
+}
+
+/// Launch config with dynamic shared memory.
+pub fn cfg_smem(grid: (u32, u32, u32), block: u32, smem: u32) -> LaunchConfig {
+    LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: smem }
 }
 
 impl Drop for Gpu {
