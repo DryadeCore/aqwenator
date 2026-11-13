@@ -65,6 +65,12 @@ struct Seq {
     turns: u32,
     /// Session id: parked entries left by the same chain of turns share it.
     sid: u64,
+    /// When the request was submitted and admitted, and the steps it took part in before its
+    /// first token (AQ_TRACE request log).
+    t_add: Instant,
+    t_admit: Instant,
+    steps: u32,
+    reused: usize,
     /// Pause prefill here and take the prompt checkpoint (page aligned, a few tokens before
     /// the prompt's end); `None` once taken, or when there is nothing to checkpoint.
     ckpt_at: Option<usize>,
@@ -273,6 +279,9 @@ pub struct Engine {
     /// last token re-tokenizes once the turn's text follows it (Qwen3.5: `<think>\n` becomes
     /// `<think>\n\n`), so consecutive prompts diverge just before the previous one's end.
     pub prompt_checkpoints: bool,
+    /// AQ_TRACE=1: log one line per step (`[step]`: composition and GPU time) and one per
+    /// request at its first token (`[req]`: queue wait, steps, time to first token).
+    pub trace: bool,
     pub policy: Policy,
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
     pub itl_target_us: Option<f64>,
@@ -324,6 +333,7 @@ impl Engine {
             last_decode: None,
             mixed_prefill_adaptive: None,
             prompt_checkpoints: std::env::var("AQ_NO_CKPT").is_err(),
+            trace: std::env::var("AQ_TRACE").as_deref() == Ok("1"),
             policy: Policy::default(),
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
@@ -844,7 +854,7 @@ impl Engine {
                 return Ok(false);
             }
         }
-        let (req, _) = self.waiting.remove(wi).unwrap();
+        let (req, t_add) = self.waiting.remove(wi).unwrap();
         let ckpt_at = if self.session_cache && self.prompt_checkpoints {
             Some(req.prompt.len().saturating_sub(CKPT_BACKOFF) / bs * bs).filter(|&at| at > computed)
         } else {
@@ -859,7 +869,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed });
         Ok(true)
     }
 
@@ -1278,6 +1288,28 @@ impl Engine {
         let t1 = Instant::now();
         let toks = self.model.step(&b, None)?;
         let gpu_us = t1.elapsed().as_micros() as u64;
+        if self.trace {
+            // Decode rows and the KV keys they scan; prefill tokens and the keys they scan.
+            let (mut rows, mut dkeys, mut ptok, mut pkeys) = (0usize, 0usize, 0usize, 0usize);
+            for (k, &(i, n)) in plan.iter().enumerate() {
+                let c = self.running[i].computed;
+                if k < decode_seqs {
+                    rows += n;
+                    dkeys += n * c;
+                } else {
+                    ptok += n;
+                    pkeys += n * (c + n / 2);
+                }
+            }
+            eprintln!(
+                "[step] dec {decode_seqs} rows {rows} dkeys {dkeys} pseqs {} ptok {ptok} pkeys {pkeys} taps {} gpu_us {gpu_us} host_us {host_us}",
+                plan.len() - decode_seqs,
+                taps.len()
+            );
+        }
+        for &(i, _) in &plan {
+            self.running[i].steps += 1;
+        }
         // Update the pacing model: pure-decode steps give the decode cost, mixed steps give
         // the per-token prefill cost on top of it.
         let prefill_tokens = b.tokens.len() - decode_seqs;
@@ -1322,6 +1354,17 @@ impl Engine {
             let mut finished = false;
             for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
                 s.out.push(tok);
+                if self.trace && s.out.len() == 1 {
+                    eprintln!(
+                        "[req] id {} prompt {} reused {} wait_ms {:.1} ttft_ms {:.1} steps {}",
+                        s.req.id,
+                        s.req.prompt.len(),
+                        s.reused,
+                        s.t_admit.duration_since(s.t_add).as_secs_f64() * 1e3,
+                        s.t_add.elapsed().as_secs_f64() * 1e3,
+                        s.steps
+                    );
+                }
                 let stop = !s.req.ignore_eos && eos.contains(&tok);
                 finished = stop || s.out.len() >= s.req.max_new_tokens;
                 events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
