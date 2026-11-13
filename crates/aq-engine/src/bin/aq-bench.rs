@@ -34,9 +34,9 @@ fn parse() -> Result<Args> {
         model,
         input_len: 1024,
         output_len: 256,
-        concurrency: vec![1, 8, 32, 64, 128, 256],
+        concurrency: vec![1, 4, 8, 16, 32, 64],
         num_prompts: None,
-        max_seqs: 256,
+        max_seqs: 64,
         max_tokens: 8192,
         out: None,
     };
@@ -113,13 +113,14 @@ fn main() -> Result<()> {
     let mut rng = Rng(0x5eed_1234_abcd_0001);
     let mut results = Vec::new();
     for &c in &a.concurrency {
-        let n = a.num_prompts.unwrap_or((4 * c).max(32));
+        let n = a.num_prompts.unwrap_or((16 * c).max(200));
         let mut next_id = 0u64;
         let mut arrive: HashMap<u64, Instant> = HashMap::new();
         let mut last_tok: HashMap<u64, Instant> = HashMap::new();
         let mut ttft = Vec::new();
         let mut itl = Vec::new();
         let mut tpot = Vec::new();
+        let mut e2el = Vec::new();
         let mut first: HashMap<u64, f64> = HashMap::new();
         let mut out_tokens = 0usize;
         let mut steps = 0usize;
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
                 last_tok.insert(e.id, now);
                 if e.finished {
                     let e2e = (now - arrive[&e.id]).as_secs_f64();
+                    e2el.push(e2e * 1e3);
                     if a.output_len > 1 {
                         tpot.push((e2e - first[&e.id]) / (a.output_len - 1) as f64 * 1e3);
                     }
@@ -162,36 +164,40 @@ fn main() -> Result<()> {
             }
         }
         let dur = start.elapsed().as_secs_f64();
-        let r = serde_json::json!({
+        let mut r = serde_json::json!({
             "engine": "aqwenator",
             "model": a.model,
             "input_len": a.input_len,
             "output_len": a.output_len,
             "concurrency": c,
             "num_prompts": n,
+            "max_tokens_per_step": a.max_tokens,
             "duration_s": dur,
             "output_throughput": out_tokens as f64 / dur,
             "total_token_throughput": (out_tokens + n * a.input_len) as f64 / dur,
-            "mean_ttft_ms": mean(&ttft),
-            "median_ttft_ms": pct(&mut ttft, 50.0),
-            "p99_ttft_ms": pct(&mut ttft, 99.0),
-            "median_tpot_ms": pct(&mut tpot, 50.0),
-            "p99_tpot_ms": pct(&mut tpot, 99.0),
-            "median_itl_ms": pct(&mut itl, 50.0),
-            "p99_itl_ms": pct(&mut itl, 99.0),
             "steps": steps,
             "host_us_per_step": host_us as f64 / steps.max(1) as f64,
             "cold_start_loaded_s": loaded_s,
             "cold_start_first_token_s": first_token_s,
         });
+        for (name, v) in [("ttft", &mut ttft), ("tpot", &mut tpot), ("itl", &mut itl), ("e2el", &mut e2el)] {
+            r[format!("mean_{name}_ms")] = serde_json::json!(mean(v));
+            for (label, q) in [("median", 50.0), ("p90", 90.0), ("p99", 99.0), ("p99.9", 99.9)] {
+                r[format!("{label}_{name}_ms")] = serde_json::json!(pct(v, q));
+            }
+        }
+        let g = |k: &str| r[k].as_f64().unwrap_or(f64::NAN);
         println!(
-            "c={c:<4} out_tok/s={:9.1} ttft_p50={:8.1}ms ttft_p99={:8.1}ms tpot_p50={:7.2}ms itl_p99={:7.2}ms host/step={:.0}us",
-            r["output_throughput"].as_f64().unwrap_or(f64::NAN),
-            r["median_ttft_ms"].as_f64().unwrap_or(f64::NAN),
-            r["p99_ttft_ms"].as_f64().unwrap_or(f64::NAN),
-            r["median_tpot_ms"].as_f64().unwrap_or(f64::NAN),
-            r["p99_itl_ms"].as_f64().unwrap_or(f64::NAN),
-            r["host_us_per_step"].as_f64().unwrap_or(f64::NAN),
+            "c={c:<3} out_tok/s={:8.1} ttft p50/p99/p999={:7.1}/{:7.1}/{:7.1}ms itl p50/p99/p999={:6.2}/{:6.2}/{:6.2}ms tpot p99={:6.2}ms host/step={:.0}us",
+            g("output_throughput"),
+            g("median_ttft_ms"),
+            g("p99_ttft_ms"),
+            g("p99.9_ttft_ms"),
+            g("median_itl_ms"),
+            g("p99_itl_ms"),
+            g("p99.9_itl_ms"),
+            g("p99_tpot_ms"),
+            g("host_us_per_step"),
         );
         if let Some(p) = eng.model.prof.as_mut() {
             println!("{}", p.report());

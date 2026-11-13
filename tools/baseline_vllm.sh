@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # vLLM baseline sweep on one GPU of the shared B200 box.
 # Usage: tools/baseline_vllm.sh <model> <tag> [gpu]
+#   CONC="1 4 8 16 32 64"      concurrency levels
+#   SHAPES="1024:256 8192:512" input:output token lengths
 # Writes vllm bench JSON results to ~/aq/results/baseline/<tag>/.
 set -euo pipefail
 MODEL=$1
 TAG=$2
 GPU=${3:-$(bash ~/aq/src/scripts/remote/pick_gpu.sh)}
+CONC=${CONC:-"1 4 8 16 32 64"}
+SHAPES=${SHAPES:-"1024:256 8192:512"}
 OUT=$HOME/aq/results/baseline/$TAG
 PORT=$((18000 + GPU))
 mkdir -p "$OUT"
@@ -22,6 +26,7 @@ echo "model=$MODEL gpu=$GPU port=$PORT" | tee "$OUT/meta.txt"
 python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)" | tee -a "$OUT/meta.txt"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader -i "$GPU" | tee -a "$OUT/meta.txt"
 
+T0=$(date +%s.%N)
 vllm serve "$MODEL" --port "$PORT" --max-model-len 16384 --gpu-memory-utilization 0.85 \
   --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 256 \
   > "$OUT/server.log" 2>&1 &
@@ -31,26 +36,30 @@ trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT
 for i in $(seq 1 180); do
   curl -sf "localhost:$PORT/v1/models" >/dev/null && break
   kill -0 $SERVER 2>/dev/null || { echo "server died"; tail -50 "$OUT/server.log"; exit 1; }
-  sleep 5
+  sleep 1
 done
+T1=$(date +%s.%N)
+echo "cold_start_ready_s=$(echo "$T1 - $T0" | bc)" | tee -a "$OUT/meta.txt"
 
 run() { # in out conc
-  local in=$1 out=$2 c=$3 n=$(( $3 * 4 > 32 ? $3 * 4 : 32 ))
+  local in=$1 out=$2 c=$3 n=$(( $3 * 16 > 200 ? $3 * 16 : 200 ))
   vllm bench serve --backend vllm --model "$MODEL" --port "$PORT" \
     --dataset-name random --random-input-len "$in" --random-output-len "$out" \
     --num-prompts "$n" --max-concurrency "$c" --ignore-eos \
-    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99,99.9 \
     --save-result --result-dir "$OUT" --result-filename "in${in}_out${out}_c${c}.json" \
     > "$OUT/bench_in${in}_out${out}_c${c}.log" 2>&1
   python - "$OUT/in${in}_out${out}_c${c}.json" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
-print(f"{sys.argv[1].split('/')[-1]:28s} out_tok/s={r['output_throughput']:9.1f} "
-      f"ttft_p50={r['median_ttft_ms']:8.1f}ms ttft_p99={r['p99_ttft_ms']:8.1f}ms "
-      f"tpot_p50={r['median_tpot_ms']:7.2f}ms itl_p99={r['p99_itl_ms']:7.2f}ms")
+g = lambda k: r.get(k, float("nan"))
+print(f"{sys.argv[1].split('/')[-1]:28s} out_tok/s={g('output_throughput'):9.1f} "
+      f"ttft p50/p99/p999={g('median_ttft_ms'):7.1f}/{g('p99_ttft_ms'):7.1f}/{g('p99.9_ttft_ms'):7.1f}ms "
+      f"itl p50/p99/p999={g('median_itl_ms'):6.2f}/{g('p99_itl_ms'):6.2f}/{g('p99.9_itl_ms'):6.2f}ms")
 PY
 }
 
-for c in 1 8 32 64 128 256; do run 1024 256 "$c"; done
-for c in 1 16 64; do run 8192 512 "$c"; done
+for shape in $SHAPES; do
+  for c in $CONC; do run "${shape%%:*}" "${shape##*:}" "$c"; done
+done
 echo BASELINE_DONE

@@ -7,6 +7,7 @@
 use crate::config::{LayerKind, TextConfig};
 use crate::cublaslt::CUDA_R_16BF;
 use crate::gpu::{Gpu, Prof, cfg, de};
+use cuda_core::LaunchConfig;
 use crate::weights::Checkpoint;
 use anyhow::Result;
 use half::bf16;
@@ -42,6 +43,9 @@ pub struct Layer {
 }
 
 pub struct Scratch {
+    // split-K decode attention partials
+    attn_part: u64,
+    attn_ml: u64,
     // chunked GDN + tiled attention (prefill)
     chunk_start: u64,
     chunk_len: u64,
@@ -86,6 +90,8 @@ pub struct LoadStats {
 pub const GDN_CHUNK: usize = 32;
 /// Query rows per tile of the prefill attention kernel (must match the kernels).
 pub const ATTN_QTILE: usize = 16;
+/// Upper bound on split-K slices for decode attention.
+pub const MAX_ATTN_SPLITS: usize = 128;
 
 /// Engine sizing, fixed at load time (every buffer is preallocated).
 #[derive(Debug, Clone, Copy)]
@@ -143,8 +149,13 @@ pub struct Model {
     pub limits: Limits,
     pub load: LoadStats,
     pub prof: Option<Prof>,
-    /// Captured decode graphs, keyed by padded batch size.
-    graphs: std::collections::HashMap<usize, u64>,
+    /// Captured decode graphs, keyed by (padded batch size, attention splits).
+    graphs: std::collections::HashMap<(usize, usize), u64>,
+    num_sms: usize,
+    /// Target decode-attention blocks per SM when choosing split-K slices (AQ_ATTN_FILL).
+    attn_fill: usize,
+    /// Split-K slices for this step's decode attention (set by `upload`).
+    cur_splits: usize,
     pub use_graphs: bool,
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
@@ -265,7 +276,10 @@ impl Model {
         let t = lim.max_tokens;
         let sq = lim.max_seqs;
         let hvd = cfg.linear_num_value_heads * 128;
+        let hq = cfg.num_attention_heads;
         let s = Scratch {
+            attn_part: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * cfg.head_dim * 4)?,
+            attn_ml: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * 2 * 4)?,
             chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
             chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
             seq_chunk0: gpu.alloc(sq * 4)?,
@@ -299,6 +313,7 @@ impl Model {
             tok: gpu.alloc(sq * 4)?,
         };
         gpu.sync()?;
+        let num_sms = gpu.num_sms()?;
         let upload_s = t1.elapsed().as_secs_f64();
         Ok(Self {
             cfg,
@@ -315,6 +330,9 @@ impl Model {
             use_graphs: std::env::var("AQ_NO_GRAPHS").is_err(),
             cur_chunks: 0,
             cur_tiles: 0,
+            cur_splits: 1,
+            num_sms,
+            attn_fill: std::env::var("AQ_ATTN_FILL").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
         })
@@ -364,6 +382,9 @@ impl Model {
         }
         self.upload(b)?;
         self.forward(b.tokens.len(), nseq, ns, b.n_decode, dump)?;
+        if let Some(p) = self.prof.as_mut() {
+            p.finish()?;
+        }
         if ns == 0 {
             return Ok(Vec::new());
         }
@@ -391,7 +412,8 @@ impl Model {
         }
         p.n_decode = bucket;
         self.upload(&p)?;
-        if let Some(&exec) = self.graphs.get(&bucket) {
+        let key = (bucket, self.cur_splits);
+        if let Some(&exec) = self.graphs.get(&key) {
             self.gpu.launch_graph(exec)?;
         } else {
             // Eager run first: produces this step's tokens and tunes every GEMM plan the
@@ -402,7 +424,7 @@ impl Model {
             let r = self.forward(bucket, bucket, bucket, bucket, None);
             let exec = self.gpu.end_capture()?;
             r?;
-            self.graphs.insert(bucket, exec);
+            self.graphs.insert(key, exec);
         }
         let mut toks = self.gpu.download(self.s.tok, bucket)?;
         toks.truncate(n);
@@ -431,6 +453,16 @@ impl Model {
         }
         self.cur_chunks = cs.len();
         self.cur_tiles = ts.len();
+        // Split-K slices for decode attention: enough blocks to fill the GPU twice, at least
+        // 64 keys per slice, power of two (bounds the number of captured graphs).
+        let nd = b.n_decode;
+        self.cur_splits = if nd == 0 {
+            1
+        } else {
+            let max_ctx = b.tok_pos[..nd].iter().copied().max().unwrap_or(0) as usize + 1;
+            let fill = (self.attn_fill * self.num_sms).div_ceil(nd * self.cfg.num_key_value_heads);
+            fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS)
+        };
         let (s, g) = (&self.s, &self.gpu);
         if !cs.is_empty() {
             g.upload(s.chunk_start, &cs)?;
@@ -469,6 +501,12 @@ impl Model {
             };
         }
         if let Some(p) = prof.as_mut() {
+            let pure_decode = nd_total == nseq;
+            p.active = match p.filter {
+                1 => pure_decode,
+                2 => !pure_decode,
+                _ => true,
+            };
             p.start(g)?;
         }
         let st = g.stream.clone();
@@ -697,12 +735,11 @@ impl Model {
                     .map_err(de)?;
                     mark!("attn_prep");
                     let scale = 1.0 / (c.head_dim as f32).sqrt();
-                    let naive_rows = if self.ref_attn { t } else { nd_total };
-                    if naive_rows > 0 {
+                    if self.ref_attn {
                         unsafe {
                             g.k.attention(
                                 &st,
-                                cfg((naive_rows as u32, h, 1), 256),
+                                cfg((t as u32, h, 1), 256),
                                 s.q as *const u16,
                                 l.k_cache as *const u16,
                                 l.v_cache as *const u16,
@@ -720,6 +757,43 @@ impl Model {
                             )
                         }
                         .map_err(de)?;
+                    } else if nd_total > 0 {
+                        let ns = self.cur_splits as u32;
+                        unsafe {
+                            g.k.attn_decode_split(
+                                &st,
+                                LaunchConfig { grid_dim: (nd_total as u32, hkv, ns), block_dim: (32 * (h / hkv), 1, 1), shared_mem_bytes: 0 },
+                                s.q as *const u16,
+                                l.k_cache as *const u16,
+                                l.v_cache as *const u16,
+                                s.tok_pos as *const u32,
+                                s.tok_seq as *const u32,
+                                s.tables as *const u32,
+                                mb,
+                                bs,
+                                h,
+                                hkv,
+                                scale,
+                                s.attn_part as *mut f32,
+                                s.attn_ml as *mut f32,
+                            )
+                        }
+                        .map_err(de)?;
+                        unsafe {
+                            g.k.attn_decode_combine(
+                                &st,
+                                cfg((nd_total as u32, h, 1), 256),
+                                s.attn_part as *const f32,
+                                s.attn_ml as *const f32,
+                                ns,
+                                s.proj as *const u16,
+                                n as u32,
+                                s.mix as *mut u16,
+                                h,
+                            )
+                        }
+                        .map_err(de)?;
+                        mark!("attn_decode");
                     }
                     if self.cur_tiles > 0 && !self.ref_attn {
                         unsafe {
@@ -746,7 +820,7 @@ impl Model {
                         }
                         .map_err(de)?;
                     }
-                    mark!("attention");
+                    mark!("attn_prefill");
                     g.gemm(t, lim.max_tokens, c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_o");
                 }

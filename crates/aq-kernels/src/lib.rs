@@ -12,7 +12,7 @@
 //! chunked gated delta rule, fused epilogues) come later and get A/B tested against these.
 #![allow(clippy::missing_safety_doc, clippy::too_many_arguments, non_snake_case)]
 
-use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
+use cuda_device::convert::{bf16_to_f32, cvt_f32x2_bf16x2, f32_to_bf16_rne};
 use cuda_device::{thread, warp};
 
 const FULL: u32 = 0xffff_ffff;
@@ -356,6 +356,172 @@ pub mod kernels {
             den += unsafe { *sl.add(k) } * f;
             num += unsafe { *sacc.add(k * D + d) } * f;
             k += 1;
+        }
+        let o = rb(num / den);
+        let g = unsafe { ld(qkv, t * ld_qkv as usize + head * 2 * D + D + d) };
+        unsafe { st(out, t * h * D + head * D + d, o * rb(sigmoid(g))) };
+    }
+
+    /// Split-K decode attention (flash-decoding), phase 1. One block per (decode token,
+    /// KV head, split); one warp per query head of the GQA group (blockDim = 32 * group).
+    /// The token's keys `0..=pos` are cut into `n_splits` equal ranges; this block scans its
+    /// range with an online softmax and writes the partial `(m, l, acc[256])` per head.
+    ///
+    /// Within a warp, 4 keys are in flight at once: lane group `g = lane / 8` takes every 4th
+    /// key, and lane `r = lane % 8` of the group owns dims `32r..32r+32` (16 bf16x2 loads of K
+    /// and of V per key). Each group keeps its own online-softmax state; the 4 groups merge
+    /// through shuffles at the end.
+    /// grid = (n_decode, Hkv, n_splits), block = (32 * H / Hkv).
+    #[kernel]
+    pub unsafe fn attn_decode_split(
+        q: *const u16,
+        k_cache: *const u16,
+        v_cache: *const u16,
+        tok_pos: *const u32,
+        tok_seq: *const u32,
+        block_tables: *const u32,
+        max_blocks: u32,
+        block_size: u32,
+        n_heads: u32,
+        n_kv: u32,
+        scale: f32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+    ) {
+        const D: usize = 256;
+        const SL: usize = 32; // dims per lane
+        let t = thread::blockIdx_x() as usize;
+        let kvh = thread::blockIdx_y() as usize;
+        let split = thread::blockIdx_z() as usize;
+        let n_splits = thread::gridDim_z() as usize;
+        let lane = (thread::threadIdx_x() % 32) as usize;
+        let w = (thread::threadIdx_x() / 32) as usize;
+        let grp = lane / 8;
+        let r = lane % 8;
+        let h = n_heads as usize;
+        let hkv = n_kv as usize;
+        let group = h / hkv;
+        let head = kvh * group + w;
+        let n_keys = unsafe { *tok_pos.add(t) } as usize + 1;
+        let chunk = n_keys.div_ceil(n_splits);
+        let k0 = split * chunk;
+        let k1 = (k0 + chunk).min(n_keys);
+        let bs = block_size as usize;
+        let table = unsafe { block_tables.add(*tok_seq.add(t) as usize * max_blocks as usize) };
+
+        let mut qv = [0.0f32; SL];
+        let qp = unsafe { q.add((t * h + head) * D + r * SL).cast::<u32>() };
+        #[unroll]
+        for i in 0..16 {
+            let (a, b) = cvt_f32x2_bf16x2(unsafe { *qp.add(i) });
+            qv[2 * i] = a * scale;
+            qv[2 * i + 1] = b * scale;
+        }
+        let mut acc = [0.0f32; SL];
+        let mut m = -1.0e30f32;
+        let mut l = 0.0f32;
+        let gmask = 0xFFu32 << (8 * grp as u32);
+        let mut j = k0 + grp;
+        while j < k1 {
+            let blk = unsafe { *table.add(j / bs) } as usize;
+            let off = ((blk * bs + j % bs) * hkv + kvh) * D + r * SL;
+            let kp = unsafe { k_cache.add(off).cast::<u32>() };
+            let vp = unsafe { v_cache.add(off).cast::<u32>() };
+            let mut kw = [0u32; 16];
+            let mut vw = [0u32; 16];
+            #[unroll]
+            for i in 0..16 {
+                kw[i] = unsafe { *kp.add(i) };
+                vw[i] = unsafe { *vp.add(i) };
+            }
+            let mut dot = 0.0f32;
+            #[unroll]
+            for i in 0..16 {
+                let (a, b) = cvt_f32x2_bf16x2(kw[i]);
+                dot += qv[2 * i] * a + qv[2 * i + 1] * b;
+            }
+            // Groups can run different trip counts: only the group's own 8 lanes take part.
+            dot += warp::shuffle_xor_f32_sync(gmask, dot, 1);
+            dot += warp::shuffle_xor_f32_sync(gmask, dot, 2);
+            dot += warp::shuffle_xor_f32_sync(gmask, dot, 4);
+            let m_new = m.max(dot);
+            let corr = libm::expf(m - m_new);
+            let p = libm::expf(dot - m_new);
+            l = l * corr + p;
+            #[unroll]
+            for i in 0..16 {
+                let (a, b) = cvt_f32x2_bf16x2(vw[i]);
+                acc[2 * i] = acc[2 * i] * corr + p * a;
+                acc[2 * i + 1] = acc[2 * i + 1] * corr + p * b;
+            }
+            m = m_new;
+            j += 4;
+        }
+        // Merge the 4 lane groups (same r, different keys).
+        let mut off = 8u32;
+        while off < 32 {
+            let mo = warp::shuffle_xor_f32_sync(FULL, m, off);
+            let lo = warp::shuffle_xor_f32_sync(FULL, l, off);
+            let mn = m.max(mo);
+            let fa = libm::expf(m - mn);
+            let fb = libm::expf(mo - mn);
+            #[unroll]
+            for i in 0..32 {
+                let ao = warp::shuffle_xor_f32_sync(FULL, acc[i], off);
+                acc[i] = acc[i] * fa + ao * fb;
+            }
+            l = l * fa + lo * fb;
+            m = mn;
+            off *= 2;
+        }
+        let slot = (t * h + head) * n_splits + split;
+        if grp == 0 {
+            #[unroll]
+            for i in 0..32 {
+                unsafe { *part_acc.add(slot * D + r * SL + i) = acc[i] };
+            }
+            if r == 0 {
+                unsafe {
+                    *part_ml.add(slot * 2) = m;
+                    *part_ml.add(slot * 2 + 1) = l;
+                }
+            }
+        }
+    }
+
+    /// Split-K decode attention, phase 2: merge the splits of each (token, head), normalize,
+    /// apply the output gate. grid = (n_decode, H), block = (256).
+    #[kernel]
+    pub unsafe fn attn_decode_combine(
+        part_acc: *const f32,
+        part_ml: *const f32,
+        n_splits: u32,
+        qkv: *const u16,
+        ld_qkv: u32,
+        out: *mut u16,
+        n_heads: u32,
+    ) {
+        const D: usize = 256;
+        let t = thread::blockIdx_x() as usize;
+        let head = thread::blockIdx_y() as usize;
+        let d = thread::threadIdx_x() as usize;
+        let h = n_heads as usize;
+        let ns = n_splits as usize;
+        let base = (t * h + head) * ns;
+        let mut mm = -1.0e30f32;
+        let mut s = 0usize;
+        while s < ns {
+            mm = mm.max(unsafe { *part_ml.add((base + s) * 2) });
+            s += 1;
+        }
+        let mut num = 0.0f32;
+        let mut den = 0.0f32;
+        let mut s = 0usize;
+        while s < ns {
+            let f = libm::expf(unsafe { *part_ml.add((base + s) * 2) } - mm);
+            den += unsafe { *part_ml.add((base + s) * 2 + 1) } * f;
+            num += unsafe { *part_acc.add((base + s) * D + d) } * f;
+            s += 1;
         }
         let o = rb(num / den);
         let g = unsafe { ld(qkv, t * ld_qkv as usize + head * 2 * D + D + d) };

@@ -104,6 +104,7 @@ unsafe extern "C" {
     fn cuGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> i32;
     fn cuGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
     fn cuGraphDestroy(graph: *mut c_void) -> i32;
+    fn cuDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> i32;
 }
 
 fn drv(r: i32, what: &str) -> Result<()> {
@@ -130,6 +131,13 @@ impl Gpu {
         Ok(exec as u64)
     }
 
+    /// Number of streaming multiprocessors (CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).
+    pub fn num_sms(&self) -> Result<usize> {
+        let mut v = 0i32;
+        drv(unsafe { cuDeviceGetAttribute(&mut v, 16, self.ctx.cu_device() as i32) }, "cuDeviceGetAttribute")?;
+        Ok(v as usize)
+    }
+
     pub fn launch_graph(&self, exec: u64) -> Result<()> {
         drv(unsafe { cuGraphLaunch(exec as *mut c_void, self.raw_stream()) }, "cuGraphLaunch")
     }
@@ -148,43 +156,89 @@ pub fn cfg(grid: (u32, u32, u32), block: u32) -> LaunchConfig {
     LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 }
 }
 
-/// Per-op wall time, enabled with `AQ_PROFILE=1`: the stream is synchronized at every mark,
-/// so this measures each op in isolation (and slows the step down). For ranking, not totals.
+/// Per-op GPU time, enabled with `AQ_PROFILE=1|decode|prefill`. CUDA events are recorded on
+/// the stream between ops (no host sync inside the step), and read back once per step, so the
+/// numbers are the GPU-side duration of each op plus any launch gap before it. Graphs are
+/// disabled while profiling, so small ops include their launch latency.
 #[derive(Default)]
 pub struct Prof {
-    last: Option<std::time::Instant>,
+    /// Which steps to time: 0 = all, 1 = pure-decode steps only, 2 = steps with prefill only.
+    pub filter: u8,
+    pub active: bool,
+    events: Vec<cuda_core::Event>,
+    names: Vec<&'static str>,
     pub acc: std::collections::BTreeMap<&'static str, (f64, u64)>,
+    pub steps: u64,
 }
 
 impl Prof {
     pub fn from_env() -> Option<Self> {
-        (std::env::var("AQ_PROFILE").as_deref() == Ok("1")).then(Self::default)
+        let filter = match std::env::var("AQ_PROFILE").as_deref() {
+            Ok("1") => 0,
+            Ok("decode") => 1,
+            Ok("prefill") => 2,
+            _ => return None,
+        };
+        Some(Self { filter, ..Self::default() })
+    }
+    fn record(&mut self, g: &Gpu, name: &'static str) -> Result<()> {
+        let k = self.names.len();
+        if self.events.len() <= k {
+            self.events.push(g.ctx.new_event().map_err(de)?);
+        }
+        self.events[k].record(&g.stream).map_err(de)?;
+        self.names.push(name);
+        Ok(())
     }
     pub fn start(&mut self, g: &Gpu) -> Result<()> {
-        g.sync()?;
-        self.last = Some(std::time::Instant::now());
+        self.names.clear();
+        if self.active {
+            self.record(g, "")?;
+        }
         Ok(())
     }
     pub fn mark(&mut self, g: &Gpu, name: &'static str) -> Result<()> {
-        g.sync()?;
-        let now = std::time::Instant::now();
-        if let Some(l) = self.last {
-            let e = self.acc.entry(name).or_default();
-            e.0 += (now - l).as_secs_f64();
+        if self.active {
+            self.record(g, name)?;
+        }
+        Ok(())
+    }
+    /// Read this step's events back (one sync) and accumulate.
+    pub fn finish(&mut self) -> Result<()> {
+        if !self.active || self.names.len() < 2 {
+            return Ok(());
+        }
+        self.events[self.names.len() - 1].synchronize().map_err(de)?;
+        for k in 1..self.names.len() {
+            let ms = self.events[k - 1].elapsed_time(&self.events[k]).map_err(de)? as f64;
+            let e = self.acc.entry(self.names[k]).or_default();
+            e.0 += ms / 1e3;
             e.1 += 1;
         }
-        self.last = Some(now);
+        self.steps += 1;
+        self.names.clear();
         Ok(())
     }
     pub fn report(&mut self) -> String {
         let total: f64 = self.acc.values().map(|v| v.0).sum();
         let mut rows: Vec<_> = self.acc.iter().collect();
         rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        let mut out = format!("{:<18} {:>10} {:>7} {:>10}\n", "op", "total ms", "share", "us/call");
+        let steps = self.steps.max(1) as f64;
+        let mut out = format!(
+            "{:<18} {:>10} {:>7} {:>10} {:>12}   ({} steps, {:.3} ms/step)\n",
+            "op", "total ms", "share", "us/call", "us/step", self.steps, total * 1e3 / steps
+        );
         for (k, (t, n)) in rows {
-            out += &format!("{k:<18} {:>10.1} {:>6.1}% {:>10.1}\n", t * 1e3, 100.0 * t / total, t * 1e6 / *n as f64);
+            out += &format!(
+                "{k:<18} {:>10.1} {:>6.1}% {:>10.1} {:>12.1}\n",
+                t * 1e3,
+                100.0 * t / total,
+                t * 1e6 / *n as f64,
+                t * 1e6 / steps
+            );
         }
         self.acc.clear();
+        self.steps = 0;
         out
     }
 }
