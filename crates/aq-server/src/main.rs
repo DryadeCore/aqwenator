@@ -10,6 +10,10 @@
 //!
 //!     aq-serve <model> [--port 8000] [--max-seqs 64] [--max-ctx 32768] [--max-tokens 8192]
 //!              [--mixed-prefill N] [--max-running N] [--session-cache true|false] [--kv-gb X]
+//!              [--spec-k N]
+//!
+//! `--spec-k` (default 4, 0 = off): exact speculative decoding with prompt-lookup drafts;
+//! outputs are token-identical to plain greedy decoding.
 //!
 //! `--max-seqs` is the number of state slots (running + parked sessions); `--max-running`
 //! caps how many run at once.
@@ -287,7 +291,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 0 };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4 };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
