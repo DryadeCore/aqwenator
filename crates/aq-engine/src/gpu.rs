@@ -19,6 +19,8 @@ pub struct Gpu {
     pub lt: CublasLt,
     allocs: Vec<u64>,
     pub allocated_bytes: usize,
+    /// True between `begin_capture` and `end_capture`.
+    pub capturing: std::cell::Cell<bool>,
 }
 
 pub const WORKSPACE_BYTES: usize = 64 << 20;
@@ -31,7 +33,11 @@ impl Gpu {
         let k = aq_kernels::kernels::load(&ctx).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
         let lt = CublasLt::new(ws, WORKSPACE_BYTES)?;
-        Ok(Self { ctx, stream, k, lt, allocs: vec![ws], allocated_bytes: WORKSPACE_BYTES })
+        let me = Self { ctx, stream, k, lt, allocs: vec![ws], allocated_bytes: WORKSPACE_BYTES, capturing: Default::default() };
+        if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
+            me.print_kernel_info()?;
+        }
+        Ok(me)
     }
 
     pub fn raw_stream(&self) -> *mut c_void {
@@ -108,6 +114,10 @@ unsafe extern "C" {
     fn cuModuleGetFunction(f: *mut *mut c_void, module: *mut c_void, name: *const std::ffi::c_char) -> i32;
     fn cuFuncSetAttribute(f: *mut c_void, attr: i32, value: i32) -> i32;
     fn cuFuncGetAttribute(value: *mut i32, attr: i32, f: *mut c_void) -> i32;
+    fn cuModuleGetFunctionCount(count: *mut u32, module: *mut c_void) -> i32;
+    fn cuModuleEnumerateFunctions(fns: *mut *mut c_void, n: u32, module: *mut c_void) -> i32;
+    fn cuFuncGetName(name: *mut *const std::ffi::c_char, f: *mut c_void) -> i32;
+    fn cuEventRecordWithFlags(event: *mut c_void, stream: *mut c_void, flags: u32) -> i32;
 }
 
 fn drv(r: i32, what: &str) -> Result<()> {
@@ -121,11 +131,13 @@ impl Gpu {
     /// Start recording everything enqueued on the stream (relaxed mode, so cuBLASLt's
     /// internal queries are allowed).
     pub fn begin_capture(&self) -> Result<()> {
+        self.capturing.set(true);
         drv(unsafe { cuStreamBeginCapture_v2(self.raw_stream(), 2) }, "cuStreamBeginCapture")
     }
 
     /// Stop recording and instantiate the graph; returns the executable graph handle.
     pub fn end_capture(&self) -> Result<u64> {
+        self.capturing.set(false);
         let mut graph = std::ptr::null_mut();
         drv(unsafe { cuStreamEndCapture(self.raw_stream(), &mut graph) }, "cuStreamEndCapture")?;
         let mut exec = std::ptr::null_mut();
@@ -147,6 +159,32 @@ impl Gpu {
 
     /// Allow `kernel` to launch with up to `bytes` of dynamic shared memory (needed above 48 KiB;
     /// the raw launch path does not opt in by itself).
+    /// `AQ_KINFO=1`: print registers / spills / static smem of every kernel in the module.
+    pub fn print_kernel_info(&self) -> Result<()> {
+        let module = self.k.as_cuda_module().cu_module() as *mut c_void;
+        let mut n = 0u32;
+        drv(unsafe { cuModuleGetFunctionCount(&mut n, module) }, "cuModuleGetFunctionCount")?;
+        let mut fns = vec![std::ptr::null_mut(); n as usize];
+        drv(unsafe { cuModuleEnumerateFunctions(fns.as_mut_ptr(), n, module) }, "cuModuleEnumerateFunctions")?;
+        let mut rows = Vec::new();
+        for f in fns {
+            let mut name = std::ptr::null();
+            drv(unsafe { cuFuncGetName(&mut name, f) }, "cuFuncGetName")?;
+            let get = |a: i32| {
+                let mut v = 0;
+                unsafe { cuFuncGetAttribute(&mut v, a, f) };
+                v
+            };
+            let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+            rows.push((name, get(4), get(3), get(1), get(0)));
+        }
+        rows.sort();
+        for (name, regs, local, smem, maxthr) in rows {
+            eprintln!("kinfo {name:<28} regs {regs:>3}  local {local:>6} B  static smem {smem:>6} B  max threads {maxthr}");
+        }
+        Ok(())
+    }
+
     pub fn opt_in_dynamic_smem(&self, kernel: &str, bytes: u32) -> Result<()> {
         const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
         let name = std::ffi::CString::new(kernel)?;
@@ -192,7 +230,7 @@ pub struct Prof {
     pub filter: u8,
     pub active: bool,
     events: Vec<cuda_core::Event>,
-    names: Vec<&'static str>,
+    pub names: Vec<&'static str>,
     pub acc: std::collections::BTreeMap<&'static str, (f64, u64)>,
     pub steps: u64,
 }
@@ -212,7 +250,12 @@ impl Prof {
         if self.events.len() <= k {
             self.events.push(g.ctx.new_event().map_err(de)?);
         }
-        self.events[k].record(&g.stream).map_err(de)?;
+        // CU_EVENT_RECORD_EXTERNAL: under stream capture this becomes a timing node of the
+        // graph (a plain record would only be a dependency edge).
+        drv(
+            unsafe { cuEventRecordWithFlags(self.events[k].cu_event() as *mut c_void, g.raw_stream(), g.capturing.get() as u32) },
+            "cuEventRecordWithFlags",
+        )?;
         self.names.push(name);
         Ok(())
     }

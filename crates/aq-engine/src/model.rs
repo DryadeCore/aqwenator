@@ -43,6 +43,8 @@ pub struct Layer {
 }
 
 pub struct Scratch {
+    amax_v: u64,
+    amax_i: u64,
     // split-K decode attention partials
     attn_part: u64,
     attn_ml: u64,
@@ -90,6 +92,8 @@ pub struct LoadStats {
 pub const GDN_CHUNK: usize = 32;
 /// Query rows per tile of the prefill attention kernel (must match the kernels).
 pub const ATTN_QTILE: usize = 16;
+/// Blocks per row in the two-phase argmax.
+pub const ARGMAX_PARTS: usize = 32;
 /// Upper bound on split-K slices for decode attention.
 pub const MAX_ATTN_SPLITS: usize = 128;
 
@@ -149,8 +153,9 @@ pub struct Model {
     pub limits: Limits,
     pub load: LoadStats,
     pub prof: Option<Prof>,
-    /// Captured decode graphs, keyed by (padded batch size, attention splits).
-    graphs: std::collections::HashMap<(usize, usize), u64>,
+    /// Captured decode graphs, keyed by (padded batch size, attention splits), with the
+    /// profile mark names recorded inside them (when profiling).
+    graphs: std::collections::HashMap<(usize, usize), (u64, Vec<&'static str>)>,
     num_sms: usize,
     /// Target decode-attention blocks per SM when choosing split-K slices (AQ_ATTN_FILL).
     attn_fill: usize,
@@ -288,6 +293,8 @@ impl Model {
         let hvd = cfg.linear_num_value_heads * 128;
         let hq = cfg.num_attention_heads;
         let s = Scratch {
+            amax_v: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
+            amax_i: gpu.alloc(sq * ARGMAX_PARTS * 4)?,
             attn_part: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * cfg.head_dim * 4)?,
             attn_ml: gpu.alloc(sq * hq * MAX_ATTN_SPLITS * 2 * 4)?,
             chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
@@ -394,7 +401,7 @@ impl Model {
         anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_tokens, "{} tokens exceeds max_tokens", b.tokens.len());
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq;
-        if self.use_graphs && pure_decode && dump.is_none() && self.prof.is_none() {
+        if self.use_graphs && pure_decode && dump.is_none() {
             return self.step_graph(b);
         }
         self.upload(b)?;
@@ -430,18 +437,30 @@ impl Model {
         p.n_decode = bucket;
         self.upload(&p)?;
         let key = (bucket, self.cur_splits);
-        if let Some(&exec) = self.graphs.get(&key) {
-            self.gpu.launch_graph(exec)?;
+        if let Some((exec, names)) = self.graphs.get(&key) {
+            if let Some(p) = self.prof.as_mut() {
+                // The graph replays the event records captured with it.
+                p.active = p.filter != 2;
+                p.names = names.clone();
+            }
+            self.gpu.launch_graph(*exec)?;
+            if let Some(p) = self.prof.as_mut() {
+                p.finish()?;
+            }
         } else {
             // Eager run first: produces this step's tokens and tunes every GEMM plan the
             // graph will use (tuning synchronizes, which capture forbids).
             self.forward(bucket, bucket, bucket, bucket, None)?;
+            if let Some(p) = self.prof.as_mut() {
+                p.finish()?;
+            }
             self.gpu.sync()?;
             self.gpu.begin_capture()?;
             let r = self.forward(bucket, bucket, bucket, bucket, None);
             let exec = self.gpu.end_capture()?;
             r?;
-            self.graphs.insert(key, exec);
+            let names = self.prof.as_mut().map(|p| std::mem::take(&mut p.names)).unwrap_or_default();
+            self.graphs.insert(key, (exec, names));
         }
         let mut toks = self.gpu.download(self.s.tok, bucket)?;
         toks.truncate(n);
@@ -796,6 +815,7 @@ impl Model {
                             )
                         }
                         .map_err(de)?;
+                        mark!("attn_dec_split");
                         unsafe {
                             g.k.attn_decode_combine(
                                 &st,
@@ -810,7 +830,7 @@ impl Model {
                             )
                         }
                         .map_err(de)?;
-                        mark!("attn_decode");
+                        mark!("attn_dec_combine");
                     }
                     if self.cur_tiles > 0 && !self.ref_attn && !self.tile_attn {
                         let grp = (h / hkv) as u32;
@@ -892,8 +912,9 @@ impl Model {
             let inter = c.intermediate_size;
             g.gemm(t, lim.max_tokens, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
             mark!("gemm_gate_up");
+            let nvec = (t * inter / 8) as u32;
             unsafe {
-                g.k.silu_mul(&st, cfg((t as u32, 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32)
+                g.k.silu_mul(&st, cfg((nvec.div_ceil(256), 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32, t as u32)
             }
             .map_err(de)?;
             mark!("silu_mul");
@@ -934,8 +955,21 @@ impl Model {
         mark!("final_norm");
         g.gemm(ns, lim.max_seqs, c.vocab_size, c.hidden_size, s.hfinal, self.lm_head, s.logits, CUDA_R_16BF)?;
         mark!("gemm_lm_head");
-        unsafe { g.k.argmax(&st, cfg((ns as u32, 1, 1), 1024), s.logits as *const u16, c.vocab_size as u32, s.tok as *mut u32) }
-            .map_err(de)?;
+        unsafe {
+            g.k.argmax_part(
+                &st,
+                cfg((ns as u32, ARGMAX_PARTS as u32, 1), 256),
+                s.logits as *const u16,
+                c.vocab_size as u32,
+                s.amax_v as *mut f32,
+                s.amax_i as *mut u32,
+            )
+        }
+        .map_err(de)?;
+        unsafe {
+            g.k.argmax_final(&st, cfg((ns as u32, 1, 1), 32), s.amax_v as *const f32, s.amax_i as *const u32, ARGMAX_PARTS as u32, s.tok as *mut u32)
+        }
+        .map_err(de)?;
         mark!("argmax");
         Ok(())
     }

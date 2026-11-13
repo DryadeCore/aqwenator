@@ -13,6 +13,7 @@
 #![allow(clippy::missing_safety_doc, clippy::too_many_arguments, non_snake_case)]
 
 use cuda_device::convert::{bf16_to_f32, cvt_f32x2_bf16x2, f32_to_bf16_rne};
+use cuda_device::vector::U32x4;
 use cuda_device::{thread, warp};
 
 const FULL: u32 = 0xffff_ffff;
@@ -117,6 +118,8 @@ pub mod kernels {
 
     /// Zero-centered RMSNorm (`x * rsqrt(mean(x^2) + eps) * (1 + w)`), optionally fused with the
     /// residual add: if `add` != 0, first `x = bf16(x + delta)` in place.
+    /// 16-byte loads (8 bf16 per thread per chunk); the row stays in registers between the
+    /// sum-of-squares and the scaling pass. Requires hidden % 8 == 0 and hidden <= 8192.
     /// grid = (T), block = (256).
     #[kernel]
     pub unsafe fn add_rmsnorm(
@@ -130,42 +133,83 @@ pub mod kernels {
     ) {
         static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
         let red = (&raw mut RED).cast::<f32>();
-        let row = thread::blockIdx_x() as usize * hidden as usize;
-        let h = hidden as usize;
-        let bd = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let nv = hidden as usize / 8;
+        let row = thread::blockIdx_x() as usize * nv;
+        let xv = unsafe { x.cast::<U32x4>().add(row) };
+        let dv = unsafe { delta.cast::<U32x4>().add(row) };
+        let wv = w.cast::<U32x4>();
+        let ov = unsafe { out.cast::<U32x4>().add(row) };
+        let mut vals = [0.0f32; 32];
         let mut ss = 0.0f32;
-        let mut i = thread::threadIdx_x() as usize;
-        while i < h {
-            let mut v = unsafe { ld(x, row + i) };
-            if add != 0 {
-                v = rb(v + unsafe { ld(delta, row + i) });
-                unsafe { st(x, row + i, v) };
+        #[unroll]
+        for c in 0..4 {
+            let v = tid + c * 256;
+            if v < nv {
+                let xw = unsafe { *xv.add(v) }.to_array();
+                let dw = if add != 0 { unsafe { *dv.add(v) }.to_array() } else { [0u32; 4] };
+                let mut packed = [0u32; 4];
+                #[unroll]
+                for e in 0..4 {
+                    let (mut a0, mut a1) = cvt_f32x2_bf16x2(xw[e]);
+                    if add != 0 {
+                        let (d0, d1) = cvt_f32x2_bf16x2(dw[e]);
+                        a0 = rb(a0 + d0);
+                        a1 = rb(a1 + d1);
+                        packed[e] = (f32_to_bf16_rne(a0) as u32) | ((f32_to_bf16_rne(a1) as u32) << 16);
+                    }
+                    vals[c * 8 + 2 * e] = a0;
+                    vals[c * 8 + 2 * e + 1] = a1;
+                    ss += a0 * a0 + a1 * a1;
+                }
+                if add != 0 {
+                    unsafe { *xv.add(v) = U32x4::new(packed) };
+                }
             }
-            ss += v * v;
-            i += bd;
         }
         let total = unsafe { block_sum(ss, red) };
         let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
-        let mut i = thread::threadIdx_x() as usize;
-        while i < h {
-            let v = unsafe { ld(x, row + i) };
-            unsafe { st(out, row + i, v * inv * (1.0 + ld(w, i))) };
-            i += bd;
+        #[unroll]
+        for c in 0..4 {
+            let v = tid + c * 256;
+            if v < nv {
+                let ww = unsafe { *wv.add(v) }.to_array();
+                let mut packed = [0u32; 4];
+                #[unroll]
+                for e in 0..4 {
+                    let (w0, w1) = cvt_f32x2_bf16x2(ww[e]);
+                    let y0 = vals[c * 8 + 2 * e] * inv * (1.0 + w0);
+                    let y1 = vals[c * 8 + 2 * e + 1] * inv * (1.0 + w1);
+                    packed[e] = (f32_to_bf16_rne(y0) as u32) | ((f32_to_bf16_rne(y1) as u32) << 16);
+                }
+                unsafe { *ov.add(v) = U32x4::new(packed) };
+            }
         }
     }
 
-    /// out[t, i] = silu(gu[t, i]) * gu[t, inter + i]. grid = (T), block = (256).
+    /// out[t, i] = silu(gu[t, i]) * gu[t, inter + i], 8 elements per thread with 16-byte
+    /// loads. Requires inter % 8 == 0. grid = (ceil(T * inter / 8 / 256)), block = (256).
     #[kernel]
-    pub unsafe fn silu_mul(gu: *const u16, out: *mut u16, inter: u32) {
-        let t = thread::blockIdx_x() as usize;
-        let n = inter as usize;
-        let mut i = thread::threadIdx_x() as usize;
-        while i < n {
-            let g = unsafe { ld(gu, t * 2 * n + i) };
-            let u = unsafe { ld(gu, t * 2 * n + n + i) };
-            unsafe { st(out, t * n + i, rb(silu(g)) * u) };
-            i += thread::blockDim_x() as usize;
+    pub unsafe fn silu_mul(gu: *const u16, out: *mut u16, inter: u32, n_tokens: u32) {
+        let nv = inter as usize / 8;
+        let idx = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if idx >= n_tokens as usize * nv {
+            return;
         }
+        let t = idx / nv;
+        let v = idx % nv;
+        let g = unsafe { *gu.cast::<U32x4>().add(t * 2 * nv + v) }.to_array();
+        let u = unsafe { *gu.cast::<U32x4>().add(t * 2 * nv + nv + v) }.to_array();
+        let mut packed = [0u32; 4];
+        #[unroll]
+        for e in 0..4 {
+            let (g0, g1) = cvt_f32x2_bf16x2(g[e]);
+            let (u0, u1) = cvt_f32x2_bf16x2(u[e]);
+            let y0 = rb(silu(g0)) * u0;
+            let y1 = rb(silu(g1)) * u1;
+            packed[e] = (f32_to_bf16_rne(y0) as u32) | ((f32_to_bf16_rne(y1) as u32) << 16);
+        }
+        unsafe { *out.cast::<U32x4>().add(idx) = U32x4::new(packed) };
     }
 
     /// Full-attention prologue for one token and one head.
@@ -417,13 +461,20 @@ pub mod kernels {
         let bs = block_size as usize;
         let table = unsafe { block_tables.add(*tok_seq.add(t) as usize * max_blocks as usize) };
 
+        // Lane r of a key group owns the 16-byte chunks c*8 + r (c = 0..4) of each 512-byte
+        // row: one U32x4 load instruction then covers 128 contiguous bytes per key.
+        // Local element i = c*8 + 2w + {0,1} maps to dim (c*8 + r)*8 + 2w + {0,1}.
         let mut qv = [0.0f32; SL];
-        let qp = unsafe { q.add((t * h + head) * D + r * SL).cast::<u32>() };
+        let qp = unsafe { q.add((t * h + head) * D).cast::<U32x4>() };
         #[unroll]
-        for i in 0..16 {
-            let (a, b) = cvt_f32x2_bf16x2(unsafe { *qp.add(i) });
-            qv[2 * i] = a * scale;
-            qv[2 * i + 1] = b * scale;
+        for c in 0..4 {
+            let v = unsafe { *qp.add(c * 8 + r) }.to_array();
+            #[unroll]
+            for w in 0..4 {
+                let (a, b) = cvt_f32x2_bf16x2(v[w]);
+                qv[c * 8 + 2 * w] = a * scale;
+                qv[c * 8 + 2 * w + 1] = b * scale;
+            }
         }
         let mut acc = [0.0f32; SL];
         let mut m = -1.0e30f32;
@@ -432,21 +483,25 @@ pub mod kernels {
         let mut j = k0 + grp;
         while j < k1 {
             let blk = unsafe { *table.add(j / bs) } as usize;
-            let off = ((blk * bs + j % bs) * hkv + kvh) * D + r * SL;
-            let kp = unsafe { k_cache.add(off).cast::<u32>() };
-            let vp = unsafe { v_cache.add(off).cast::<u32>() };
-            let mut kw = [0u32; 16];
-            let mut vw = [0u32; 16];
+            let off = ((blk * bs + j % bs) * hkv + kvh) * D;
+            let kp = unsafe { k_cache.add(off).cast::<U32x4>() };
+            let vp = unsafe { v_cache.add(off).cast::<U32x4>() };
+            let mut kw = [U32x4::splat(0); 4];
+            let mut vw = [U32x4::splat(0); 4];
             #[unroll]
-            for i in 0..16 {
-                kw[i] = unsafe { *kp.add(i) };
-                vw[i] = unsafe { *vp.add(i) };
+            for c in 0..4 {
+                kw[c] = unsafe { *kp.add(c * 8 + r) };
+                vw[c] = unsafe { *vp.add(c * 8 + r) };
             }
             let mut dot = 0.0f32;
             #[unroll]
-            for i in 0..16 {
-                let (a, b) = cvt_f32x2_bf16x2(kw[i]);
-                dot += qv[2 * i] * a + qv[2 * i + 1] * b;
+            for c in 0..4 {
+                let k4 = kw[c].to_array();
+                #[unroll]
+                for w in 0..4 {
+                    let (a, b) = cvt_f32x2_bf16x2(k4[w]);
+                    dot += qv[c * 8 + 2 * w] * a + qv[c * 8 + 2 * w + 1] * b;
+                }
             }
             // Groups can run different trip counts: only the group's own 8 lanes take part.
             dot += warp::shuffle_xor_f32_sync(gmask, dot, 1);
@@ -457,10 +512,15 @@ pub mod kernels {
             let p = libm::expf(dot - m_new);
             l = l * corr + p;
             #[unroll]
-            for i in 0..16 {
-                let (a, b) = cvt_f32x2_bf16x2(vw[i]);
-                acc[2 * i] = acc[2 * i] * corr + p * a;
-                acc[2 * i + 1] = acc[2 * i + 1] * corr + p * b;
+            for c in 0..4 {
+                let v4 = vw[c].to_array();
+                #[unroll]
+                for w in 0..4 {
+                    let (a, b) = cvt_f32x2_bf16x2(v4[w]);
+                    let i = c * 8 + 2 * w;
+                    acc[i] = acc[i] * corr + p * a;
+                    acc[i + 1] = acc[i + 1] * corr + p * b;
+                }
             }
             m = m_new;
             j += 4;
@@ -485,8 +545,11 @@ pub mod kernels {
         let slot = (t * h + head) * n_splits + split;
         if grp == 0 {
             #[unroll]
-            for i in 0..32 {
-                unsafe { *part_acc.add(slot * D + r * SL + i) = acc[i] };
+            for c in 0..4 {
+                #[unroll]
+                for e in 0..8 {
+                    unsafe { *part_acc.add(slot * D + (c * 8 + r) * 8 + e) = acc[c * 8 + e] };
+                }
             }
             if r == 0 {
                 unsafe {
@@ -1769,6 +1832,112 @@ pub mod kernels {
         while i < h {
             unsafe { st(out, s * h + i, *rv.add(i) * inv * (1.0 + ld(w, i))) };
             i += bd;
+        }
+    }
+
+    /// Row-wise argmax, phase 1: grid = (S, P) blocks of 256 threads; block p scans its 1/P of
+    /// the row with 16-byte loads and writes its (value, index). Ties go to the lowest index.
+    /// Requires n % 8 == 0.
+    #[kernel]
+    pub unsafe fn argmax_part(logits: *const u16, n: u32, part_v: *mut f32, part_i: *mut u32) {
+        static mut BV: SharedArray<f32, 8> = SharedArray::UNINIT;
+        static mut BI: SharedArray<u32, 8> = SharedArray::UNINIT;
+        let bv = (&raw mut BV).cast::<f32>();
+        let bi = (&raw mut BI).cast::<u32>();
+        let row = thread::blockIdx_x() as usize;
+        let p = thread::blockIdx_y() as usize;
+        let np = thread::gridDim_y() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let nv = n as usize / 8;
+        let per = nv.div_ceil(np);
+        let v0 = p * per;
+        let v1 = (v0 + per).min(nv);
+        let base = unsafe { logits.cast::<U32x4>().add(row * nv) };
+        let mut best = -3.0e38f32;
+        let mut idx = u32::MAX;
+        let mut v = v0 + tid;
+        while v < v1 {
+            let w = unsafe { *base.add(v) }.to_array();
+            #[unroll]
+            for e in 0..4 {
+                let (a0, a1) = cvt_f32x2_bf16x2(w[e]);
+                let i0 = (v * 8 + 2 * e) as u32;
+                if a0 > best {
+                    best = a0;
+                    idx = i0;
+                }
+                if a1 > best {
+                    best = a1;
+                    idx = i0 + 1;
+                }
+            }
+            v += 256;
+        }
+        let mut off = 16u32;
+        while off > 0 {
+            let ov = warp::shuffle_xor_f32_sync(FULL, best, off);
+            let oi = warp::shuffle_xor_sync(FULL, idx, off);
+            if ov > best || (ov == best && oi < idx) {
+                best = ov;
+                idx = oi;
+            }
+            off /= 2;
+        }
+        if tid % 32 == 0 {
+            unsafe {
+                *bv.add(tid / 32) = best;
+                *bi.add(tid / 32) = idx;
+            }
+        }
+        thread::sync_threads();
+        if tid == 0 {
+            let mut k = 1usize;
+            while k < 8 {
+                let v = unsafe { *bv.add(k) };
+                let j = unsafe { *bi.add(k) };
+                if v > best || (v == best && j < idx) {
+                    best = v;
+                    idx = j;
+                }
+                k += 1;
+            }
+            unsafe {
+                *part_v.add(row * np + p) = best;
+                *part_i.add(row * np + p) = idx;
+            }
+        }
+    }
+
+    /// Row-wise argmax, phase 2: reduce the P partials of each row. grid = (S), block = (32).
+    #[kernel]
+    pub unsafe fn argmax_final(part_v: *const f32, part_i: *const u32, np: u32, out: *mut u32) {
+        let row = thread::blockIdx_x() as usize;
+        let lane = thread::threadIdx_x() as usize;
+        let np = np as usize;
+        let mut best = -3.0e38f32;
+        let mut idx = u32::MAX;
+        let mut k = lane;
+        while k < np {
+            let v = unsafe { *part_v.add(row * np + k) };
+            let j = unsafe { *part_i.add(row * np + k) };
+            if v > best || (v == best && j < idx) {
+                best = v;
+                idx = j;
+            }
+            k += 32;
+        }
+        let mut off = 16u32;
+        while off > 0 {
+            let ov = warp::shuffle_xor_f32_sync(FULL, best, off);
+            let oi = warp::shuffle_xor_sync(FULL, idx, off);
+            if ov > best || (ov == best && oi < idx) {
+                best = ov;
+                idx = oi;
+            }
+            off /= 2;
+        }
+        if lane == 0 {
+            unsafe { *out.add(row) = idx };
         }
     }
 

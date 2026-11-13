@@ -69,6 +69,9 @@ impl TextConfig {
         if self.linear_conv_kernel_dim != 4 {
             bail!("conv1d kernel assumes width 4");
         }
+        if self.hidden_size % 8 != 0 || self.hidden_size > 8192 || self.intermediate_size % 8 != 0 || self.vocab_size % 8 != 0 {
+            bail!("vectorized kernels need hidden/intermediate/vocab multiples of 8 and hidden <= 8192");
+        }
         if self.layer_types.len() != self.num_hidden_layers {
             bail!("layer_types length mismatch");
         }
