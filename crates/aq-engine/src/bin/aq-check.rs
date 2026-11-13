@@ -171,27 +171,35 @@ fn main() -> Result<()> {
         first = m.step(&m.single(&ids[pos..pos + n], pos), None)?[0];
         pos += n;
     }
+    // Our own top-2 margin at each free-running position: the right yardstick for comparing
+    // other runs of *our* engine against this one once it has left the reference trajectory.
+    let margin_of = |l: &[f32]| {
+        let (_, a, b) = top2(l);
+        a - b
+    };
+    let mut our_margin = vec![margin_of(&m.logits()?)];
     let mut out = vec![first];
     while out.len() < greedy_ref.len() {
         let next = m.step(&m.single(&[*out.last().unwrap()], pos), None)?[0];
+        our_margin.push(margin_of(&m.logits()?));
         pos += 1;
         out.push(next);
     }
     // A divergence from a sequence that matched up to k is acceptable only at a near-tie of the
     // reference (teacher-forced margin at k below NEAR_TIE).
-    let classify = |name: &str, seq: &[u32], against: &[u32]| -> bool {
+    let classify = |name: &str, seq: &[u32], against: &[u32], margins: &dyn Fn(usize) -> Option<f32>| -> bool {
         match seq.iter().zip(against).position(|(a, b)| a != b) {
             None => {
                 println!("{name}: {}/{} identical", seq.len().min(against.len()), against.len());
                 true
             }
-            Some(k) => match ref_at(k) {
+            Some(k) => match margins(k).map(|m| ((), m)) {
                 Some((_, margin)) if margin < NEAR_TIE => {
-                    println!("{name}: identical for {k}/{} tokens, then diverges at a near-tie (ref margin {margin:.3}): ok", against.len());
+                    println!("{name}: identical for {k}/{} tokens, then diverges at a near-tie (margin {margin:.3}): ok", against.len());
                     true
                 }
                 Some((_, margin)) => {
-                    println!("{name}: diverges at k={k} where the reference margin is {margin:.3}: REAL MISMATCH");
+                    println!("{name}: diverges at k={k} where the margin is {margin:.3}: REAL MISMATCH");
                     false
                 }
                 None => {
@@ -201,7 +209,9 @@ fn main() -> Result<()> {
             },
         }
     };
-    failed |= !classify("greedy vs reference", &out, &greedy_ref);
+    let ref_margin = |k: usize| ref_at(k).map(|(_, m)| m);
+    let own_margin = |k: usize| our_margin.get(k).copied();
+    failed |= !classify("greedy vs reference", &out, &greedy_ref, &ref_margin);
     let single = out.clone();
 
     let mut eng = Engine::new(m, vec![]);
@@ -218,7 +228,8 @@ fn main() -> Result<()> {
         }
     }
     for (i, gseq) in got.iter().enumerate() {
-        failed |= !classify(&format!("batched seq {i} vs single"), gseq, &single);
+        // Margins from our own single run: same context as the batched run up to the divergence.
+        failed |= !classify(&format!("batched seq {i} vs single"), gseq, &single, &own_margin);
     }
 
     // ---- 4. session cache: a request that extends a finished one must resume from the parked
