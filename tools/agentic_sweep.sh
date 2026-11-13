@@ -30,8 +30,8 @@ if [ "$ENGINE" = vllm ]; then
     --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 64 > "$OUT/server.log" 2>&1 &
   LABEL="vLLM $(python -c 'import vllm; print(vllm.__version__)')"
 else
-  ~/aq/bin/aq-serve-current "$MODEL" --port "$PORT" --max-seqs 64 --max-running 32 --max-ctx $MAX_CTX \
-    --kv-gb "${AQ_KV_GB:-9}" --mixed-prefill "${AQ_MIXED:-2048}" > "$OUT/server.log" 2>&1 &
+  ${AQ_SERVE_BIN:-~/aq/bin/aq-serve-current} "$MODEL" --port "$PORT" --max-seqs 64 --max-running 32 --max-ctx $MAX_CTX \
+    --kv-gb "${AQ_KV_GB:-9}" --mixed-prefill "${AQ_MIXED:-2048}" --spec-k "${AQ_SPEC_K:-0}" > "$OUT/server.log" 2>&1 &
   LABEL="aqwenator $TAG"
 fi
 SERVER=$!

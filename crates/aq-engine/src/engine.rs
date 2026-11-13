@@ -20,7 +20,7 @@
 //! copy plus shared read-only pages. Exact, because no sequence ever writes below its own
 //! `computed` position, so shared pages are never written.
 
-use crate::model::{Batch, Limits, Model};
+use crate::model::{Batch, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -50,6 +50,8 @@ struct Seq {
     computed: usize,
     /// Pause prefill at this position and snapshot the state there (shared prefix).
     snapshot_at: Option<usize>,
+    /// Spare state slot a speculative step writes into (swapped in on full acceptance).
+    spare: Option<u32>,
 }
 
 impl Seq {
@@ -94,6 +96,18 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
+/// Speculative decoding counters.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpecStats {
+    /// Decode entries that carried at least one draft token.
+    pub spec_entries: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+    /// Decode entries that emitted tokens (with or without drafts) and tokens they emitted.
+    pub decode_entries: u64,
+    pub emitted: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StepStats {
     pub tokens: usize,
@@ -124,6 +138,15 @@ pub struct Engine {
     pub session_cache: bool,
     /// Max sequences running at once; state slots beyond this hold parked sessions.
     pub max_running: usize,
+    /// Speculative decoding: max draft tokens per decode step (0 = off). Greedy requests only.
+    /// Exact: drafts are verified through the normal decode-path kernels, the state is written
+    /// to a spare slot, and on a rejection the accepted tokens are simply fed again.
+    pub spec_k: usize,
+    /// Prompt-lookup drafting: longest suffix n-gram (down to `spec_min_ngram`) matched against
+    /// the sequence's own earlier tokens.
+    pub spec_max_ngram: usize,
+    pub spec_min_ngram: usize,
+    pub spec: SpecStats,
     /// Max prefill tokens in a step that also carries decode tokens. Bounds how long a running
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
@@ -149,6 +172,10 @@ impl Engine {
             cache: CacheStats::default(),
             session_cache: true,
             max_running: lim.max_seqs,
+            spec_k: 0,
+            spec_max_ngram: 4,
+            spec_min_ngram: 2,
+            spec: SpecStats::default(),
             mixed_prefill_budget: usize::MAX,
         }
     }
@@ -172,6 +199,11 @@ impl Engine {
 
     pub fn num_running(&self) -> usize {
         self.running.len()
+    }
+
+    /// Drop every parked session and snapshot (their slots and pages return to the pool).
+    pub fn clear_cache(&mut self) {
+        while self.evict_lru() {}
     }
 
     pub fn num_parked(&self) -> usize {
@@ -355,8 +387,33 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None });
         Ok(true)
+    }
+
+    /// Prompt-lookup draft: find the most recent earlier occurrence of the longest suffix
+    /// n-gram of the sequence's known tokens and propose the tokens that followed it.
+    fn draft(&self, s: &Seq, k: usize) -> Vec<u32> {
+        let n_known = s.known();
+        let tok = |i: usize| s.token_at(i);
+        let mut n = self.spec_max_ngram.min(n_known.saturating_sub(1));
+        while n >= self.spec_min_ngram.max(1) {
+            let suf0 = n_known - n;
+            // scan backwards for an earlier occurrence of tokens[suf0..n_known]
+            let mut start = suf0;
+            while start > 0 {
+                start -= 1;
+                if (0..n).all(|j| tok(start + j) == tok(suf0 + j)) {
+                    let from = start + n;
+                    let to = (from + k).min(n_known);
+                    if to > from {
+                        return (from..to).map(tok).collect();
+                    }
+                }
+            }
+            n -= 1;
+        }
+        Vec::new()
     }
 
     fn ensure_blocks(&mut self, si: usize, upto: usize) -> Result<()> {
@@ -382,13 +439,40 @@ impl Engine {
             }
         }
 
-        // Decode first (1 token each), then prefill chunks in admission order.
+        // Decode-path entries first (pending tokens + optional drafts), then prefill chunks in
+        // admission order.
         let mut plan: Vec<(usize, usize)> = Vec::new(); // (running index, n tokens)
-        for (i, s) in self.running.iter().enumerate() {
-            if s.computed >= s.req.prompt.len() && s.known() - s.computed == 1 && budget > 0 {
-                plan.push((i, 1));
-                budget -= 1;
+        let mut drafts: Vec<Vec<u32>> = Vec::new(); // per decode entry
+        for i in 0..self.running.len() {
+            let s = &self.running[i];
+            if s.computed < s.req.prompt.len() || budget == 0 {
+                continue;
             }
+            let pending = s.known() - s.computed;
+            let rem = s.req.max_new_tokens - s.out.len();
+            let mut d = Vec::new();
+            if self.spec_k > 0 && rem > 1 {
+                let kmax = self.spec_k.min(rem - 1).min(MAX_DECODE_ROWS_PER_SEQ.saturating_sub(pending));
+                if kmax > 0 {
+                    d = self.draft(s, kmax);
+                }
+            }
+            if !d.is_empty() && self.running[i].spare.is_none() {
+                // A spare slot for the speculative state, only if one is free: speculation is
+                // opportunistic and never evicts cached sessions or snapshots.
+                self.running[i].spare = self.free_slots.pop();
+            }
+            if self.running[i].spare.is_none() {
+                d.clear();
+            }
+            let n = (pending + d.len()).min(budget);
+            if n < pending + d.len() {
+                d.clear();
+            }
+            let n = n.min(pending + d.len());
+            plan.push((i, n));
+            drafts.push(d);
+            budget -= n;
         }
         let decode_seqs = plan.len();
         if decode_seqs > 0 {
@@ -413,25 +497,40 @@ impl Engine {
 
         let mb = lim.max_blocks_per_seq();
         let mut b = Batch::default();
-        let mut sampled: Vec<usize> = Vec::new(); // running indices that sample this step
+        // Per plan entry: (first sampled row index in `toks`, number of sampled rows).
+        let mut samples: Vec<(usize, usize)> = Vec::new();
         for (k, &(i, n)) in plan.iter().enumerate() {
+            let d: &[u32] = if k < decode_seqs { &drafts[k] } else { &[] };
+            let real = n - d.len(); // tokens already known
             let upto = self.running[i].computed + n;
             self.ensure_blocks(i, upto)?;
             let s = &self.running[i];
             b.seq_start.push(b.tokens.len() as u32);
             b.seq_len.push(n as u32);
             b.seq_slot.push(s.slot);
-            for p in s.computed..upto {
+            b.seq_slot_out.push(if d.is_empty() { s.slot } else { s.spare.unwrap() });
+            for p in s.computed..s.computed + real {
                 b.tokens.push(s.token_at(p));
                 b.tok_pos.push(p as u32);
+                b.tok_seq.push(k as u32);
+            }
+            for (j, &t) in d.iter().enumerate() {
+                b.tokens.push(t);
+                b.tok_pos.push((s.computed + real + j) as u32);
                 b.tok_seq.push(k as u32);
             }
             let mut row = s.blocks.clone();
             row.resize(mb, 0);
             b.block_tables.extend_from_slice(&row);
-            if upto == s.known() {
-                b.sample_rows.push(b.tokens.len() as u32 - 1);
-                sampled.push(i);
+            if s.computed + real == s.known() {
+                // Sample at the last known token and at every draft.
+                let first = b.tokens.len() - d.len() - 1;
+                samples.push((b.sample_rows.len(), d.len() + 1));
+                for r in first..b.tokens.len() {
+                    b.sample_rows.push(r as u32);
+                }
+            } else {
+                samples.push((0, 0));
             }
         }
         b.n_decode = decode_seqs;
@@ -440,29 +539,65 @@ impl Engine {
         let toks = self.model.step(&b, None)?;
         let gpu_us = t1.elapsed().as_micros() as u64;
 
-        for &(i, n) in &plan {
-            self.running[i].computed += n;
+        let mut events = Vec::new();
+        let mut done = Vec::new();
+        let eos = self.eos.clone();
+        let mut st = self.spec;
+        for (k, &(i, n)) in plan.iter().enumerate() {
+            let d: &[u32] = if k < decode_seqs { &drafts[k] } else { &[] };
+            let (r0, nr) = samples[k];
+            let targets = &toks[r0..r0 + nr];
+            // Accept drafts while they equal the target's greedy choice at the previous row.
+            let m = d.iter().zip(targets).take_while(|(a, b)| a == b).count();
+            let s = &mut self.running[i];
+            if d.is_empty() {
+                s.computed += n;
+            } else if m == d.len() {
+                // Every draft accepted: the spare slot holds the state after all n tokens.
+                s.computed += n;
+                let old = s.slot;
+                s.slot = s.spare.unwrap();
+                s.spare = Some(old);
+            }
+            // else: rejection. The old slot still holds the state before this step; the
+            // accepted tokens become pending and are fed again next step.
+            if k < decode_seqs && nr > 0 {
+                st.decode_entries += 1;
+                if !d.is_empty() {
+                    st.spec_entries += 1;
+                    st.drafted += d.len() as u64;
+                    st.accepted += m as u64;
+                }
+            }
+            let mut finished = false;
+            for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
+                s.out.push(tok);
+                finished = s.out.len() >= s.req.max_new_tokens || (!s.req.ignore_eos && eos.contains(&tok));
+                events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished });
+                if k < decode_seqs {
+                    st.emitted += 1;
+                }
+                if finished {
+                    break;
+                }
+            }
+            if finished {
+                done.push(i);
+            }
         }
+        self.spec = st;
         for &(i, _) in &plan {
             if self.running[i].snapshot_at == Some(self.running[i].computed) {
                 self.running[i].snapshot_at = None;
                 self.snapshot(i)?;
             }
         }
-        let mut events = Vec::with_capacity(sampled.len());
-        let mut done = Vec::new();
-        for (&i, &tok) in sampled.iter().zip(&toks) {
-            let s = &mut self.running[i];
-            s.out.push(tok);
-            let finished = s.out.len() >= s.req.max_new_tokens || (!s.req.ignore_eos && self.eos.contains(&tok));
-            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished });
-            if finished {
-                done.push(i);
-            }
-        }
         done.sort_unstable_by(|a, b| b.cmp(a));
         for i in done {
             let s = self.running.swap_remove(i);
+            if let Some(sp) = s.spare {
+                self.free_slots.push(sp);
+            }
             if self.session_cache {
                 let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
                 self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });

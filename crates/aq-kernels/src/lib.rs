@@ -519,6 +519,7 @@ pub mod kernels {
         scale: f32,
         part_acc: *mut f32,
         part_ml: *mut f32,
+        split_keys: u32,
     ) {
         const D: usize = 256;
         const SL: usize = 32; // dims per lane
@@ -535,7 +536,9 @@ pub mod kernels {
         let group = h / hkv;
         let head = kvh * group + w;
         let n_keys = unsafe { *tok_pos.add(t) } as usize + 1;
-        let chunk = n_keys.div_ceil(n_splits);
+        // split_keys > 0: fixed slice size, so a row's result does not depend on the other
+        // rows of the batch (empty trailing slices contribute exactly nothing to the merge).
+        let chunk = if split_keys > 0 { split_keys as usize } else { n_keys.div_ceil(n_splits) };
         let k0 = split * chunk;
         let k1 = (k0 + chunk).min(n_keys);
         let bs = block_size as usize;
@@ -915,7 +918,9 @@ pub mod kernels {
         state_base: *mut f32,
         out: *mut u16,
         seq_start: *const u32,
+        seq_len: *const u32,
         seq_slot: *const u32,
+        seq_slot_out: *const u32,
         n_k_heads: u32,
         n_v_heads: u32,
         eps: f32,
@@ -938,9 +943,12 @@ pub mod kernels {
         let hk = n_k_heads as usize;
         let hv = n_v_heads as usize;
         let kh = h / (hv / hk);
-        let t = unsafe { *seq_start.add(sq) } as usize;
+        let t0 = unsafe { *seq_start.add(sq) } as usize;
+        let n_tok = unsafe { *seq_len.add(sq) } as usize;
         let slot = unsafe { *seq_slot.add(sq) } as usize;
+        let slot_out = unsafe { *seq_slot_out.add(sq) } as usize;
         let sp = unsafe { state_base.add((slot * hv + h) * D * D + j) };
+        let sp_out = unsafe { state_base.add((slot_out * hv + h) * D * D + j) };
 
         // Issue all state loads first: 128 independent coalesced loads per thread.
         let mut s = [0.0f32; 128];
@@ -949,64 +957,74 @@ pub mod kernels {
             s[i] = unsafe { *sp.add(i * D) };
         }
 
-        let crow = t * conv_dim as usize;
-        let key_dim = hk * D;
-        let qj = unsafe { ld(conv, crow + kh * D + j) };
-        let kj = unsafe { ld(conv, crow + key_dim + kh * D + j) };
-        let vj = unsafe { ld(conv, crow + 2 * key_dim + h * D + j) };
-        let prow = t * ld_proj as usize;
-        let a = unsafe { ld(proj, prow + a_off as usize + h) };
-        let b = unsafe { ld(proj, prow + b_off as usize + h) };
-        let z = unsafe { ld(proj, prow + z_off as usize + h * D + j) };
-        let qq = warp_sum(qj * qj);
-        let kk = warp_sum(kj * kj);
-        unsafe {
-            *qs.add(j) = qj;
-            *ks.add(j) = kj;
-        }
-        if lane == 0 {
+        // Tokens of this sequence are processed in order with the state in registers (the
+        // same per-token arithmetic for 1 token or for a speculative run of several).
+        let mut tt = 0usize;
+        while tt < n_tok {
+            let t = t0 + tt;
+            let crow = t * conv_dim as usize;
+            let key_dim = hk * D;
+            let qj = unsafe { ld(conv, crow + kh * D + j) };
+            let kj = unsafe { ld(conv, crow + key_dim + kh * D + j) };
+            let vj = unsafe { ld(conv, crow + 2 * key_dim + h * D + j) };
+            let prow = t * ld_proj as usize;
+            let a = unsafe { ld(proj, prow + a_off as usize + h) };
+            let b = unsafe { ld(proj, prow + b_off as usize + h) };
+            let z = unsafe { ld(proj, prow + z_off as usize + h * D + j) };
+            let qq = warp_sum(qj * qj);
+            let kk = warp_sum(kj * kj);
             unsafe {
-                *r1.add(w) = qq;
-                *r1.add(4 + w) = kk;
+                *qs.add(j) = qj;
+                *ks.add(j) = kj;
             }
-        }
-        thread::sync_threads();
-        let inv_q = 1.0
-            / libm::sqrtf(unsafe { *r1.add(0) + *r1.add(1) + *r1.add(2) + *r1.add(3) } + 1.0e-6)
-            / libm::sqrtf(D as f32);
-        let inv_k = 1.0 / libm::sqrtf(unsafe { *r1.add(4) + *r1.add(5) + *r1.add(6) + *r1.add(7) } + 1.0e-6);
-        let g = -libm::expf(unsafe { *a_log.add(h) }) * softplus(a + unsafe { *dt_bias.add(h) });
-        let decay = libm::expf(g);
-        let beta = rb(sigmoid(b));
+            if lane == 0 {
+                unsafe {
+                    *r1.add(w) = qq;
+                    *r1.add(4 + w) = kk;
+                }
+            }
+            thread::sync_threads();
+            let inv_q = 1.0
+                / libm::sqrtf(unsafe { *r1.add(0) + *r1.add(1) + *r1.add(2) + *r1.add(3) } + 1.0e-6)
+                / libm::sqrtf(D as f32);
+            let inv_k = 1.0 / libm::sqrtf(unsafe { *r1.add(4) + *r1.add(5) + *r1.add(6) + *r1.add(7) } + 1.0e-6);
+            let g = -libm::expf(unsafe { *a_log.add(h) }) * softplus(a + unsafe { *dt_bias.add(h) });
+            let decay = libm::expf(g);
+            let beta = rb(sigmoid(b));
 
-        let mut kv = 0.0f32;
-        #[unroll]
-        for i in 0..128 {
-            s[i] *= decay;
-            kv += s[i] * unsafe { *ks.add(i) };
+            let mut kv = 0.0f32;
+            #[unroll]
+            for i in 0..128 {
+                s[i] *= decay;
+                kv += s[i] * unsafe { *ks.add(i) };
+            }
+            let delta = (vj - kv * inv_k) * beta;
+            let dk = delta * inv_k;
+            let mut o = 0.0f32;
+            #[unroll]
+            for i in 0..128 {
+                s[i] += unsafe { *ks.add(i) } * dk;
+                o += s[i] * unsafe { *qs.add(i) };
+            }
+
+            let ob = rb(o * inv_q);
+            let oo = warp_sum(ob * ob);
+            if lane == 0 {
+                unsafe { *r2.add(w) = oo };
+            }
+            thread::sync_threads();
+            let var = unsafe { *r2.add(0) + *r2.add(1) + *r2.add(2) + *r2.add(3) } / D as f32;
+            let y = unsafe { *norm_w.add(j) } * rb(ob / libm::sqrtf(var + eps));
+            unsafe { st(out, t * hv * D + h * D + j, y * silu(z)) };
+            // qs/ks/r1/r2 are rewritten by the next token.
+            thread::sync_threads();
+            tt += 1;
         }
-        let delta = (vj - kv * inv_k) * beta;
-        let dk = delta * inv_k;
-        let mut o = 0.0f32;
         #[unroll]
         for i in 0..128 {
-            s[i] += unsafe { *ks.add(i) } * dk;
-            o += s[i] * unsafe { *qs.add(i) };
-        }
-        #[unroll]
-        for i in 0..128 {
-            unsafe { *sp.add(i * D) = s[i] };
+            unsafe { *sp_out.add(i * D) = s[i] };
         }
 
-        let ob = rb(o * inv_q);
-        let oo = warp_sum(ob * ob);
-        if lane == 0 {
-            unsafe { *r2.add(w) = oo };
-        }
-        thread::sync_threads();
-        let var = unsafe { *r2.add(0) + *r2.add(1) + *r2.add(2) + *r2.add(3) } / D as f32;
-        let y = unsafe { *norm_w.add(j) } * rb(ob / libm::sqrtf(var + eps));
-        unsafe { st(out, t * hv * D + h * D + j, y * silu(z)) };
     }
 
     // ------------------------------------------------------------------------------------
@@ -1064,6 +1082,7 @@ pub mod kernels {
         seq_start: *const u32,
         seq_len: *const u32,
         seq_slot: *const u32,
+        seq_slot_out: *const u32,
         conv_dim: u32,
     ) {
         let c = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
@@ -1076,6 +1095,7 @@ pub mod kernels {
         let n = unsafe { *seq_len.add(sq) } as usize;
         let state = unsafe { state_base.add(*seq_slot.add(sq) as usize * cd * 3) };
         let old = unsafe { [*state.add(c * 3), *state.add(c * 3 + 1), *state.add(c * 3 + 2)] };
+        let state = unsafe { state_base.add(*seq_slot_out.add(sq) as usize * cd * 3) };
         let mut j = 0usize;
         while j < 3 {
             // new state j = input at local index n - 3 + j

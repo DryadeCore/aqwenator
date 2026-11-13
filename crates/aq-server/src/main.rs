@@ -181,6 +181,7 @@ struct EngineOpts {
     mixed: Option<usize>,
     max_running: Option<usize>,
     session_cache: bool,
+    spec_k: usize,
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -200,6 +201,11 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         eng.max_running = r;
     }
     eng.session_cache = opts.session_cache;
+    eng.spec_k = opts.spec_k;
+    if opts.spec_k > 0 {
+        // Fixed decode-attention slices keep speculative and plain decoding numerically aligned.
+        eng.model.attn_split_keys = 256;
+    }
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());
     let _ = ready.send(Ok(()));
@@ -228,8 +234,9 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {}",
-                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} evictions {} | spec drafted {} accepted {} tok/step {:.2}",
+                eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.evictions,
+                eng.spec.drafted, eng.spec.accepted, eng.spec.emitted as f64 / eng.spec.decode_entries.max(1) as f64
             );
             last_report = Instant::now();
         }
@@ -280,7 +287,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 0 };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
@@ -292,6 +299,7 @@ async fn main() -> Result<()> {
             "--mixed-prefill" => opts.mixed = Some(v.parse()?),
             "--max-running" => opts.max_running = Some(v.parse()?),
             "--session-cache" => opts.session_cache = v.parse()?,
+            "--spec-k" => opts.spec_k = v.parse()?,
             "--kv-gb" => kv_gb = v.parse()?,
             _ => anyhow::bail!("unknown option {k}"),
         }
