@@ -306,13 +306,15 @@ async fn main() -> Result<()> {
                 opts.policy.evict = match v.as_str() {
                     "lru" => aq_engine::engine::Evict::Lru,
                     "mru" => aq_engine::engine::Evict::Mru,
-                    _ => anyhow::bail!("--evict lru|mru"),
+                    "idle" => aq_engine::engine::Evict::Idle,
+                    _ => anyhow::bail!("--evict lru|mru|idle"),
                 }
             }
             "--pin-snapshots" => opts.policy.pin_snapshots = v.parse()?,
             "--load-control" => opts.policy.load_control = v.parse()?,
             "--srpt" => opts.policy.srpt = v.parse()?,
             "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
+            "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,

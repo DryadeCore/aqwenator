@@ -213,6 +213,7 @@ fn main() -> Result<()> {
         for f in p.split(',') {
             match f {
                 "mru" => eng.policy.evict = aq_engine::engine::Evict::Mru,
+                "idle" => eng.policy.evict = aq_engine::engine::Evict::Idle,
                 "pin" => eng.policy.pin_snapshots = true,
                 "load" => eng.policy.load_control = true,
                 "srpt" => eng.policy.srpt = true,

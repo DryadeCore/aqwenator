@@ -70,6 +70,9 @@ pub enum Evict {
     /// Most recently parked first. With bounded tool think time, the session parked longest
     /// ago is the one most likely to come back next, so LRU evicts exactly the wrong one.
     Mru,
+    /// Idle-aware: sessions idle longer than `dead_after_ms` are presumed finished and go
+    /// first (oldest first); among the live ones, most recently parked first.
+    Idle,
 }
 
 /// Memory and scheduling policy knobs (all default to the original behavior).
@@ -86,11 +89,13 @@ pub struct Policy {
     /// aging past `max_wait_ms`.
     pub srpt: bool,
     pub max_wait_ms: u64,
+    /// `Evict::Idle`: idle time after which a parked session is presumed finished.
+    pub dead_after_ms: u64,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { evict: Evict::Lru, pin_snapshots: false, load_control: false, srpt: false, max_wait_ms: 2000 }
+        Self { evict: Evict::Lru, pin_snapshots: false, load_control: false, srpt: false, max_wait_ms: 2000, dead_after_ms: 6000 }
     }
 }
 
@@ -113,6 +118,7 @@ struct Parked {
     slot: u32,
     blocks: Vec<u32>,
     last_used: u64,
+    parked_at: Instant,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -246,6 +252,14 @@ impl Engine {
         let victim = match self.policy.evict {
             Evict::Lru => (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used),
             Evict::Mru => (0..self.parked.len()).max_by_key(|&i| self.parked[i].last_used),
+            Evict::Idle => {
+                let now = Instant::now();
+                let dead = |i: usize| now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms;
+                (0..self.parked.len())
+                    .filter(|&i| dead(i))
+                    .min_by_key(|&i| self.parked[i].parked_at)
+                    .or_else(|| (0..self.parked.len()).max_by_key(|&i| self.parked[i].parked_at))
+            }
         };
         if let Some(i) = victim {
             let p = self.parked.swap_remove(i);
@@ -494,7 +508,7 @@ impl Engine {
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
                     let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
-                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock });
+                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now() });
                 } else {
                     self.free_slots.push(slot);
                     self.release(blocks);
@@ -638,7 +652,7 @@ impl Engine {
             let s = self.running.swap_remove(i);
             if self.session_cache {
                 let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
+                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now() });
             } else {
                 self.free_slots.push(s.slot);
                 self.release(s.blocks);
