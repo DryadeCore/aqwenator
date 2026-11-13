@@ -133,7 +133,7 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
                 ],
                 Msg::Token(e) => {
                     let mut choice = json!({"index": 0, "text": detok.push(e.token), "logprobs": null,
-                        "finish_reason": if e.finished { json!("length") } else { json!(null) }});
+                        "finish_reason": if !e.finished { json!(null) } else if e.stop { json!("stop") } else { json!("length") }});
                     if with_ids {
                         choice["token_ids"] = json!([e.token]);
                     }
@@ -153,6 +153,7 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
     let mut rx = rx;
     let mut toks = Vec::new();
     let mut text = String::new();
+    let mut finish = "length";
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Error(e) => return bad(e),
@@ -160,12 +161,15 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
                 toks.push(e.token);
                 text.push_str(&detok.push(e.token));
                 if e.finished {
+                    if e.stop {
+                        finish = "stop";
+                    }
                     break;
                 }
             }
         }
     }
-    let mut choice = json!({"index": 0, "text": text, "logprobs": null, "finish_reason": "length"});
+    let mut choice = json!({"index": 0, "text": text, "logprobs": null, "finish_reason": finish});
     if with_ids {
         choice["token_ids"] = json!(toks);
     }
@@ -247,12 +251,21 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         match eng.step() {
             Ok(events) => {
                 for e in events {
-                    if let Some(tx) = sinks.get(&e.id) {
-                        let _ = tx.send(Msg::Token(e));
+                    // A failed send means the handler dropped its receiver: the client went
+                    // away. Stop generating for it instead of running to its token limit.
+                    let gone = sinks.get(&e.id).is_some_and(|tx| tx.send(Msg::Token(e)).is_err());
+                    if gone && !e.finished {
+                        eng.cancel(e.id);
                     }
-                    if e.finished {
+                    if gone || e.finished {
                         sinks.remove(&e.id);
                     }
+                }
+                // Clients that left before their first token (still queued or prefilling).
+                let closed: Vec<u64> = sinks.iter().filter(|(_, tx)| tx.is_closed()).map(|(&id, _)| id).collect();
+                for id in closed {
+                    eng.cancel(id);
+                    sinks.remove(&id);
                 }
             }
             Err(e) => {

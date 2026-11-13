@@ -20,6 +20,7 @@
 //! copy plus shared read-only pages. Exact, because no sequence ever writes below its own
 //! `computed` position, so shared pages are never written.
 
+use crate::draft::DraftIndex;
 use crate::model::{Batch, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
@@ -39,6 +40,8 @@ pub struct TokenEvent {
     pub token: u32,
     pub index: usize,
     pub finished: bool,
+    /// The request ended on an end-of-sequence token (rather than its token limit).
+    pub stop: bool,
 }
 
 struct Seq {
@@ -54,6 +57,10 @@ struct Seq {
     spare: Option<u32>,
     /// Part of the prefill batch currently in flight on lane 0 (co-execution).
     in_prefill: bool,
+    /// Cancelled while its prefill batch was in flight; retired when that batch is collected.
+    cancelled: bool,
+    /// Prompt-lookup index over the known tokens, built on the first speculative step.
+    draft: Option<DraftIndex>,
 }
 
 /// A prefill batch launched on lane 0 and not collected yet (co-execution). Sequences are
@@ -230,8 +237,38 @@ impl Engine {
         if req.prompt.is_empty() || req.prompt.len() + req.max_new_tokens > lim.max_ctx {
             bail!("request {} needs {} tokens of context (max {})", req.id, req.prompt.len() + req.max_new_tokens, lim.max_ctx);
         }
+        // A request that needs more KV pages than the whole pool can never be admitted; left
+        // in the queue it would block every request behind it forever.
+        let need = (req.prompt.len() + req.max_new_tokens).div_ceil(lim.block_size);
+        if need > lim.num_blocks() {
+            bail!(
+                "request {} needs {} KV pages ({} tokens) but the pool has {}; lower max_tokens or raise the KV budget",
+                req.id,
+                need,
+                req.prompt.len() + req.max_new_tokens,
+                lim.num_blocks()
+            );
+        }
         self.waiting.push_back(req);
         Ok(())
+    }
+
+    /// Stop a request early, e.g. because its client went away. A waiting request is dropped.
+    /// A running one is retired as if it had finished (parked for reuse when the session cache
+    /// is on), or, if its prefill batch is in flight, as soon as that batch is collected.
+    /// Returns false if the request is not known (already finished).
+    pub fn cancel(&mut self, id: u64) -> bool {
+        if let Some(i) = self.waiting.iter().position(|r| r.id == id) {
+            self.waiting.remove(i);
+            return true;
+        }
+        let Some(i) = self.running.iter().position(|s| s.req.id == id) else { return false };
+        if self.running[i].in_prefill {
+            self.running[i].cancelled = true;
+        } else {
+            self.retire(vec![i]);
+        }
+        true
     }
 
     pub fn has_work(&self) -> bool {
@@ -438,39 +475,32 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None });
         Ok(true)
     }
 
-    /// Prompt-lookup draft: find the most recent earlier occurrence of the longest suffix
-    /// n-gram of the sequence's known tokens and propose the tokens that followed it.
-    fn draft(&self, s: &Seq, k: usize) -> Vec<u32> {
-        let n_known = s.known();
-        let tok = |i: usize| s.token_at(i);
-        let mut n = self.spec_max_ngram.min(n_known.saturating_sub(1));
-        while n >= self.spec_min_ngram.max(1) {
-            let suf0 = n_known - n;
-            // scan backwards for an earlier occurrence of tokens[suf0..n_known]
-            let mut start = suf0;
-            while start > 0 {
-                start -= 1;
-                if (0..n).all(|j| tok(start + j) == tok(suf0 + j)) {
-                    let from = start + n;
-                    let to = (from + k).min(n_known);
-                    if to > from {
-                        return (from..to).map(tok).collect();
-                    }
-                }
-            }
-            n -= 1;
+    /// Prompt-lookup draft for running sequence `i`: what followed the most recent earlier
+    /// occurrence of the longest suffix n-gram of its known tokens (see [`DraftIndex`]).
+    fn draft(&mut self, i: usize, k: usize) -> Vec<u32> {
+        let (min_n, max_n) = (self.spec_min_ngram, self.spec_max_ngram);
+        let s = &mut self.running[i];
+        let mut idx = match s.draft.take() {
+            Some(idx) if idx.matches(min_n, max_n) => idx,
+            _ => DraftIndex::new(min_n, max_n),
+        };
+        for p in idx.len()..s.known() {
+            idx.push(s.token_at(p));
         }
-        Vec::new()
+        let d = idx.draft(k);
+        s.draft = Some(idx);
+        d
     }
 
     fn ensure_blocks(&mut self, si: usize, upto: usize) -> Result<()> {
         let bs = self.limits().block_size;
         while self.running[si].blocks.len() * bs < upto {
             let Some(b) = self.free_blocks.pop() else { bail!("KV page pool exhausted") };
+            self.refcnt[b as usize] = 1;
             self.running[si].blocks.push(b);
         }
         Ok(())
@@ -511,8 +541,9 @@ impl Engine {
         for (&i, &tok) in sampled.iter().zip(toks) {
             let s = &mut self.running[i];
             s.out.push(tok);
-            let finished = s.out.len() >= s.req.max_new_tokens || (!s.req.ignore_eos && self.eos.contains(&tok));
-            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished });
+            let stop = !s.req.ignore_eos && self.eos.contains(&tok);
+            let finished = stop || s.out.len() >= s.req.max_new_tokens;
+            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
             if finished {
                 done.push(i);
             }
@@ -522,14 +553,23 @@ impl Engine {
 
     /// Park (session cache) or free finished sequences, given their running indices.
     fn retire(&mut self, mut done: Vec<usize>) {
+        let bs = self.limits().block_size;
         done.sort_unstable_by(|a, b| b.cmp(a));
+        done.dedup();
         for i in done {
-            let s = self.running.swap_remove(i);
+            let mut s = self.running.swap_remove(i);
             if let Some(sp) = s.spare {
                 self.free_slots.push(sp);
             }
-            if self.session_cache {
+            // Nothing computed (cancelled before its first chunk): nothing worth keeping.
+            if self.session_cache && s.computed > 0 {
                 let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
+                // Admission reserved pages for the whole token limit. Keep only the pages that
+                // hold computed tokens: a request that stops early (EOS well before a large
+                // max_tokens) must not pin the unused reservation while it is parked.
+                let keep = s.computed.div_ceil(bs).min(s.blocks.len());
+                let extra = s.blocks.split_off(keep);
+                self.release(extra);
                 self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
             } else {
                 self.free_slots.push(s.slot);
@@ -670,7 +710,8 @@ impl Engine {
             }
         }
         let sampled: Vec<usize> = inf.sampled.iter().map(|&id| self.index_of(id)).collect();
-        let done = self.apply_sampled(&sampled, &toks, events);
+        let mut done = self.apply_sampled(&sampled, &toks, events);
+        done.extend(inf.plan.iter().map(|&(id, _)| self.index_of(id)).filter(|&i| self.running[i].cancelled));
         self.retire(done);
         Ok(inf.tokens)
     }
@@ -720,7 +761,7 @@ impl Engine {
             if self.spec_k > 0 && rem > 1 {
                 let kmax = self.spec_k.min(rem - 1).min(MAX_DECODE_ROWS_PER_SEQ.saturating_sub(pending));
                 if kmax > 0 {
-                    d = self.draft(s, kmax);
+                    d = self.draft(i, kmax);
                 }
             }
             if !d.is_empty() && self.running[i].spare.is_none() {
@@ -843,8 +884,9 @@ impl Engine {
             let mut finished = false;
             for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
                 s.out.push(tok);
-                finished = s.out.len() >= s.req.max_new_tokens || (!s.req.ignore_eos && eos.contains(&tok));
-                events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished });
+                let stop = !s.req.ignore_eos && eos.contains(&tok);
+                finished = stop || s.out.len() >= s.req.max_new_tokens;
+                events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
                 if k < decode_seqs {
                     st.emitted += 1;
                 }
@@ -863,20 +905,7 @@ impl Engine {
                 self.snapshot(i)?;
             }
         }
-        done.sort_unstable_by(|a, b| b.cmp(a));
-        for i in done {
-            let s = self.running.swap_remove(i);
-            if let Some(sp) = s.spare {
-                self.free_slots.push(sp);
-            }
-            if self.session_cache {
-                let tokens = (0..s.computed).map(|k| s.token_at(k)).collect();
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock });
-            } else {
-                self.free_slots.push(s.slot);
-                self.release(s.blocks);
-            }
-        }
+        self.retire(done);
         self.last = StepStats {
             tokens: b.tokens.len(),
             decode_seqs,
