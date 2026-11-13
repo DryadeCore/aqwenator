@@ -194,6 +194,9 @@ pub struct Engine {
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
     pub mixed_prefill_budget: usize,
+    /// (larger budget, pending-prefill threshold in tokens): switch mixed steps to the larger
+    /// prefill budget while more than `threshold` admitted prompt tokens await prefill.
+    pub mixed_prefill_adaptive: Option<(usize, usize)>,
     pub policy: Policy,
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
     pub itl_target_us: Option<f64>,
@@ -232,6 +235,7 @@ impl Engine {
             session_cache: true,
             max_running: lim.max_seqs,
             mixed_prefill_budget: usize::MAX,
+            mixed_prefill_adaptive: None,
             policy: Policy::default(),
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
@@ -634,7 +638,21 @@ impl Engine {
         }
         let decode_seqs = plan.len();
         if decode_seqs > 0 {
-            budget = budget.min(self.mixed_prefill_budget);
+            // Adaptive: while admitted prefill work is backed up past the threshold, use the
+            // larger budget (throughput and TTFT under overload); otherwise the small one
+            // (inter-token latency when prefill is light).
+            let mixed = match self.mixed_prefill_adaptive {
+                Some((hi, threshold)) => {
+                    let pending: usize = self
+                        .running
+                        .iter()
+                        .map(|s| s.req.prompt.len().saturating_sub(s.computed))
+                        .sum();
+                    if pending > threshold { hi } else { self.mixed_prefill_budget }
+                }
+                None => self.mixed_prefill_budget,
+            };
+            budget = budget.min(mixed);
             // Frame pacing: size the prefill part so the whole step fits the ITL target,
             // from online estimates of the decode cost and the per-token prefill cost.
             if let Some(target) = self.itl_target_us {

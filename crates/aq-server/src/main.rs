@@ -184,6 +184,7 @@ struct EngineOpts {
     policy: aq_engine::engine::Policy,
     max_snapshots: Option<usize>,
     itl_target_ms: Option<f64>,
+    adaptive: Option<(usize, usize)>,
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -208,6 +209,7 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         eng.max_snapshots = n;
     }
     eng.itl_target_us = opts.itl_target_ms.map(|m| m * 1000.0);
+    eng.mixed_prefill_adaptive = opts.adaptive;
     eprintln!("policy: {:?} max_snapshots {} itl_target_ms {:?}", eng.policy, eng.max_snapshots, opts.itl_target_ms);
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());
@@ -290,7 +292,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, policy: Default::default(), max_snapshots: None, itl_target_ms: None };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None };
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
@@ -316,6 +318,11 @@ async fn main() -> Result<()> {
             "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
             "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
             "--quantum" => opts.policy.quantum = v.parse()?,
+            "--mixed-prefill-adaptive" => {
+                // "HI:THRESHOLD", e.g. 8192:16384
+                let (a, b) = v.split_once(':').context("--mixed-prefill-adaptive HI:THRESHOLD")?;
+                opts.adaptive = Some((a.parse()?, b.parse()?));
+            }
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
