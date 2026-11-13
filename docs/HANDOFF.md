@@ -1,5 +1,25 @@
 # Handoff: aqwenator state as of 2026-11-13
 
+## FIRST: known correctness bug on main (fix exists, unmerged)
+The memory-policy lane (branch `worktree-agent-ada1630c33961379c`) found that a shared-prefix
+**fork admission that evicts to get a slot reuses a stale snapshot index**, so after an eviction it
+can fork the *wrong prefix state* (silent wrong output under memory pressure). Fixed in `da01b7c`
+(snapshot re-looked-up by content), together with a feasibility fix (`2d0338c`: an admission that
+cannot fit no longer evicts parked sessions one by one and then fails) and a host-time fix
+(`527332c`: prefix matching was O(waiting × parked × 18k tokens) per step). That branch is based on
+c6f9b86 (before the speculation and co-execution merges): rebase onto main, run the full aq-check
+suite (its new memory-pressure test + `AQ_CHECK_POLICY`), and merge these fixes first. Until then,
+avoid memory-pressure workloads with session cache + snapshots on main.
+
+Lane findings worth keeping: snapshot pinning + dedupe (151 snapshots → 1 at 32 agents) and
+`--prewarm` (tune all cuBLASLt plans at startup; mid-run autotune is the likely cause of multi-second
+ITL p99.9 spikes) should become defaults; idle-aware eviction, load control with `--quantum`, and
+`--mixed-prefill-adaptive` as opt-in; MRU eviction, SRPT (until re-measured on the fixed build) and
+25 ms frame pacing are not worth it. Best variants still trail vLLM at 16/32 agents (163 vs 189,
+92 vs 188 turns/min); the remaining gap is long-context decode attention (~1 TB/s effective, ITL p50
+11.5 vs 5.8 ms at 16 agents / 18k ctx) and re-prefill throughput. Its gate auto-runs on the B200 when
+the driver recovers: `~/aq/logs/mem_gate.log`; sweeps: `tools/agentic_sweep_mem.sh`.
+
 ## What exists (main @ 7771327, all gated)
 - Rust workspace: `aq-kernels` (cuda-oxide `#[cuda_module]` kernels), `aq-engine` (model, scheduler,
   session cache, aq-check, aq-bench), `aq-server` (`aq-serve`, OpenAI `/v1/completions`, SSE).
@@ -28,7 +48,7 @@ Byte-identity comparisons need `AQ_GEMM_HEURISTIC=1` (cuBLASLt plans are picked 
   logits byte-identical to raw). Rebased on 7771327, opt-in (`AQ_KV_COMPRESS=1`). **Gate not yet run**
   (B200 driver hang): run `tools/kvc_gate.sh` before merging. Decode attention is ~2.3× slower than
   raw, so it only pays when capacity avoids evictions (memory-tight agentic runs, the Spark).
-- `worktree-agent-ada1630c33961379c` — memory policy / scheduler lane (eviction policies, snapshot
+- `worktree-agent-ada1630c33961379c` — memory policy / scheduler lane; **contains the stale-fork-index correctness fix** (see top). Eviction policies, snapshot
   pinning, load control, SRPT). See its final report / commit messages; results in
   `~/aq/results/agentic/mem-*` on the B200.
 - `worktree-agent-a6d76573bade9b155` — skinny GEMM experiments (did not beat cuBLASLt; keep unmerged).
