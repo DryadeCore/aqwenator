@@ -5,7 +5,7 @@
 //! Compares the residual stream after every layer, the final logits, and 32 greedy tokens.
 
 use anyhow::{Context, Result};
-use aq_engine::model::Model;
+use aq_engine::model::{Limits, Model};
 use aq_engine::weights::resolve_model;
 use std::time::Instant;
 
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     let dir = resolve_model(model_spec)?;
 
     let t0 = Instant::now();
-    let mut m = Model::load(&dir, 512, 4096)?;
+    let mut m = Model::load(&dir, Limits { max_tokens: 2048, max_seqs: 4, max_ctx: 4096, block_size: 16 })?;
     println!(
         "load: {:.2}s total (open {:.3}s, upload {:.2}s), {:.2} GiB on device",
         t0.elapsed().as_secs_f64(),
@@ -60,10 +60,10 @@ fn main() -> Result<()> {
     let greedy_ref = as_u32("greedy_ids")?;
     let n_layers = m.cfg.num_hidden_layers;
 
-    m.reset()?;
+    m.reset_slot(0)?;
     let mut dump = Vec::new();
     let t1 = Instant::now();
-    let first = m.forward(&ids, 0, Some(&mut dump))?;
+    let first = m.step(&m.single(&ids, 0), Some(&mut dump))?[0];
     println!("prefill {} tokens (with dumps): {:.1} ms", ids.len(), t1.elapsed().as_secs_f64() * 1e3);
 
     let mut worst = 0f64;
@@ -80,7 +80,9 @@ fn main() -> Result<()> {
     }
     let last_ref = as_f32(&format!("hidden.{n_layers}"))?;
     let (rel_pre, _) = rel_err(&dump[n_layers - 1], &last_ref);
-    let (rel_post, _) = rel_err(&m.final_hidden(ids.len())?, &last_ref);
+    let n = ids.len();
+    let hd = m.cfg.hidden_size;
+    let (rel_post, _) = rel_err(&m.final_hidden()?, &last_ref[(n - 1) * hd..n * hd]);
     println!("last hidden: rel_l2 vs pre-norm {rel_pre:.2e}, vs post-norm {rel_post:.2e}");
 
     let logits = m.logits()?;
@@ -94,7 +96,7 @@ fn main() -> Result<()> {
     let mut pos = ids.len();
     let t2 = Instant::now();
     while out.len() < greedy_ref.len() {
-        let next = m.forward(&[*out.last().unwrap()], pos, None)?;
+        let next = m.step(&m.single(&[*out.last().unwrap()], pos), None)?[0];
         pos += 1;
         out.push(next);
     }
@@ -108,5 +110,22 @@ fn main() -> Result<()> {
     println!("ours: {out:?}");
     println!("ref:  {greedy_ref:?}");
     println!("worst layer rel_l2 {worst:.2e}");
+
+    // Batched consistency: the same prompt in 3 slots at once, plus a decode, through the
+    // scheduler, must produce the same greedy tokens as the single-sequence path.
+    let mut eng = aq_engine::engine::Engine::new(m, vec![]);
+    for id in 0..3u64 {
+        eng.add(aq_engine::engine::Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+    }
+    let mut got: Vec<Vec<u32>> = vec![Vec::new(); 3];
+    while eng.has_work() {
+        for e in eng.step()? {
+            got[e.id as usize].push(e.token);
+        }
+    }
+    for (i, g) in got.iter().enumerate() {
+        let ok = g.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
+        println!("batched seq {i}: {ok}/{} greedy tokens match", greedy_ref.len());
+    }
     Ok(())
 }

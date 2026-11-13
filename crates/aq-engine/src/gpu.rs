@@ -78,9 +78,60 @@ impl Gpu {
     }
 
     /// `y[m, n] = x[m, k] . w[n, k]^T` (bf16 in, `out_ty` out).
-    pub fn gemm(&mut self, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
+    ///
+    /// M is rounded up to a bucket (capped at `cap`, the row capacity of `x` and `y`) so a
+    /// handful of tuned plans cover every batch size; the extra rows compute on scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm(&mut self, m: usize, cap: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
+        let mb = if m <= 256 {
+            m.next_multiple_of(16)
+        } else if m <= 2048 {
+            m.next_multiple_of(128)
+        } else {
+            m.next_multiple_of(512)
+        }
+        .min(cap)
+        .max(m);
         let s = self.raw_stream();
-        self.lt.gemm(s, m, n, k, x, w, y, out_ty)
+        self.lt.gemm(s, mb, n, k, x, w, y, out_ty)
+    }
+}
+
+#[link(name = "cuda")]
+unsafe extern "C" {
+    fn cuStreamBeginCapture_v2(stream: *mut c_void, mode: u32) -> i32;
+    fn cuStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
+    fn cuGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> i32;
+    fn cuGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
+    fn cuGraphDestroy(graph: *mut c_void) -> i32;
+}
+
+fn drv(r: i32, what: &str) -> Result<()> {
+    if r != 0 {
+        anyhow::bail!("{what} failed: CUresult {r}");
+    }
+    Ok(())
+}
+
+impl Gpu {
+    /// Start recording everything enqueued on the stream (relaxed mode, so cuBLASLt's
+    /// internal queries are allowed).
+    pub fn begin_capture(&self) -> Result<()> {
+        drv(unsafe { cuStreamBeginCapture_v2(self.raw_stream(), 2) }, "cuStreamBeginCapture")
+    }
+
+    /// Stop recording and instantiate the graph; returns the executable graph handle.
+    pub fn end_capture(&self) -> Result<u64> {
+        let mut graph = std::ptr::null_mut();
+        drv(unsafe { cuStreamEndCapture(self.raw_stream(), &mut graph) }, "cuStreamEndCapture")?;
+        let mut exec = std::ptr::null_mut();
+        drv(unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) }, "cuGraphInstantiate")?;
+        drv(unsafe { cuGraphDestroy(graph) }, "cuGraphDestroy")?;
+        Ok(exec as u64)
+    }
+
+    pub fn launch_graph(&self, exec: u64) -> Result<()> {
+        drv(unsafe { cuGraphLaunch(exec as *mut c_void, self.raw_stream()) }, "cuGraphLaunch")
     }
 }
 
@@ -95,4 +146,45 @@ impl Drop for Gpu {
 
 pub fn cfg(grid: (u32, u32, u32), block: u32) -> LaunchConfig {
     LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 }
+}
+
+/// Per-op wall time, enabled with `AQ_PROFILE=1`: the stream is synchronized at every mark,
+/// so this measures each op in isolation (and slows the step down). For ranking, not totals.
+#[derive(Default)]
+pub struct Prof {
+    last: Option<std::time::Instant>,
+    pub acc: std::collections::BTreeMap<&'static str, (f64, u64)>,
+}
+
+impl Prof {
+    pub fn from_env() -> Option<Self> {
+        (std::env::var("AQ_PROFILE").as_deref() == Ok("1")).then(Self::default)
+    }
+    pub fn start(&mut self, g: &Gpu) -> Result<()> {
+        g.sync()?;
+        self.last = Some(std::time::Instant::now());
+        Ok(())
+    }
+    pub fn mark(&mut self, g: &Gpu, name: &'static str) -> Result<()> {
+        g.sync()?;
+        let now = std::time::Instant::now();
+        if let Some(l) = self.last {
+            let e = self.acc.entry(name).or_default();
+            e.0 += (now - l).as_secs_f64();
+            e.1 += 1;
+        }
+        self.last = Some(now);
+        Ok(())
+    }
+    pub fn report(&mut self) -> String {
+        let total: f64 = self.acc.values().map(|v| v.0).sum();
+        let mut rows: Vec<_> = self.acc.iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let mut out = format!("{:<18} {:>10} {:>7} {:>10}\n", "op", "total ms", "share", "us/call");
+        for (k, (t, n)) in rows {
+            out += &format!("{k:<18} {:>10.1} {:>6.1}% {:>10.1}\n", t * 1e3, 100.0 * t / total, t * 1e6 / *n as f64);
+        }
+        self.acc.clear();
+        out
+    }
 }

@@ -2,7 +2,8 @@
 //!
 //! Row-major activations and HF-layout weights (`[out, in]`) map to cuBLASLt's
 //! column-major "TN" problem: `C(N x M) = op(A)^T . B` with `A = W` (K x N col-major,
-//! transposed) and `B = X` (K x M col-major). Plans are cached per shape.
+//! transposed) and `B = X` (K x M col-major). Plans are cached per shape; on first use of a
+//! shape the top heuristic candidates are timed on the real buffers and the fastest is kept.
 #![allow(non_camel_case_types)]
 
 use anyhow::{Result, bail};
@@ -113,7 +114,8 @@ impl CublasLt {
         Ok(Self { handle, workspace, workspace_size, plans: HashMap::new() })
     }
 
-    fn plan(&mut self, m: usize, n: usize, k: usize, out_ty: i32) -> Result<&Plan> {
+    #[allow(clippy::too_many_arguments)]
+    fn plan(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<&Plan> {
         let key = (m, n, k, out_ty);
         if !self.plans.contains_key(&key) {
             unsafe {
@@ -134,29 +136,47 @@ impl CublasLt {
                     cublasLtMatmulPreferenceSetAttribute(pref, PREF_MAX_WORKSPACE_BYTES, (&ws as *const u64).cast(), 8),
                     "pref ws",
                 )?;
-                let mut res = std::mem::zeroed::<HeuristicResult>();
+                const CANDIDATES: usize = 8;
+                let mut res = [std::mem::zeroed::<HeuristicResult>(); CANDIDATES];
                 let mut got = 0;
                 check(
-                    cublasLtMatmulAlgoGetHeuristic(self.handle, desc, a, b, c, c, pref, 1, &mut res, &mut got),
+                    cublasLtMatmulAlgoGetHeuristic(self.handle, desc, a, b, c, c, pref, CANDIDATES as i32, res.as_mut_ptr(), &mut got),
                     "heuristic",
                 )?;
                 if got == 0 {
                     bail!("no cuBLASLt algo for m={m} n={n} k={k}");
                 }
-                self.plans.insert(key, Plan { desc, a, b, c, algo: res.algo });
+                let mut best = (f64::INFINITY, res[0].algo);
+                if got > 1 {
+                    for r in &res[..got as usize] {
+                        let plan = Plan { desc, a, b, c, algo: r.algo };
+                        // Warm once, then time 3 runs on the real buffers.
+                        if self.run(stream, &plan, x, w, y).is_err() {
+                            continue;
+                        }
+                        sync(stream)?;
+                        let t = std::time::Instant::now();
+                        for _ in 0..3 {
+                            self.run(stream, &plan, x, w, y)?;
+                        }
+                        sync(stream)?;
+                        let dt = t.elapsed().as_secs_f64();
+                        if dt < best.0 {
+                            best = (dt, r.algo);
+                        }
+                    }
+                }
+                self.plans.insert(key, Plan { desc, a, b, c, algo: best.1 });
             }
         }
         Ok(&self.plans[&key])
     }
 
-    /// `y[m, n] = x[m, k] . w[n, k]^T`, bf16 inputs, f32 accumulate, `out_ty` output.
-    pub fn gemm(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
-        let (ws, ws_size, handle) = (self.workspace, self.workspace_size, self.handle);
-        let p = self.plan(m, n, k, out_ty)?;
+    fn run(&self, stream: *mut c_void, p: &Plan, x: u64, w: u64, y: u64) -> Result<()> {
         let (alpha, beta) = (1.0f32, 0.0f32);
         let s = unsafe {
             cublasLtMatmul(
-                handle,
+                self.handle,
                 p.desc,
                 (&alpha as *const f32).cast(),
                 w as *const c_void,
@@ -169,11 +189,31 @@ impl CublasLt {
                 y as *mut c_void,
                 p.c,
                 &p.algo,
-                ws as *mut c_void,
-                ws_size,
+                self.workspace as *mut c_void,
+                self.workspace_size,
                 stream,
             )
         };
         check(s, "matmul")
     }
+
+    /// `y[m, n] = x[m, k] . w[n, k]^T`, bf16 inputs, f32 accumulate, `out_ty` output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
+        self.plan(stream, m, n, k, x, w, y, out_ty)?;
+        let p = &self.plans[&(m, n, k, out_ty)];
+        self.run(stream, p, x, w, y)
+    }
+}
+
+fn sync(stream: *mut c_void) -> Result<()> {
+    #[link(name = "cuda")]
+    unsafe extern "C" {
+        fn cuStreamSynchronize(s: *mut c_void) -> i32;
+    }
+    let r = unsafe { cuStreamSynchronize(stream) };
+    if r != 0 {
+        bail!("cuStreamSynchronize failed: {r}");
+    }
+    Ok(())
 }

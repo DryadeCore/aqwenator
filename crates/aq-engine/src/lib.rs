@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod cublaslt;
+pub mod engine;
 pub mod gpu;
 pub mod model;
 pub mod weights;

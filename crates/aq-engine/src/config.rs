@@ -101,6 +101,11 @@ impl TextConfig {
     pub fn gdn_proj_dim(&self) -> usize {
         self.conv_dim() + self.value_dim() + 2 * self.linear_num_value_heads
     }
+    /// Row stride of the merged GDN projection: width rounded up to 256 (zero weight rows),
+    /// so the GEMM's N is tile-aligned.
+    pub fn gdn_proj_ld(&self) -> usize {
+        self.gdn_proj_dim().next_multiple_of(256)
+    }
     /// Merged attention projection width: `[q+gate | k | v]`.
     pub fn attn_proj_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim * 2 + 2 * self.num_key_value_heads * self.head_dim

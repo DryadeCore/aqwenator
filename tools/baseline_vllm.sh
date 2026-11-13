@@ -10,8 +10,12 @@ OUT=$HOME/aq/results/baseline/$TAG
 PORT=$((18000 + GPU))
 mkdir -p "$OUT"
 source ~/aq/venv-ref/bin/activate
-# vLLM JIT-compiles some kernels (flashinfer); use the user-space CUDA 13 toolkit.
-export CUDA_HOME=$HOME/aq/env PATH=$PATH:$HOME/aq/env/bin
+# vLLM JIT-compiles some kernels (flashinfer); use the CUDA 13 toolkit that ships with torch's
+# pip wheels so headers and libs match the torch build.
+export CUDA_HOME=$HOME/aq/cuda-shim  # built by scripts/remote/make_cuda_shim.sh
+export PATH=$PATH:$CUDA_HOME/bin
+# conda's GCC 15 headers are too new for CUDA 13.0's front end; host-compile with the system GCC 13.
+export NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-13"
 export CUDA_VISIBLE_DEVICES=$GPU
 
 echo "model=$MODEL gpu=$GPU port=$PORT" | tee "$OUT/meta.txt"

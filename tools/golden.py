@@ -16,19 +16,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROMPT = "The capital of France is Paris. The capital of Japan is Tokyo. The capital of Italy is"
 
+# ~1k tokens of varied text, so the chunked/tiled prefill paths cross many chunk boundaries.
+LONG_PROMPT = " ".join(
+    f"Record {i}: the {a} {b} crossed {c} kilometres of {d} terrain in {i % 7 + 2} days, "
+    f"carrying {i * 13 % 97} crates of {e}."
+    for i, (a, b, c, d, e) in enumerate(
+        [(a, b, c, d, e) for a in ("swift", "old", "patient", "noisy") for b in ("caravan", "courier", "barge", "convoy")
+         for c in (12, 340, 77) for d in ("desert", "mountain") for e in ("salt", "tea", "copper")][:60]
+    )
+) + " Summarize the records above in one sentence:"
+
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--greedy", type=int, default=32, help="greedy tokens to generate for an e2e check")
+    p.add_argument("--long", action="store_true", help="use the ~1k-token prompt")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map="cuda", attn_implementation="eager"
     ).eval()
-    ids = tok(PROMPT, return_tensors="pt").input_ids.cuda()
+    prompt = LONG_PROMPT if args.long else PROMPT
+    ids = tok(prompt, return_tensors="pt").input_ids.cuda()
 
     tensors = {"input_ids": ids[0].to(torch.int32).cpu()}
     with torch.no_grad():
@@ -43,7 +55,7 @@ def main():
         tensors["greedy_ids"] = gen[0, ids.shape[1]:].to(torch.int32).cpu()
 
     os.makedirs(os.path.dirname(os.path.expanduser(args.out)), exist_ok=True)
-    save_file(tensors, os.path.expanduser(args.out), metadata={"model": args.model, "prompt": PROMPT})
+    save_file(tensors, os.path.expanduser(args.out), metadata={"model": args.model, "prompt": prompt})
     print("saved", len(tensors), "tensors; greedy:", repr(tok.decode(tensors["greedy_ids"])))
 
 
