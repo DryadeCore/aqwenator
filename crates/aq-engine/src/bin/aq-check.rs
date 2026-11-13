@@ -237,6 +237,38 @@ fn main() -> Result<()> {
         failed |= !classify(&format!("batched seq {i} vs single"), gseq, &single, &own_margin);
     }
 
+    // ---- 3b. staggered admission: one sequence is decoding when two more arrive and prefill,
+    // so decode steps and prefill chunks share the GPU (mixed steps, or concurrent lanes with
+    // AQ_COEXEC=1). All three must match the single-sequence run.
+    let overlap_before = eng.overlap_steps;
+    let cache_was = eng.session_cache;
+    eng.session_cache = false; // full prefills, so the late arrivals really overlap with decode
+    eng.add(Request { id: 300, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+    let mut st: Vec<Vec<u32>> = vec![Vec::new(); 3];
+    let mut added = false;
+    while eng.has_work() {
+        for e in eng.step()? {
+            st[(e.id - 300) as usize].push(e.token);
+        }
+        if !added && st[0].len() >= 2 {
+            for id in 301..303u64 {
+                eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+            }
+            added = true;
+        }
+    }
+    eng.session_cache = cache_was;
+    for (i, gseq) in st.iter().enumerate() {
+        failed |= !classify(&format!("staggered seq {i} vs single"), gseq, &single, &own_margin);
+    }
+    if eng.coexec && eng.spec_k == 0 {
+        let overlap = eng.overlap_steps - overlap_before;
+        println!("co-execution: {overlap} decode steps ran while a prefill batch was in flight");
+        failed |= overlap == 0;
+    } else if eng.coexec {
+        println!("co-execution: off while speculating (spec_k = {}), normal path used", eng.spec_k);
+    }
+
     // ---- 4. session cache: a request that extends a finished one must resume from the parked
     // state and produce the same tokens as a cold engine (session cache off) on the same prompt.
     let turn2: Vec<u32> = ids.iter().copied().chain(single[..8].iter().copied()).chain(ids[..ids.len().min(37)].iter().copied()).collect();
@@ -307,6 +339,11 @@ fn main() -> Result<()> {
         let k = if spec_env > 0 { spec_env } else { 4 };
         let prompts: Vec<Vec<u32>> = vec![ids.clone(), ids[..ids.len() * 3 / 4].to_vec(), ids[ids.len() / 4..].to_vec()];
         let saved = (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m);
+        // The bit-identity baseline (spec off) must take the same single-stream path as the
+        // speculative run: co-execution is not used while speculating, and its decode lane
+        // runs GEMMs under a different row cap (so different plans).
+        let coexec_saved = eng.coexec;
+        eng.coexec = false;
         eng.session_cache = false;
         eng.clear_cache();
         eng.model.attn_split_keys = 64;
@@ -372,6 +409,7 @@ fn main() -> Result<()> {
             failed |= !ok;
         }
         (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m) = saved;
+        eng.coexec = coexec_saved;
     }
 
     if failed {

@@ -14,7 +14,13 @@ pub fn de<E: Debug>(e: E) -> anyhow::Error {
 
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
+    /// The active lane's stream; everything enqueued by this struct goes here.
     pub stream: Arc<Stream>,
+    /// One stream + cuBLASLt workspace per lane (lane 0 = main; lane 1 = decode, created by
+    /// `add_lane` for decode/prefill co-execution).
+    streams: Vec<Arc<Stream>>,
+    workspaces: Vec<u64>,
+    pub lane: usize,
     pub k: LoadedModule,
     pub lt: CublasLt,
     allocs: Vec<u64>,
@@ -36,11 +42,49 @@ impl Gpu {
         let k = aq_kernels::kernels::load(&ctx).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
         let lt = CublasLt::new(ws, WORKSPACE_BYTES)?;
-        let me = Self { ctx, stream, k, lt, allocs: vec![ws], allocated_bytes: WORKSPACE_BYTES, capturing: Default::default(), gemm_min_m: 0 };
+        let me = Self {
+            ctx,
+            streams: vec![stream.clone()],
+            stream,
+            workspaces: vec![ws],
+            lane: 0,
+            k,
+            lt,
+            allocs: vec![ws],
+            allocated_bytes: WORKSPACE_BYTES,
+            capturing: Default::default(),
+            gemm_min_m: 0,
+        };
         if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
             me.print_kernel_info()?;
         }
         Ok(me)
+    }
+
+    /// Add a lane: a new stream at the given scheduling priority (lower = more urgent) with
+    /// its own cuBLASLt workspace. Returns the lane index.
+    pub fn add_lane(&mut self, priority: i32) -> Result<usize> {
+        let stream = self.ctx.new_stream_with_priority(priority).map_err(de)?;
+        let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
+        self.allocs.push(ws);
+        self.allocated_bytes += WORKSPACE_BYTES;
+        self.streams.push(stream);
+        self.workspaces.push(ws);
+        Ok(self.streams.len() - 1)
+    }
+
+    /// Highest scheduling priority this device supports (numerically smallest).
+    pub fn highest_priority(&self) -> Result<i32> {
+        Ok(self.ctx.stream_priority_range().map_err(de)?.greatest())
+    }
+
+    /// Make `lane` the target of every subsequent enqueue (kernels, copies, GEMMs, graphs).
+    pub fn set_lane(&mut self, lane: usize) {
+        if lane != self.lane {
+            self.stream = self.streams[lane].clone();
+            self.lt.set_workspace(self.workspaces[lane]);
+            self.lane = lane;
+        }
     }
 
     pub fn raw_stream(&self) -> *mut c_void {

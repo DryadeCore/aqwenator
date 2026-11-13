@@ -228,6 +228,84 @@ pub struct Model {
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
     cc_gdn: bool,
+    /// Rows of the active lane's scratch: the GEMM row cap and the per-step token limit.
+    s_cap: usize,
+    /// The inactive lane's per-step state when a decode lane exists (co-execution); swapped
+    /// with the active fields by `set_lane`.
+    alt: Option<LaneState>,
+    /// One completion event per lane (co-execution).
+    lane_events: Vec<cuda_core::Event>,
+}
+
+/// Everything that is per step and per lane: scratch and metadata buffers, the work lists of
+/// the step being run, and the CUDA graphs captured against this lane's buffers.
+struct LaneState {
+    s: Scratch,
+    cap: usize,
+    graphs: std::collections::HashMap<(usize, usize), (u64, Vec<&'static str>)>,
+    cur_chunks: usize,
+    cur_tiles: usize,
+    cur_splits: usize,
+    cur_nd_rows: usize,
+    cur_split_keys: u32,
+}
+
+/// Allocate one lane's scratch for `lim.max_rows()` token rows (and `lim.max_seqs` sequences).
+fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool) -> Result<Scratch> {
+    let hd = cfg.hidden_size;
+    let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
+    let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
+    let t = lim.max_rows();
+    let sq = lim.max_seqs;
+    let hvd = cfg.linear_num_value_heads * 128;
+    let hq = cfg.num_attention_heads;
+    // Only the selected chunked-GDN path gets real scratch; the other gets a stub.
+    let (cct, tcc) = if cc_gdn { (t, 0) } else { (0, lim.max_tc_chunks() * cfg.linear_num_value_heads) };
+    Ok(Scratch {
+        amax_v: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
+        amax_i: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
+        attn_part: gpu.alloc(attn_part_rows(sq) * hq * cfg.head_dim * 4)?,
+        attn_ml: gpu.alloc(attn_part_rows(sq) * hq * 2 * 4)?,
+        chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
+        chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
+        seq_chunk0: gpu.alloc(sq * 4)?,
+        seq_nchunk: gpu.alloc(sq * 4)?,
+        tile_start: gpu.alloc(lim.max_tiles() * 4)?,
+        tile_len: gpu.alloc(lim.max_tiles() * 4)?,
+        gu: gpu.alloc(cct * hvd * 4)?,
+        gw: gpu.alloc(cct * hvd * 4)?,
+        gqp: gpu.alloc(cct * hvd * 4)?,
+        gkp: gpu.alloc(cct * hvd * 4)?,
+        gintra: gpu.alloc(if cc_gdn { lim.max_chunks() * cfg.linear_num_value_heads * GDN_CHUNK * GDN_CHUNK * 4 } else { 0 })?,
+        gdecay: gpu.alloc(lim.max_chunks() * cfg.linear_num_value_heads * 4)?,
+        go: gpu.alloc(cct * hvd * 2)?,
+        tqn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+        tkn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+        tu: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+        tw: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
+        tg: gpu.alloc(tcc * GDN_TC_CHUNK * 4)?,
+        tht: gpu.alloc(tcc * 128 * 128 * 2)?,
+        tvnt: gpu.alloc(tcc * 128 * GDN_TC_CHUNK * 2)?,
+        ids: gpu.alloc(t * 4)?,
+        tok_pos: gpu.alloc(t * 4)?,
+        tok_seq: gpu.alloc(t * 4)?,
+        seq_start: gpu.alloc((sq + 1) * 4)?,
+        seq_len: gpu.alloc((sq + 1) * 4)?,
+        seq_slot: gpu.alloc((sq + 1) * 4)?,
+        seq_slot_out: gpu.alloc((sq + 1) * 4)?,
+        rows: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
+        tables: gpu.alloc((sq + 1) * lim.max_blocks_per_seq() * 4)?,
+        hfinal: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * hd * 2)?,
+        x: gpu.alloc(t * hd * 2)?,
+        h: gpu.alloc(t * hd * 2)?,
+        proj: gpu.alloc(t * wide * 2)?,
+        conv: gpu.alloc(t * cfg.conv_dim() * 2)?,
+        mix: gpu.alloc(t * mixw * 2)?,
+        delta: gpu.alloc(t * hd * 2)?,
+        q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
+        logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
+        tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
+    })
 }
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per query head of the group) plus one
@@ -354,62 +432,10 @@ impl Model {
             cfg.state_bytes_per_seq() as f64 / (1 << 20) as f64
         );
 
-        let hd = cfg.hidden_size;
-        let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
-        let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
-        let t = lim.max_rows();
-        let sq = lim.max_seqs;
-        let hvd = cfg.linear_num_value_heads * 128;
-        let hq = cfg.num_attention_heads;
         let cc_gdn = std::env::var("AQ_GDN_CHUNK_CC").as_deref() == Ok("1");
-        // Only the selected chunked-GDN path gets real scratch; the other gets a stub.
-        let (cct, tcc) = if cc_gdn { (t, 0) } else { (0, lim.max_tc_chunks() * cfg.linear_num_value_heads) };
-        let s = Scratch {
-            amax_v: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
-            amax_i: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
-            attn_part: gpu.alloc(attn_part_rows(sq) * hq * cfg.head_dim * 4)?,
-            attn_ml: gpu.alloc(attn_part_rows(sq) * hq * 2 * 4)?,
-            chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
-            chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
-            seq_chunk0: gpu.alloc(sq * 4)?,
-            seq_nchunk: gpu.alloc(sq * 4)?,
-            tile_start: gpu.alloc(lim.max_tiles() * 4)?,
-            tile_len: gpu.alloc(lim.max_tiles() * 4)?,
-            gu: gpu.alloc(cct * hvd * 4)?,
-            gw: gpu.alloc(cct * hvd * 4)?,
-            gqp: gpu.alloc(cct * hvd * 4)?,
-            gkp: gpu.alloc(cct * hvd * 4)?,
-            gintra: gpu.alloc(if cc_gdn { lim.max_chunks() * cfg.linear_num_value_heads * GDN_CHUNK * GDN_CHUNK * 4 } else { 0 })?,
-            gdecay: gpu.alloc(lim.max_chunks() * cfg.linear_num_value_heads * 4)?,
-            go: gpu.alloc(cct * hvd * 2)?,
-            tqn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
-            tkn: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
-            tu: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
-            tw: gpu.alloc(tcc * GDN_TC_CHUNK * 128 * 2)?,
-            tg: gpu.alloc(tcc * GDN_TC_CHUNK * 4)?,
-            tht: gpu.alloc(tcc * 128 * 128 * 2)?,
-            tvnt: gpu.alloc(tcc * 128 * GDN_TC_CHUNK * 2)?,
-            ids: gpu.alloc(t * 4)?,
-            tok_pos: gpu.alloc(t * 4)?,
-            tok_seq: gpu.alloc(t * 4)?,
-            seq_start: gpu.alloc((sq + 1) * 4)?,
-            seq_len: gpu.alloc((sq + 1) * 4)?,
-            seq_slot: gpu.alloc((sq + 1) * 4)?,
-            seq_slot_out: gpu.alloc((sq + 1) * 4)?,
-            rows: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
-            tables: gpu.alloc((sq + 1) * lim.max_blocks_per_seq() * 4)?,
-            hfinal: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * hd * 2)?,
-            x: gpu.alloc(t * hd * 2)?,
-            h: gpu.alloc(t * hd * 2)?,
-            proj: gpu.alloc(t * wide * 2)?,
-            conv: gpu.alloc(t * cfg.conv_dim() * 2)?,
-            mix: gpu.alloc(t * mixw * 2)?,
-            delta: gpu.alloc(t * hd * 2)?,
-            q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
-            logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
-            tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
-        };
+        let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn)?;
         gpu.sync()?;
+        let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
         let num_sms = gpu.num_sms()?;
         let attn_tc_smem = attention_tc_smem(cfg.num_attention_heads / cfg.num_key_value_heads);
         gpu.opt_in_dynamic_smem(
@@ -446,7 +472,95 @@ impl Model {
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
             cc_gdn,
+            s_cap: lim.max_rows(),
+            alt: None,
+            lane_events,
         })
+    }
+
+    /// Create the decode lane for decode/prefill co-execution: a high-priority stream with its
+    /// own cuBLASLt workspace, plus scratch and metadata buffers sized for one decode token per
+    /// sequence (plus the usual decode-row headroom). Lane 0 keeps the full-size scratch for
+    /// prefill.
+    pub fn enable_decode_lane(&mut self) -> Result<()> {
+        if self.alt.is_some() {
+            return Ok(());
+        }
+        self.set_lane_raw(0);
+        let prio = self.gpu.highest_priority()?;
+        let lane = self.gpu.add_lane(prio)?;
+        anyhow::ensure!(lane == 1, "decode lane must be lane 1");
+        let mut l2 = self.limits;
+        l2.max_tokens = l2.max_seqs;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &l2, self.cc_gdn)?;
+        self.gpu.sync()?;
+        self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
+        self.alt = Some(LaneState {
+            s,
+            cap: l2.max_rows(),
+            graphs: Default::default(),
+            cur_chunks: 0,
+            cur_tiles: 0,
+            cur_splits: 1,
+            cur_nd_rows: 0,
+            cur_split_keys: 0,
+        });
+        Ok(())
+    }
+
+    /// Which lane is active (0 without co-execution).
+    pub fn lane(&self) -> usize {
+        self.gpu.lane
+    }
+
+    fn set_lane_raw(&mut self, lane: usize) {
+        self.gpu.set_lane(lane);
+    }
+
+    /// Make `lane` active: swap in its scratch, work lists and graphs, and point the GPU at its
+    /// stream and workspace. Lane 1 exists only after `enable_decode_lane`.
+    pub fn set_lane(&mut self, lane: usize) {
+        if lane == self.gpu.lane {
+            return;
+        }
+        let alt = self.alt.as_mut().expect("set_lane(1) without enable_decode_lane");
+        std::mem::swap(&mut self.s, &mut alt.s);
+        std::mem::swap(&mut self.s_cap, &mut alt.cap);
+        std::mem::swap(&mut self.graphs, &mut alt.graphs);
+        std::mem::swap(&mut self.cur_chunks, &mut alt.cur_chunks);
+        std::mem::swap(&mut self.cur_tiles, &mut alt.cur_tiles);
+        std::mem::swap(&mut self.cur_splits, &mut alt.cur_splits);
+        std::mem::swap(&mut self.cur_nd_rows, &mut alt.cur_nd_rows);
+        std::mem::swap(&mut self.cur_split_keys, &mut alt.cur_split_keys);
+        self.gpu.set_lane(lane);
+    }
+
+    /// Enqueue a whole step on the active lane without waiting for it: upload, forward, argmax.
+    /// Returns the number of sampled rows; collect them with `collect` once `lane_done`.
+    pub fn launch(&mut self, b: &Batch) -> Result<usize> {
+        let nseq = b.seq_start.len();
+        let ns = b.sample_rows.len();
+        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= self.s_cap, "{} tokens exceeds lane capacity", b.tokens.len());
+        anyhow::ensure!(nseq <= self.limits.max_seqs, "{nseq} sequences exceeds max_seqs");
+        self.upload(b)?;
+        self.forward(b.tokens.len(), nseq, ns, b.n_decode, None)?;
+        let lane = self.gpu.lane;
+        self.lane_events[lane].record(&self.gpu.stream).map_err(de)?;
+        Ok(ns)
+    }
+
+    /// Whether everything enqueued on `lane` up to its last `launch` has finished.
+    pub fn lane_done(&self, lane: usize) -> Result<bool> {
+        self.lane_events[lane].query().map_err(de)
+    }
+
+    /// Sampled tokens of the active lane's last `launch` (waits for it).
+    pub fn collect(&mut self, ns: usize) -> Result<Vec<u32>> {
+        if ns == 0 {
+            self.gpu.sync()?;
+            return Ok(Vec::new());
+        }
+        self.gpu.download(self.s.tok, ns)
     }
 
     /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
@@ -504,7 +618,7 @@ impl Model {
         let nseq = b.seq_start.len();
         let ns = b.sample_rows.len();
         let lim = self.limits;
-        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= lim.max_rows(), "{} tokens exceeds max_rows", b.tokens.len());
+        anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= self.s_cap, "{} tokens exceeds the lane's capacity", b.tokens.len());
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
         anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
@@ -599,7 +713,7 @@ impl Model {
             .len()
             .next_multiple_of(16)
             .max(bucket)
-            .min(lim.max_rows())
+            .min(self.s_cap)
             .min(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ)
             .max(b.tokens.len());
         let _ = w;
@@ -733,6 +847,8 @@ impl Model {
     /// profiling or dumping, so it can be captured into a graph.
     fn forward(&mut self, t: usize, nseq: usize, ns: usize, nd_total: usize, mut dump: Option<&mut Vec<Vec<f32>>>) -> Result<()> {
         let lim = self.limits;
+        // Row capacity of the active lane's scratch (GEMM M-bucket cap).
+        let cap = self.s_cap;
         let c = self.cfg.clone();
         let hd = c.hidden_size as u32;
         let eps = c.rms_norm_eps as f32;
@@ -783,7 +899,7 @@ impl Model {
                 LayerKind::Linear => {
                     let n = c.gdn_proj_ld();
                     mark!("norm");
-                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, cap, n, c.hidden_size, s.h, l.gdn_proj, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_gdn_in");
                     let cd = c.conv_dim() as u32;
                     unsafe {
@@ -1017,14 +1133,14 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("gdn");
-                    g.gemm(t, lim.max_rows(), c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, cap, c.hidden_size, c.value_dim(), s.mix, l.out_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_gdn_out");
                 }
                 LayerKind::Full => {
                     let n = c.attn_proj_dim();
                     let (h, hkv) = (c.num_attention_heads as u32, c.num_key_value_heads as u32);
                     mark!("norm");
-                    g.gemm(t, lim.max_rows(), n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
+                    g.gemm(t, cap, n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_qkv");
                     unsafe {
                         g.k.attn_prep(
@@ -1171,7 +1287,7 @@ impl Model {
                         .map_err(de)?;
                     }
                     mark!("attn_prefill");
-                    g.gemm(t, lim.max_rows(), c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
+                    g.gemm(t, cap, c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, l.o_proj, s.delta, CUDA_R_16BF)?;
                     mark!("gemm_o");
                 }
             }
@@ -1192,7 +1308,7 @@ impl Model {
             .map_err(de)?;
             mark!("norm");
             let inter = c.intermediate_size;
-            g.gemm(t, lim.max_rows(), 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
+            g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
             mark!("gemm_gate_up");
             let nvec = (t * inter / 8) as u32;
             unsafe {
@@ -1200,7 +1316,7 @@ impl Model {
             }
             .map_err(de)?;
             mark!("silu_mul");
-            g.gemm(t, lim.max_rows(), c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
+            g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
             mark!("gemm_down");
 
             if let Some(d) = dump.as_deref_mut() {
