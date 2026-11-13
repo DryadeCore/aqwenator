@@ -77,6 +77,10 @@ pub struct Scratch {
     seq_len: u64,
     seq_slot: u64,
     seq_slot_out: u64,
+    // state taps (prompt checkpoints inside a prefill chunk)
+    seq_tap_n: u64,
+    seq_tap_len: u64,
+    seq_tap_slot: u64,
     rows: u64,
     tables: u64,
     hfinal: u64,
@@ -187,6 +191,10 @@ pub struct Batch {
     /// Slot each sequence's updated state is written to (empty = same as `seq_slot`). A
     /// speculative step writes to a spare slot so the old state survives a rejection.
     pub seq_slot_out: Vec<u32>,
+    /// State taps, one `(chunks, slot)` per sequence (empty = none): after `chunks` full
+    /// 64-token chunks of a prefill sequence, its recurrent and conv state are also written to
+    /// `slot`. Only with the tensor-core chunked DeltaNet path (`Model::supports_tap`).
+    pub seq_tap: Vec<(u32, u32)>,
 }
 
 pub struct Model {
@@ -210,6 +218,8 @@ pub struct Model {
     cur_splits: usize,
     /// Decode-path token rows of this step (set by `upload`).
     cur_nd_rows: usize,
+    /// This step has at least one state tap (set by `upload`).
+    cur_tap: bool,
     /// Fixed decode-attention slice size in use this step (0 = slices sized per step).
     cur_split_keys: u32,
     /// Fixed decode-attention slice size (keys); 0 = size slices from the batch. Fixed slices
@@ -293,6 +303,9 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool) ->
         seq_len: gpu.alloc((sq + 1) * 4)?,
         seq_slot: gpu.alloc((sq + 1) * 4)?,
         seq_slot_out: gpu.alloc((sq + 1) * 4)?,
+        seq_tap_n: gpu.alloc((sq + 1) * 4)?,
+        seq_tap_len: gpu.alloc((sq + 1) * 4)?,
+        seq_tap_slot: gpu.alloc((sq + 1) * 4)?,
         rows: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
         tables: gpu.alloc((sq + 1) * lim.max_blocks_per_seq() * 4)?,
         hfinal: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * hd * 2)?,
@@ -463,6 +476,7 @@ impl Model {
             cur_tiles: 0,
             cur_splits: 1,
             cur_nd_rows: 0,
+            cur_tap: false,
             cur_split_keys: 0,
             attn_split_keys: std::env::var("AQ_ATTN_SPLIT_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             num_sms,
@@ -623,6 +637,11 @@ impl Model {
         Ok(())
     }
 
+    /// Whether prefill sequences can carry a state tap (`Batch::seq_tap`).
+    pub fn supports_tap(&self) -> bool {
+        !self.cc_gdn && !self.ref_gdn
+    }
+
     /// Copy one KV page (every full-attention layer's K and V rows) into another, on the stream.
     pub fn copy_page(&mut self, dst: usize, src: usize) -> Result<()> {
         let psz = self.limits.block_size * self.cfg.num_key_value_heads * self.cfg.head_dim * 2;
@@ -669,6 +688,7 @@ impl Model {
             sample_rows: vec![n - 1],
             n_decode: (n == 1) as usize,
             seq_slot_out: Vec::new(),
+            seq_tap: Vec::new(),
         }
     }
 
@@ -881,8 +901,22 @@ impl Model {
             "decode attention partials overflow ({nd} rows x {} slices)",
             self.cur_splits
         );
+        // State taps (dummy slot and zero chunks where a sequence has none).
+        let ns_all = b.seq_start.len();
+        let dummy = self.limits.max_seqs as u32;
+        let (mut tn, mut tlen, mut tslot) = (vec![0u32; ns_all], vec![0u32; ns_all], vec![dummy; ns_all]);
+        for (k, &(n, slot)) in b.seq_tap.iter().enumerate() {
+            if n > 0 {
+                anyhow::ensure!(k >= b.n_decode && (n as usize * GDN_TC_CHUNK) <= b.seq_len[k] as usize && self.supports_tap(), "invalid state tap");
+                (tn[k], tlen[k], tslot[k]) = (n, n * GDN_TC_CHUNK as u32, slot);
+            }
+        }
+        self.cur_tap = tn.iter().any(|&n| n > 0);
         let (s, g) = (&self.s, &self.gpu);
         if !cs.is_empty() {
+            g.upload(s.seq_tap_n, &tn)?;
+            g.upload(s.seq_tap_len, &tlen)?;
+            g.upload(s.seq_tap_slot, &tslot)?;
             g.upload(s.chunk_start, &cs)?;
             g.upload(s.chunk_len, &cl)?;
             g.upload(s.seq_chunk0, &c0)?;
@@ -978,6 +1012,24 @@ impl Model {
                         )
                     }
                     .map_err(de)?;
+                    if self.cur_tap {
+                        // Conv state at each tap: the last 3 inputs before it, into the tap slot.
+                        unsafe {
+                            g.k.conv_state_update(
+                                &st,
+                                cfg((cd.div_ceil(256), nseq as u32, 1), 256),
+                                s.proj as *const u16,
+                                n as u32,
+                                l.conv_state as *mut u16,
+                                s.seq_start as *const u32,
+                                s.seq_tap_len as *const u32,
+                                s.seq_slot as *const u32,
+                                s.seq_tap_slot as *const u32,
+                                cd,
+                            )
+                        }
+                        .map_err(de)?;
+                    }
                     unsafe {
                         g.k.conv_state_update(
                             &st,
@@ -1097,6 +1149,8 @@ impl Model {
                                 s.tht as *mut u16,
                                 s.tvnt as *mut u16,
                                 hv_u,
+                                s.seq_tap_n as *const u32,
+                                s.seq_tap_slot as *const u32,
                             )
                         }
                         .map_err(de)?;

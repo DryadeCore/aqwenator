@@ -21,7 +21,7 @@
 //! `computed` position, so shared pages are never written.
 
 use crate::draft::DraftIndex;
-use crate::model::{Batch, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
+use crate::model::{Batch, GDN_TC_CHUNK, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -160,6 +160,9 @@ struct Snapshot {
 /// Tokens between a prompt checkpoint and the end of its prompt, at least (see
 /// `Engine::prompt_checkpoints`).
 pub const CKPT_BACKOFF: usize = 4;
+
+/// Prefills of at most this many tokens are not held back by the mixed-step prefill budget.
+pub const SMALL_PREFILL: usize = 256;
 
 /// Shared prefixes shorter than this are not worth a snapshot slot.
 pub const SNAPSHOT_MIN_TOKENS: usize = 1024;
@@ -742,12 +745,34 @@ impl Engine {
         let mut resident_turns = 0;
         let mut sid = self.waiting[wi].0.id;
         let (slot, mut blocks, computed) = if let Some(i) = best {
-            let p = self.parked.swap_remove(i);
-            resident_turns = p.turns;
-            sid = p.sid;
-            // The session's other entries (its checkpoint or its generation end) are stale now.
-            self.drop_session(sid);
-            (p.slot, p.blocks, p.tokens.len())
+            resident_turns = self.parked[i].turns;
+            sid = self.parked[i].sid;
+            let n = self.parked[i].tokens.len();
+            // A turn too short to produce a checkpoint of its own must not consume the one it
+            // resumes from, or the session's next turn would find nothing: fork it instead
+            // (copy the state, share the pages) when a slot is free.
+            let prompt_len = self.waiting[wi].0.prompt.len();
+            let no_new_ckpt = self.prompt_checkpoints && prompt_len.saturating_sub(CKPT_BACKOFF) / bs * bs <= n;
+            if no_new_ckpt && !self.free_slots.is_empty() {
+                let slot = self.free_slots.pop().unwrap();
+                let (src, blocks) = (self.parked[i].slot as usize, self.parked[i].blocks.clone());
+                self.parked[i].last_used = self.clock;
+                self.model.copy_slot(slot as usize, src)?;
+                for &b in &blocks {
+                    self.refcnt[b as usize] += 1;
+                }
+                // Drop the session's other entries, keep this one.
+                let keep = std::mem::replace(&mut self.parked[i].sid, u64::MAX);
+                self.drop_session(keep);
+                let k = self.parked.iter().position(|p| p.sid == u64::MAX).unwrap();
+                self.parked[k].sid = keep;
+                (slot, blocks, n)
+            } else {
+                let p = self.parked.swap_remove(i);
+                // The session's other entries (its checkpoint or its generation end) are stale now.
+                self.drop_session(sid);
+                (p.slot, p.blocks, n)
+            }
         } else {
             let slot = match self.free_slots.pop() {
                 Some(s) => s,
@@ -1165,19 +1190,40 @@ impl Engine {
         if self.policy.srpt {
             prefill.sort_by_key(|&i| self.running[i].req.prompt.len() - self.running[i].computed);
         }
+        // Checkpoints taken inside this step's prefill: (plan index, position, slot).
+        let mut taps: Vec<(usize, usize, u32)> = Vec::new();
+        let can_tap = self.model.supports_tap();
+        // Hard cap on prefill tokens (the step's row capacity); `budget` is the soft one.
+        let mut room = lim.max_tokens - decode_seqs;
         for i in prefill {
             let s = &self.running[i];
-            if budget == 0 {
-                break;
+            let start = s.computed;
+            let rem = s.req.prompt.len() - start;
+            // Small prefills ride along whatever the mixed-step budget says: next to the
+            // weights a step streams anyway they cost almost nothing, and making a short
+            // turn (or the last few tokens after a checkpoint) wait behind a long prompt is
+            // what the time-to-first-token tail is made of.
+            let mut n = if rem <= SMALL_PREFILL { rem.min(room) } else { rem.min(budget).min(room) };
+            if n == 0 {
+                continue;
             }
-            {
-                let mut n = (s.req.prompt.len() - s.computed).min(budget);
-                for at in [s.snapshot_at, s.ckpt_at].into_iter().flatten().filter(|&at| at > s.computed) {
-                    n = n.min(at - s.computed);
+            if let Some(at) = s.snapshot_at.filter(|&at| at > start) {
+                n = n.min(at - start);
+            }
+            if let Some(cp) = s.ckpt_at.filter(|&at| at > start) {
+                // The checkpoint is free when this step reaches the end of the prompt: tap
+                // the state at the last 64-token chunk boundary before the backoff. Otherwise
+                // stop at the page-aligned checkpoint position and take it between steps.
+                let c = start + (s.req.prompt.len() - CKPT_BACKOFF - start) / GDN_TC_CHUNK * GDN_TC_CHUNK;
+                if can_tap && n == rem && c > start && !self.free_slots.is_empty() {
+                    taps.push((plan.len(), c, self.free_slots.pop().unwrap()));
+                } else {
+                    n = n.min(cp - start);
                 }
-                plan.push((i, n));
-                budget -= n;
             }
+            plan.push((i, n));
+            budget = budget.saturating_sub(n);
+            room -= n;
         }
         if plan.is_empty() {
             return Ok(Vec::new());
@@ -1197,6 +1243,10 @@ impl Engine {
             b.seq_len.push(n as u32);
             b.seq_slot.push(s.slot);
             b.seq_slot_out.push(if d.is_empty() { s.slot } else { s.spare.unwrap() });
+            b.seq_tap.push(match taps.iter().find(|t| t.0 == k) {
+                Some(&(_, c, slot)) => (((c - s.computed) / GDN_TC_CHUNK) as u32, slot),
+                None => (0, 0),
+            });
             for p in s.computed..s.computed + real {
                 b.tokens.push(s.token_at(p));
                 b.tok_pos.push(p as u32);
@@ -1287,6 +1337,19 @@ impl Engine {
             }
         }
         self.spec = st;
+        // Tapped checkpoints: the tap slot holds the state at `c`; park it with the pages below.
+        let bs = lim.block_size;
+        for &(k, c, slot) in &taps {
+            let s = &mut self.running[plan[k].0];
+            s.ckpt_at = None;
+            let blocks: Vec<u32> = s.blocks[..c.div_ceil(bs)].to_vec();
+            let (tokens, sid, turns) = (s.req.prompt[..c].to_vec(), s.sid, s.turns);
+            for &b in &blocks {
+                self.refcnt[b as usize] += 1;
+            }
+            self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
+            self.cache.checkpoints += 1;
+        }
         self.after_step(plan.iter().map(|&(i, _)| i))?;
         self.retire(done);
         self.last = StepStats {

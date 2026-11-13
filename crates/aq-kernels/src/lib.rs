@@ -2272,6 +2272,8 @@ pub mod kernels {
         ht_out: *mut u16,
         vnt_out: *mut u16,
         n_v_heads: u32,
+        seq_tap_n: *const u32,
+        seq_tap_slot: *const u32,
     ) {
         const C: usize = 64;
         const D: usize = 128;
@@ -2297,6 +2299,12 @@ pub mod kernels {
         let sp = unsafe { state_base.add((slot * hv + h) * D * D) };
         let c_first = unsafe { *seq_chunk0.add(p) } as usize;
         let n_chunks = unsafe { *seq_nchunk.add(p) } as usize;
+        // State tap: after `tap_n` chunks (0 = none) the state is also written to another
+        // slot, which gives a checkpoint inside the prompt without a separate step. The
+        // tapped state is the f32 register state, exactly what a prefill stopped there holds.
+        let tap_n = unsafe { *seq_tap_n.add(p + seq_off as usize) } as usize;
+        let tap_slot = unsafe { *seq_tap_slot.add(p + seq_off as usize) } as usize;
+        let tp = unsafe { state_base.add((tap_slot * hv + h) * D * D) };
         // (b) work split: rows c in 16 (w % 4).., n-tiles 2 (w / 4)..+2
         let vr0 = 16 * (w % 4);
         let vn0 = 2 * (w / 4);
@@ -2410,6 +2418,17 @@ pub mod kernels {
             }
             thread::sync_threads();
             cc += 1;
+            if cc == tap_n {
+                #[unroll]
+                for nt in 0..4 {
+                    #[unroll]
+                    for e in 0..4 {
+                        let k = 16 * w + g + if e >= 2 { 8 } else { 0 };
+                        let v = VB * vb + 8 * nt + 2 * t + (e & 1);
+                        unsafe { *tp.add(k * D + v) = hs[nt][e] };
+                    }
+                }
+            }
         }
         #[unroll]
         for nt in 0..4 {

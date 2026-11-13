@@ -341,7 +341,9 @@ fn main() -> Result<()> {
         for overlap in [false, true] {
             let (warm, reused) = run(&mut eng, true, overlap)?;
             let (cold, _) = run(&mut eng, false, overlap)?;
-            let mut ok = reused == ckpt as u64;
+            // The checkpoint sits at the last page boundary before the backoff, or (taken inside
+            // the prefill kernel) up to a 64-token chunk earlier.
+            let mut ok = if ckpt == 0 { reused == 0 } else { reused > 0 && reused as usize <= ckpt && ckpt - reused as usize <= 64 };
             let mut same_total = 0;
             for k in 0..2 {
                 let same = warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
