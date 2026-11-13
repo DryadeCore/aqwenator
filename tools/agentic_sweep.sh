@@ -23,9 +23,17 @@ source ~/aq/venv-ref/bin/activate
 export CUDA_VISIBLE_DEVICES=$GPU
 
 if [ "$ENGINE" = vllm ]; then
-  export CUDA_HOME=$HOME/aq/cuda-shim PATH=$PATH:$HOME/aq/cuda-shim/bin NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-13"
-  TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)
-  UTIL=$(python -c "print(round($MEM_GB * 1024 / $TOTAL, 4))")
+  if [ -d "$HOME/aq/cuda-shim" ]; then
+    export CUDA_HOME=$HOME/aq/cuda-shim PATH=$PATH:$HOME/aq/cuda-shim/bin NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-13"
+  else
+    export CUDA_HOME=/usr/local/cuda-13.0 PATH=$PATH:/usr/local/cuda-13.0/bin
+  fi
+  if [ -n "${VLLM_UTIL:-}" ]; then
+    UTIL=$VLLM_UTIL   # unified-memory devices (GB10) report no memory.total
+  else
+    TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)
+    UTIL=$(python -c "print(round($MEM_GB * 1024 / $TOTAL, 4))")
+  fi
   vllm serve "$MODEL" --port "$PORT" --max-model-len $MAX_CTX --gpu-memory-utilization "$UTIL" \
     --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 64 > "$OUT/server.log" 2>&1 &
   LABEL="vLLM $(python -c 'import vllm; print(vllm.__version__)')"
@@ -36,7 +44,7 @@ else
 fi
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT
-for i in $(seq 1 300); do
+for i in $(seq 1 900); do
   curl -sf "localhost:$PORT/v1/models" >/dev/null && break
   kill -0 $SERVER 2>/dev/null || { echo "server died"; tail -30 "$OUT/server.log"; exit 1; }
   sleep 1

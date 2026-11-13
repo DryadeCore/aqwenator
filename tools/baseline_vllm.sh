@@ -37,11 +37,13 @@ vllm serve "$MODEL" --port "$PORT" --max-model-len 16384 --gpu-memory-utilizatio
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT
 
-for i in $(seq 1 180); do
-  curl -sf "localhost:$PORT/v1/models" >/dev/null && break
+READY=0
+for i in $(seq 1 900); do
+  curl -sf "localhost:$PORT/v1/models" >/dev/null && { READY=1; break; }
   kill -0 $SERVER 2>/dev/null || { echo "server died"; tail -50 "$OUT/server.log"; exit 1; }
   sleep 1
 done
+[ $READY = 1 ] || { echo "server not ready after 900 s"; exit 1; }
 T1=$(date +%s.%N)
 echo "cold_start_ready_s=$(echo "$T1 - $T0" | bc)" | tee -a "$OUT/meta.txt"
 
@@ -50,7 +52,7 @@ run() { # in out conc
   local n=$(( $3 * ${NPROMPTS_MULT:-16} > ${NPROMPTS_MIN:-200} ? $3 * ${NPROMPTS_MULT:-16} : ${NPROMPTS_MIN:-200} ))
   vllm bench serve --backend vllm --model "$MODEL" --port "$PORT" \
     --dataset-name random --random-input-len "$in" --random-output-len "$out" \
-    --num-prompts "$n" --max-concurrency "$c" --ignore-eos \
+    --num-prompts "$n" --max-concurrency "$c" --ignore-eos --temperature 0 \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99,99.9 \
     --save-result --result-dir "$OUT" --result-filename "in${in}_out${out}_c${c}.json" \
     > "$OUT/bench_in${in}_out${out}_c${c}.log" 2>&1
