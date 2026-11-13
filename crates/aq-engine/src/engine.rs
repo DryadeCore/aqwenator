@@ -65,8 +65,9 @@ struct Seq {
     turns: u32,
     /// Session id: parked entries left by the same chain of turns share it.
     sid: u64,
-    /// A prompt-end checkpoint was taken (or skipped) for this request.
-    ckpt_done: bool,
+    /// Pause prefill here and take the prompt checkpoint (page aligned, a few tokens before
+    /// the prompt's end); `None` once taken, or when there is nothing to checkpoint.
+    ckpt_at: Option<usize>,
 }
 
 /// A prefill batch launched on lane 0 and not collected yet (co-execution). Sequences are
@@ -155,6 +156,10 @@ struct Snapshot {
     last_used: u64,
     forks: u64,
 }
+
+/// Tokens between a prompt checkpoint and the end of its prompt, at least (see
+/// `Engine::prompt_checkpoints`).
+pub const CKPT_BACKOFF: usize = 4;
 
 /// Shared prefixes shorter than this are not worth a snapshot slot.
 pub const SNAPSHOT_MIN_TOKENS: usize = 1024;
@@ -256,11 +261,14 @@ pub struct Engine {
     /// (larger budget, pending-prefill threshold in tokens): switch mixed steps to the larger
     /// prefill budget while more than `threshold` admitted prompt tokens await prefill.
     pub mixed_prefill_adaptive: Option<(usize, usize)>,
-    /// Prompt-end checkpoints: when a request finishes its prompt, keep a copy of the state at
-    /// exactly that point (a parked entry sharing the prompt's KV pages). A later request that
-    /// extends the *prompt* then resumes from it even if it does not extend the tokens this
-    /// engine generated, which is what agent harnesses send: the previous prompt plus the
-    /// assistant turn as the chat template renders it.
+    /// Prompt checkpoints: keep a copy of the state at the last page boundary at least
+    /// `CKPT_BACKOFF` tokens before a request's prompt ends (a parked entry sharing the
+    /// prompt's KV pages). A later request that extends the *prompt* then resumes from it even
+    /// if it does not extend the tokens this engine generated, which is what agent harnesses
+    /// send: the previous prompt plus the assistant turn as the chat template renders it.
+    /// The backoff is there because templates end a prompt with a generation header whose
+    /// last token re-tokenizes once the turn's text follows it (Qwen3.5: `<think>\n` becomes
+    /// `<think>\n\n`), so consecutive prompts diverge just before the previous one's end.
     pub prompt_checkpoints: bool,
     pub policy: Policy,
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
@@ -522,23 +530,17 @@ impl Engine {
         (best.min(prompt.len().saturating_sub(1)) / bs) * bs
     }
 
-    /// Prompt-end checkpoint of running sequence `i`, whose state is exactly the state after
-    /// its prompt: a parked entry with a copy of the state and shared references to the
-    /// prompt's KV pages. The last page may be partly filled; whoever resumes from a shared
-    /// partial page copies it first (see `try_admit`), so the two owners never write the same
-    /// page. Skipped when no state slot is free.
+    /// Prompt checkpoint of running sequence `i` at its current (page-aligned) position: a
+    /// parked entry with a copy of the state and shared references to the KV pages below it.
+    /// Skipped when no state slot is free.
     fn checkpoint(&mut self, i: usize) -> Result<()> {
-        self.running[i].ckpt_done = true;
-        if !self.session_cache || !self.prompt_checkpoints {
-            return Ok(());
-        }
         let Some(slot) = self.free_slots.pop() else { return Ok(()) };
         let bs = self.limits().block_size;
         let s = &self.running[i];
         let n = s.computed;
         let blocks: Vec<u32> = s.blocks[..n.div_ceil(bs)].to_vec();
         let (src, sid, turns) = (s.slot as usize, s.sid, s.turns);
-        let tokens = s.req.prompt.clone();
+        let tokens = s.req.prompt[..n].to_vec();
         self.model.copy_slot(slot as usize, src)?;
         for &b in &blocks {
             self.refcnt[b as usize] += 1;
@@ -556,8 +558,8 @@ impl Engine {
                 self.running[i].snapshot_at = None;
                 self.snapshot(i)?;
             }
-            let s = &self.running[i];
-            if !s.ckpt_done && s.computed == s.req.prompt.len() {
+            if self.running[i].ckpt_at == Some(self.running[i].computed) {
+                self.running[i].ckpt_at = None;
                 self.checkpoint(i)?;
             }
         }
@@ -818,6 +820,11 @@ impl Engine {
             }
         }
         let (req, _) = self.waiting.remove(wi).unwrap();
+        let ckpt_at = if self.session_cache && self.prompt_checkpoints {
+            Some(req.prompt.len().saturating_sub(CKPT_BACKOFF) / bs * bs).filter(|&at| at > computed)
+        } else {
+            None
+        };
         self.cache.admitted += 1;
         if forked {
             self.cache.forks += 1;
@@ -827,7 +834,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_done: false });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at });
         Ok(true)
     }
 
@@ -963,7 +970,7 @@ impl Engine {
                 }
                 if !s.in_prefill && s.computed < s.req.prompt.len() {
                     let mut n = (s.req.prompt.len() - s.computed).min(budget);
-                    if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
+                    for at in [s.snapshot_at, s.ckpt_at].into_iter().flatten().filter(|&at| at > s.computed) {
                         n = n.min(at - s.computed);
                     }
                     plan.push((i, n));
@@ -1165,7 +1172,7 @@ impl Engine {
             }
             {
                 let mut n = (s.req.prompt.len() - s.computed).min(budget);
-                if let Some(at) = s.snapshot_at.filter(|&at| at > s.computed) {
+                for at in [s.snapshot_at, s.ckpt_at].into_iter().flatten().filter(|&at| at > s.computed) {
                     n = n.min(at - s.computed);
                 }
                 plan.push((i, n));

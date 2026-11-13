@@ -308,11 +308,14 @@ fn main() -> Result<()> {
     println!("session cache: turn 2 resumed from {reused} cached tokens; {same}/{} tokens identical to a cold prefill", cold.len());
     failed |= reused == 0 || same != cold.len();
 
-    // ---- 4b. prompt-end checkpoint: a request that extends the previous *prompt* with tokens
-    // other than the ones this engine generated (what a chat template re-render does) must
-    // resume from the checkpoint taken at the end of that prompt, and match a cold engine.
+    // ---- 4b. prompt checkpoint: a request that shares all but the last token of the previous
+    // *prompt* and continues with tokens other than the ones this engine generated (what a
+    // chat template re-render does) must resume from the checkpoint taken just before the end
+    // of that prompt, and match a cold engine.
     {
-        let turn2: Vec<u32> = ids.iter().copied().chain(ids[..ids.len().min(41)].iter().map(|&t| t ^ 5)).collect();
+        let cut = ids.len() - 1;
+        let ckpt = ids.len().saturating_sub(aq_engine::engine::CKPT_BACKOFF) / 16 * 16;
+        let turn2: Vec<u32> = ids[..cut].iter().copied().chain(ids[..ids.len().min(41)].iter().map(|&t| t ^ 5)).collect();
         // `overlap`: the second request arrives while the first is still generating, so the
         // checkpoint's last (partly filled) page is shared with a running sequence and must be
         // copied before the second request writes to it.
@@ -338,7 +341,7 @@ fn main() -> Result<()> {
         for overlap in [false, true] {
             let (warm, reused) = run(&mut eng, true, overlap)?;
             let (cold, _) = run(&mut eng, false, overlap)?;
-            let mut ok = reused == ids.len() as u64;
+            let mut ok = reused == ckpt as u64;
             let mut same_total = 0;
             for k in 0..2 {
                 let same = warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
@@ -364,9 +367,9 @@ fn main() -> Result<()> {
                 }
             }
             println!(
-                "prompt checkpoint{}: turn 2 resumed from {reused} of {} prompt tokens; {same_total}/40 tokens identical to a cold engine",
+                "prompt checkpoint{}: turn 2 resumed from {reused} of {} shared prompt tokens; {same_total}/40 tokens identical to a cold engine",
                 if overlap { " (first turn still running)" } else { "" },
-                ids.len()
+                cut
             );
             failed |= !ok;
         }
