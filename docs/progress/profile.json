@@ -1,13 +1,14 @@
 [
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "attention (prefill tiles)", "us_per_call": 6129, "share_pct": 41.6},
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "DeltaNet chunk scan", "us_per_call": 1318, "share_pct": 26.8},
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "DeltaNet chunk prep", "us_per_call": 535, "share_pct": 10.9},
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "conv1d", "us_per_call": 270, "share_pct": 5.5},
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "GEMMs (all)", "us_per_call": 61, "share_pct": 7.4},
- {"phase": "Prefill: 64 prompts of 1024 tokens, Qwen3.5-0.8B", "op": "everything else", "us_per_call": 0, "share_pct": 7.8},
- {"phase": "Decode: 256 sequences, short context, Qwen3.5-0.8B", "op": "DeltaNet decode", "us_per_call": 159, "share_pct": 38.9},
- {"phase": "Decode: 256 sequences, short context, Qwen3.5-0.8B", "op": "GEMMs (all)", "us_per_call": 21, "share_pct": 33.2},
- {"phase": "Decode: 256 sequences, short context, Qwen3.5-0.8B", "op": "attention (decode)", "us_per_call": 99, "share_pct": 8.1},
- {"phase": "Decode: 256 sequences, short context, Qwen3.5-0.8B", "op": "norms + SwiGLU + conv", "us_per_call": 14, "share_pct": 16.3},
- {"phase": "Decode: 256 sequences, short context, Qwen3.5-0.8B", "op": "argmax + misc", "us_per_call": 0, "share_pct": 3.5}
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "GEMMs (all, cuBLASLt)", "us_per_call": 0, "share_pct": 61.6},
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "RMSNorm", "us_per_call": 8.7, "share_pct": 10.1},
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "conv1d + DeltaNet", "us_per_call": 10.6, "share_pct": 8.4},
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "SwiGLU", "us_per_call": 6.7, "share_pct": 3.9},
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "attention (split-K + prep)", "us_per_call": 11.2, "share_pct": 4.6},
+ {"phase": "Decode: 1 sequence, 1k context, Qwen3.5-9B", "op": "everything else", "us_per_call": 0, "share_pct": 11.4},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "GEMMs (all, cuBLASLt)", "us_per_call": 0, "share_pct": 56.6},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "attention (split-K + prep)", "us_per_call": 30, "share_pct": 9.0},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "conv1d + DeltaNet", "us_per_call": 22, "share_pct": 12.0},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "RMSNorm", "us_per_call": 9.1, "share_pct": 7.1},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "SwiGLU", "us_per_call": 8.7, "share_pct": 3.4},
+ {"phase": "Decode: 32 sequences, 1k context, Qwen3.5-9B", "op": "everything else", "us_per_call": 0, "share_pct": 11.9}
 ]

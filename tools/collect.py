@@ -1,6 +1,7 @@
-"""Collect benchmark JSONs from ~/aq/results into one flat file for the progress page.
+"""Collect benchmark JSONs from ~/aq/results into flat files for the progress page.
 
     python -I tools/collect.py ~/aq/results > bench.json
+    python -I tools/collect.py ~/aq/results agentic > agentic.json
 
 Rows: engine, model, input_len, output_len, concurrency, output_tok_s, ttft_p50_ms,
 ttft_p99_ms, tpot_p50_ms, itl_p99_ms, run (file stem), gpu, date (file mtime, UTC).
@@ -40,6 +41,9 @@ def main():
                 "ttft_p99_ms": num(r["p99_ttft_ms"]),
                 "tpot_p50_ms": num(r["median_tpot_ms"]),
                 "itl_p99_ms": num(r["p99_itl_ms"]),
+                "ttft_p999_ms": num(r.get("p99.9_ttft_ms")),
+                "itl_p999_ms": num(r.get("p99.9_itl_ms")),
+                "tpot_p99_ms": num(r.get("p99_tpot_ms")),
                 "run": tag,
                 "gpu": "B200",
                 "date": datetime.datetime.fromtimestamp(os.path.getmtime(f), datetime.UTC).strftime("%Y-%m-%dT%H:%MZ"),
@@ -60,6 +64,9 @@ def main():
                     "ttft_p99_ms": num(r["p99_ttft_ms"]),
                     "tpot_p50_ms": num(r["median_tpot_ms"]),
                     "itl_p99_ms": num(r["p99_itl_ms"]),
+                    "ttft_p999_ms": num(r.get("p99.9_ttft_ms")),
+                    "itl_p999_ms": num(r.get("p99.9_itl_ms")),
+                    "tpot_p99_ms": num(r.get("p99_tpot_ms")),
                     "cold_start_loaded_s": num(r.get("cold_start_loaded_s")),
                     "cold_start_first_token_s": num(r.get("cold_start_first_token_s")),
                     "run": os.path.basename(f)[:-5],
@@ -68,6 +75,25 @@ def main():
                 }
             )
     rows.sort(key=lambda r: (r["model"], r["input_len"], r["engine"], r["concurrency"]))
+    # vLLM tail-latency reruns supersede the first vLLM runs of the same shape.
+    tail = {(r["model"], r["input_len"], r["concurrency"]) for r in rows if r["run"].startswith("vllm-tail")}
+    rows = [r for r in rows if not (r["engine"].startswith("vLLM") and not r["run"].startswith("vllm-tail")
+                                    and (r["model"], r["input_len"], r["concurrency"]) in tail)]
+    which = sys.argv[2] if len(sys.argv) > 2 else "bench"
+    if which == "agentic":
+        rows = []
+        for f in glob.glob(f"{root}/agentic/*/agents*.json"):
+            r = json.load(open(f))
+            rows.append({
+                "engine": r["engine"], "model": r["model"], "agents": r["agents"],
+                "turns_per_min": num(r["turns_per_min"]), "gen_tok_s": num(r["gen_tok_s"]),
+                "new_prompt_tok_s": num(r["new_prompt_tok_s"]), "mean_ctx": num(r["mean_ctx"]),
+                "ttft_p50_ms": num(r["ttft_ms"]["p50"]), "ttft_p99_ms": num(r["ttft_ms"]["p99"]),
+                "ttft_p999_ms": num(r["ttft_ms"]["p99.9"]), "itl_p50_ms": num(r["itl_ms"]["p50"]),
+                "itl_p99_ms": num(r["itl_ms"]["p99"]), "itl_p999_ms": num(r["itl_ms"]["p99.9"]),
+                "turns": r["turns"], "errors": r["errors"], "run": os.path.basename(os.path.dirname(f)),
+            })
+        rows.sort(key=lambda r: (r["model"], r["engine"], r["agents"]))
     json.dump(rows, sys.stdout, indent=1)
 
 
