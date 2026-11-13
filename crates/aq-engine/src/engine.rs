@@ -172,6 +172,8 @@ pub struct Engine {
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
     pub itl_target_us: Option<f64>,
     pace: Pace,
+    /// Set during an admission that may only evict sessions presumed finished.
+    dead_only: bool,
 }
 
 /// Online step-cost model for frame pacing.
@@ -207,6 +209,7 @@ impl Engine {
             policy: Policy::default(),
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
+            dead_only: false,
         }
     }
 
@@ -246,9 +249,25 @@ impl Engine {
         }
     }
 
+    fn is_dead(&self, i: usize, now: Instant) -> bool {
+        now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms
+    }
+
     /// Evict one parked session chosen by the policy (or, if none and snapshots are not
     /// pinned, the least-recently-used snapshot), returning its slot and pages.
+    /// With `self.dead_only`, only sessions presumed finished may go.
     fn evict_lru(&mut self) -> bool {
+        if self.dead_only {
+            let now = Instant::now();
+            let Some(i) = (0..self.parked.len()).filter(|&i| self.is_dead(i, now)).min_by_key(|&i| self.parked[i].parked_at) else {
+                return false;
+            };
+            let p = self.parked.swap_remove(i);
+            self.free_slots.push(p.slot);
+            self.release(p.blocks);
+            self.cache.evictions += 1;
+            return true;
+        }
         let victim = match self.policy.evict {
             Evict::Lru => (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used),
             Evict::Mru => (0..self.parked.len()).max_by_key(|&i| self.parked[i].last_used),
@@ -424,7 +443,11 @@ impl Engine {
             let Some(wi) = self.waiting.iter().position(|(r, _)| r.id == id) else { continue };
             let hit = self.find_parked(&self.waiting[wi].0.prompt).is_some();
             let allow_evict = !pol.load_control || hit || !not_aged || self.running.is_empty();
-            if !self.try_admit(wi, allow_evict)? {
+            // Without permission to evict live sessions, sessions presumed finished may still go.
+            self.dead_only = !allow_evict;
+            let ok = self.try_admit(wi, allow_evict);
+            self.dead_only = false;
+            if !ok? {
                 self.cache.deferred += 1;
             }
         }
@@ -433,26 +456,41 @@ impl Engine {
 
     /// Admit waiting request `wi`: resume a parked session that is a strict prefix of its
     /// prompt, else fork a shared-prefix snapshot, else start fresh. With `allow_evict` false
-    /// it only uses free slots and pages. Returns false (changing nothing) when resources are
-    /// not available.
+    /// it only uses free slots and pages plus those of sessions presumed finished (the caller
+    /// sets `dead_only` to match). Checks feasibility first and returns false, changing
+    /// nothing, when the request cannot fit even after the evictions it is allowed.
     fn try_admit(&mut self, wi: usize, allow_evict: bool) -> Result<bool> {
         let bs = self.limits().block_size;
         let req = &self.waiting[wi].0;
         let need = (req.prompt.len() + req.max_new_tokens).div_ceil(bs);
         let best = self.find_parked(&req.prompt);
         let fork = if best.is_none() { self.find_snapshot(&req.prompt) } else { None };
-        if !allow_evict {
+        {
+            // Feasibility before touching anything: free pages, plus (if eviction is allowed)
+            // the pages evicting other parked sessions would actually return (refcount 1).
+            // Without this, a request that cannot fit evicts the whole cache and then fails.
             let have = match (best, fork) {
                 (Some(i), _) => self.parked[i].blocks.len().min(need),
                 (None, Some(i)) => self.snapshots[i].blocks.len().min(need),
                 _ => 0,
             };
-            let slot_ok = best.is_some() || !self.free_slots.is_empty();
-            if !slot_ok || self.free_blocks.len() < need - have {
+            let mut avail = self.free_blocks.len();
+            let mut slots = self.free_slots.len();
+            let now = Instant::now();
+            for (k, p) in self.parked.iter().enumerate() {
+                if Some(k) == best || (!allow_evict && !self.is_dead(k, now)) {
+                    continue;
+                }
+                avail += p.blocks.iter().filter(|&&b| self.refcnt[b as usize] == 1).count();
+                slots += 1;
+            }
+            let slot_ok = best.is_some() || slots > 0;
+            if !slot_ok || avail < need - have {
                 return Ok(false);
             }
         }
         let mut snapshot_at = None;
+        let mut forked = false;
         let (slot, mut blocks, computed) = if let Some(i) = best {
             let p = self.parked.swap_remove(i);
             (p.slot, p.blocks, p.tokens.len())
@@ -483,7 +521,7 @@ impl Engine {
                 for &b in &blocks {
                     self.refcnt[b as usize] += 1;
                 }
-                self.cache.forks += 1;
+                forked = true;
                 (slot, blocks, n)
             } else {
                 self.model.reset_slot(slot as usize)?;
@@ -518,6 +556,9 @@ impl Engine {
         }
         let (req, _) = self.waiting.remove(wi).unwrap();
         self.cache.admitted += 1;
+        if forked {
+            self.cache.forks += 1;
+        }
         if computed > 0 {
             self.cache.hits += 1;
             self.cache.reused_tokens += computed as u64;
