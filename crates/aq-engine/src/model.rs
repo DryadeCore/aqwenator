@@ -487,7 +487,12 @@ impl Model {
             return Ok(());
         }
         self.set_lane_raw(0);
-        let prio = self.gpu.highest_priority()?;
+        // AQ_COEXEC_PRIO: stream priority of the decode lane (default: the device's highest;
+        // 0 = same priority as prefill).
+        let prio = match std::env::var("AQ_COEXEC_PRIO").ok().and_then(|v| v.parse::<i32>().ok()) {
+            Some(p) => p,
+            None => self.gpu.highest_priority()?,
+        };
         let lane = self.gpu.add_lane(prio)?;
         anyhow::ensure!(lane == 1, "decode lane must be lane 1");
         let mut l2 = self.limits;

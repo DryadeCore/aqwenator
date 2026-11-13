@@ -170,6 +170,10 @@ pub struct Engine {
     inflight: Option<Inflight>,
     /// Decode steps that ran while a prefill batch was in flight (co-execution).
     pub overlap_steps: u64,
+    /// Minimum time between decode steps while a prefill batch is in flight (AQ_COEXEC_PACE_US):
+    /// leaves the GPU to prefill between decode steps, trading inter-token latency for TTFT.
+    pub pace: std::time::Duration,
+    last_decode: Option<Instant>,
 }
 
 impl Engine {
@@ -199,6 +203,10 @@ impl Engine {
             coexec: false,
             inflight: None,
             overlap_steps: 0,
+            pace: std::time::Duration::from_micros(
+                std::env::var("AQ_COEXEC_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
+            last_decode: None,
         };
         if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
             eng.enable_coexec().expect("could not create the decode lane for AQ_COEXEC=1");
@@ -601,8 +609,21 @@ impl Engine {
             .map(|(i, s)| (i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ)))
             .collect();
         let decode_seqs = dplan.len();
+        if decode_seqs > 0 && self.inflight.is_some() && !self.pace.is_zero() {
+            // Pacing: give the in-flight prefill the GPU until the next decode step is due.
+            if let Some(last) = self.last_decode {
+                let due = last + self.pace;
+                while Instant::now() < due {
+                    if self.model.lane_done(0)? {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+        }
         let t1 = Instant::now();
         if decode_seqs > 0 {
+            self.last_decode = Some(t1);
             if self.inflight.is_some() {
                 self.overlap_steps += 1;
             }
