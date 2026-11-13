@@ -85,6 +85,11 @@ struct Inflight {
     sampled: Vec<u64>,
     ns: usize,
     tokens: usize,
+    /// Lane the batch runs on (0: co-execution's prefill lane; 1: the background prefill lane).
+    lane: usize,
+    /// Checkpoints tapped inside the batch: (request id, position, slot).
+    taps: Vec<(u64, usize, u32)>,
+    launched: Instant,
 }
 
 impl Seq {
@@ -282,6 +287,11 @@ pub struct Engine {
     /// AQ_TRACE=1: log one line per step (`[step]`: composition and GPU time) and one per
     /// request at its first token (`[req]`: queue wait, steps, time to first token).
     pub trace: bool,
+    /// Background prefill (AQ_BG_PREFILL=tokens, 0 = off): a prompt with at least this many
+    /// tokens left to prefill runs as one asynchronous batch on a second lane, while steps for
+    /// everyone else (decode, speculation, short prefills) continue. Keeps a long tool result
+    /// from stalling the sequences that are generating. Not combined with co-execution.
+    pub bg_prefill: usize,
     pub policy: Policy,
     /// Frame pacing: target duration of a step that carries decode tokens (µs).
     pub itl_target_us: Option<f64>,
@@ -334,12 +344,15 @@ impl Engine {
             mixed_prefill_adaptive: None,
             prompt_checkpoints: std::env::var("AQ_NO_CKPT").is_err(),
             trace: std::env::var("AQ_TRACE").as_deref() == Ok("1"),
+            bg_prefill: 0,
             policy: Policy::default(),
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
             dead_only: false,
         };
-        if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
+        if let Some(n) = std::env::var("AQ_BG_PREFILL").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
+            eng.enable_bg_prefill(n).expect("could not create the background prefill lane");
+        } else if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
             eng.enable_coexec().expect("could not create the decode lane for AQ_COEXEC=1");
         }
         eng
@@ -350,6 +363,84 @@ impl Engine {
         self.model.enable_decode_lane()?;
         self.coexec = true;
         Ok(())
+    }
+
+    /// Turn on background prefill for prompts with at least `min_tokens` left to prefill.
+    pub fn enable_bg_prefill(&mut self, min_tokens: usize) -> Result<()> {
+        if self.coexec {
+            bail!("background prefill and co-execution both need the second lane");
+        }
+        self.model.enable_prefill_lane()?;
+        self.bg_prefill = min_tokens;
+        Ok(())
+    }
+
+    /// Start the background prefill of the running sequence with the most prompt left, if it
+    /// has at least `bg_prefill` tokens to go and the lane is free.
+    fn launch_bg(&mut self) -> Result<()> {
+        let lim = self.limits();
+        let left = |s: &Seq| s.req.prompt.len().saturating_sub(s.computed);
+        let Some(i) = (0..self.running.len())
+            .filter(|&i| !self.running[i].in_prefill && left(&self.running[i]) >= self.bg_prefill)
+            .max_by_key(|&i| left(&self.running[i]))
+        else {
+            return Ok(());
+        };
+        let s = &self.running[i];
+        let (start, rem) = (s.computed, left(s));
+        let mut n = rem.min(lim.max_tokens);
+        if let Some(at) = s.snapshot_at.filter(|&at| at > start) {
+            n = n.min(at - start);
+        }
+        let mut tap = None;
+        if let Some(cp) = s.ckpt_at.filter(|&at| at > start) {
+            let c = start + (s.req.prompt.len() - CKPT_BACKOFF - start) / GDN_TC_CHUNK * GDN_TC_CHUNK;
+            if self.model.supports_tap() && n == rem && c > start && !self.free_slots.is_empty() {
+                tap = Some((c, self.free_slots.pop().unwrap()));
+            } else {
+                n = n.min(cp - start);
+            }
+        }
+        let (mut b, sampled) = self.build_batch(&[(i, n)])?;
+        if let Some((c, slot)) = tap {
+            b.seq_tap = vec![(((c - start) / GDN_TC_CHUNK) as u32, slot)];
+        }
+        // Whatever the main lane still has queued for this sequence (slot reset or copy, a
+        // page copy) must have run before the other lane reads it.
+        self.model.gpu.sync()?;
+        // AQ_BG_LANE=0 (debug): run the batch on the main lane through the same launch/collect path.
+        let lane: usize = std::env::var("AQ_BG_LANE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        self.model.set_lane(lane);
+        let ns = self.model.launch(&b);
+        self.model.set_lane(0);
+        let ns = ns?;
+        self.running[i].in_prefill = true;
+        let id = self.running[i].req.id;
+        self.inflight = Some(Inflight {
+            plan: vec![(id, n)],
+            sampled: sampled.iter().map(|&k| self.running[k].req.id).collect(),
+            ns,
+            tokens: n,
+            lane,
+            taps: tap.map(|(c, slot)| (id, c, slot)).into_iter().collect(),
+            launched: Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// Park the checkpoint a state tap wrote into `slot`: the state of running sequence `i`
+    /// at position `c`, with shared references to the KV pages below it.
+    fn park_tap(&mut self, i: usize, c: usize, slot: u32) {
+        let bs = self.limits().block_size;
+        let s = &mut self.running[i];
+        s.ckpt_at = None;
+        let blocks: Vec<u32> = s.blocks[..c.div_ceil(bs)].to_vec();
+        let (tokens, sid, turns) = (s.req.prompt[..c].to_vec(), s.sid, s.turns);
+        for &b in &blocks {
+            self.refcnt[b as usize] += 1;
+        }
+        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
+        self.cache.checkpoints += 1;
     }
 
     pub fn limits(&self) -> Limits {
@@ -720,13 +811,23 @@ impl Engine {
             let mut avail = self.free_blocks.len();
             let mut slots = self.free_slots.len();
             let now = Instant::now();
+            // A page comes back when every reference to it is held by an evictable parked
+            // entry (a session's checkpoint and its generation end share the prompt's pages).
+            // Counted only when the free pages alone do not cover the request.
+            let short = avail < need - have + 1;
+            let mut held: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for (k, p) in self.parked.iter().enumerate() {
                 if Some(k) == best || (!allow_evict && !self.evictable_restricted(k, now)) {
                     continue;
                 }
-                avail += p.blocks.iter().filter(|&&b| self.refcnt[b as usize] == 1).count();
+                if short {
+                    for &b in &p.blocks {
+                        *held.entry(b).or_insert(0) += 1;
+                    }
+                }
                 slots += 1;
             }
+            avail += held.iter().filter(|&(&b, &n)| self.refcnt[b as usize] == n).count();
             let slot_ok = best.is_some() || slots > 0;
             // One more page if the resumed entry ends inside a shared page (copied below).
             let cow = match best {
@@ -935,6 +1036,17 @@ impl Engine {
         for (&i, &tok) in sampled.iter().zip(toks) {
             let s = &mut self.running[i];
             s.out.push(tok);
+            if self.trace && s.out.len() == 1 {
+                eprintln!(
+                    "[req] id {} prompt {} reused {} wait_ms {:.1} ttft_ms {:.1} steps {}",
+                    s.req.id,
+                    s.req.prompt.len(),
+                    s.reused,
+                    s.t_admit.duration_since(s.t_add).as_secs_f64() * 1e3,
+                    s.t_add.elapsed().as_secs_f64() * 1e3,
+                    s.steps
+                );
+            }
             let stop = !s.req.ignore_eos && self.eos.contains(&tok);
             let finished = stop || s.out.len() >= s.req.max_new_tokens;
             events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
@@ -1024,6 +1136,9 @@ impl Engine {
                     sampled: sampled.iter().map(|&i| self.running[i].req.id).collect(),
                     ns,
                     tokens: b.tokens.len(),
+                    lane: 0,
+                    taps: Vec::new(),
+                    launched: Instant::now(),
                 });
             }
         }
@@ -1089,11 +1204,23 @@ impl Engine {
     /// Returns the batch's token count (0 if none was in flight).
     fn collect_inflight(&mut self, events: &mut Vec<TokenEvent>) -> Result<usize> {
         let Some(inf) = self.inflight.take() else { return Ok(0) };
-        let toks = self.model.collect(inf.ns)?;
+        let back = self.model.lane();
+        self.model.set_lane(inf.lane);
+        let toks = self.model.collect(inf.ns);
+        self.model.set_lane(back);
+        let toks = toks?;
+        if self.trace {
+            eprintln!("[bg] lane {} tokens {} ms {:.1}", inf.lane, inf.tokens, inf.launched.elapsed().as_secs_f64() * 1e3);
+        }
         for &(id, n) in &inf.plan {
             let i = self.index_of(id);
             self.running[i].computed += n;
             self.running[i].in_prefill = false;
+            self.running[i].steps += 1;
+        }
+        for &(id, c, slot) in &inf.taps {
+            let i = self.index_of(id);
+            self.park_tap(i, c, slot);
         }
         let idx: Vec<usize> = inf.plan.iter().map(|&(id, _)| self.index_of(id)).collect();
         self.after_step(idx.into_iter())?;
@@ -1129,6 +1256,22 @@ impl Engine {
         // Admit waiting requests while there is room to run them.
         self.clock += 1;
         self.admit()?;
+
+        // Background prefill: collect a finished batch, start the next long prompt.
+        let mut bg_events = Vec::new();
+        if self.bg_prefill > 0 {
+            if self.inflight.as_ref().is_some_and(|inf| inf.lane == 0) || (self.inflight.is_some() && self.model.lane_done(1)?) {
+                self.collect_inflight(&mut bg_events)?;
+            }
+            if self.inflight.is_none() {
+                self.launch_bg()?;
+                // AQ_BG_SYNC=1 (debug): wait for the batch right away, so the two lanes never overlap.
+                if self.inflight.is_some() && std::env::var("AQ_BG_SYNC").is_ok() {
+                    self.collect_inflight(&mut bg_events)?;
+                }
+            }
+        }
+        let bg_min = if self.bg_prefill > 0 { self.bg_prefill } else { usize::MAX };
 
         // Decode-path entries first (pending tokens + optional drafts), then prefill chunks in
         // admission order.
@@ -1196,7 +1339,14 @@ impl Engine {
             }
         }
         // Prefill order: admission order, or shortest remaining prefill first (SRPT).
-        let mut prefill: Vec<usize> = (0..self.running.len()).filter(|&i| self.running[i].computed < self.running[i].req.prompt.len()).collect();
+        // Prompts long enough for the background lane wait for it instead of taking main steps.
+        let mut prefill: Vec<usize> = (0..self.running.len())
+            .filter(|&i| {
+                let s = &self.running[i];
+                let left = s.req.prompt.len().saturating_sub(s.computed);
+                left > 0 && left < bg_min && !s.in_prefill
+            })
+            .collect();
         if self.policy.srpt {
             prefill.sort_by_key(|&i| self.running[i].req.prompt.len() - self.running[i].computed);
         }
@@ -1236,7 +1386,11 @@ impl Engine {
             room -= n;
         }
         if plan.is_empty() {
-            return Ok(Vec::new());
+            // Nothing for the main lane: wait for the background batch rather than spin.
+            if bg_events.is_empty() && self.inflight.is_some() {
+                self.collect_inflight(&mut bg_events)?;
+            }
+            return Ok(bg_events);
         }
 
         let mb = lim.max_blocks_per_seq();
@@ -1321,7 +1475,9 @@ impl Engine {
             self.pace.prefill_us_per_tok = 0.8 * self.pace.prefill_us_per_tok + 0.2 * per;
         }
 
-        let mut events = Vec::new();
+        // Tokens from a collected background batch come first: this step may already have
+        // decoded the next token of the same sequence.
+        let mut events = bg_events;
         let mut done = Vec::new();
         let eos = self.eos.clone();
         let mut st = self.spec;
@@ -1381,17 +1537,8 @@ impl Engine {
         }
         self.spec = st;
         // Tapped checkpoints: the tap slot holds the state at `c`; park it with the pages below.
-        let bs = lim.block_size;
         for &(k, c, slot) in &taps {
-            let s = &mut self.running[plan[k].0];
-            s.ckpt_at = None;
-            let blocks: Vec<u32> = s.blocks[..c.div_ceil(bs)].to_vec();
-            let (tokens, sid, turns) = (s.req.prompt[..c].to_vec(), s.sid, s.turns);
-            for &b in &blocks {
-                self.refcnt[b as usize] += 1;
-            }
-            self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
-            self.cache.checkpoints += 1;
+            self.park_tap(plan[k].0, c, slot);
         }
         self.after_step(plan.iter().map(|&(i, _)| i))?;
         self.retire(done);

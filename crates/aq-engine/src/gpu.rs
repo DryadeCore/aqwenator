@@ -78,6 +78,11 @@ impl Gpu {
         Ok(self.ctx.stream_priority_range().map_err(de)?.greatest())
     }
 
+    /// Lowest scheduling priority this device supports.
+    pub fn lowest_priority(&self) -> Result<i32> {
+        Ok(self.ctx.stream_priority_range().map_err(de)?.least())
+    }
+
     /// Make `lane` the target of every subsequent enqueue (kernels, copies, GEMMs, graphs).
     pub fn set_lane(&mut self, lane: usize) {
         if lane != self.lane {

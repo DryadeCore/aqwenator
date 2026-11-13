@@ -1656,15 +1656,17 @@ pub mod kernels {
 
     /// FlashAttention-2-style causal GQA prefill attention on tensor cores, gate fused.
     ///
-    /// One block per (query tile of up to 16 tokens of one sequence, KV head). The block has one
-    /// warp per query head of the KV group (`n_heads / n_kv` warps), so each K/V tile loaded into
-    /// shared memory is used by every query head that shares it. Warp `w` owns the 16 x 256 output
-    /// rows of head `kv * group + w`: `S = Q K^T` and `O += P V` run as m16n8k16 MMAs with operands
+    /// One block per (query tile of up to `16 * QT` tokens of one sequence, KV head), with
+    /// `QT = blockDim / (32 * group)` sub-tiles of 16 tokens. The block has one warp per (sub-tile,
+    /// query head of the KV group), so each K/V tile loaded into shared memory is used by every
+    /// query head that shares it and by `QT * 16` tokens: at long context this kernel is bound by
+    /// K/V traffic, which a larger QT divides. Warp `w` owns the 16 x 256 output rows of head
+    /// `kv * group + w % group` for tokens `16 * (w / group)..+16` of the tile: `S = Q K^T` and `O += P V` run as m16n8k16 MMAs with operands
     /// fed by `ldmatrix` from XOR-swizzled shared tiles; K/V tiles of 32 keys arrive by `cp.async`.
     /// Softmax is online (exp2 with the scale folded in); P is rounded to bf16 for the PV MMA.
     ///
-    /// Dynamic shared memory: `(group * 16 + 2 * 32) * 256 * 2` bytes (64 KiB for group 4).
-    /// grid = (n_tiles, n_kv), block = (32 * group).
+    /// Dynamic shared memory: `(QT * group * 16 + 2 * 32) * 256 * 2` bytes (64 KiB for group 4,
+    /// QT 1). grid = (n_tiles, n_kv), block = (32 * group * QT).
     #[kernel]
     pub unsafe fn attention_tc(
         q: *const u16,
@@ -1705,7 +1707,10 @@ pub mod kernels {
         let h = n_heads as usize;
         let hkv = n_kv as usize;
         let grp = h / hkv;
-        let head = kv * grp + warp_id;
+        let nwarps = nthreads / 32;
+        let head = kv * grp + warp_id % grp;
+        // First token (within the tile) of this warp's 16-token sub-tile.
+        let qoff = (warp_id / grp) * 16;
         let t0 = unsafe { *tile_start.add(tile) } as usize;
         let nq = unsafe { *tile_len.add(tile) } as usize;
         let pos0 = unsafe { *tok_pos.add(t0) } as usize;
@@ -1714,20 +1719,20 @@ pub mod kernels {
         let n_keys = pos0 + nq;
 
         let qs = smem;
-        let ks = unsafe { smem.add(grp * 16 * D) };
+        let ks = unsafe { smem.add(nwarps * 16 * D) };
         let vs = unsafe { ks.add(KT * D) };
 
-        // Q tile: grp * 16 rows (warp w -> rows 16w..16w+16 = tokens of head kv*grp + w).
-        let qrows = grp * 16;
+        // Q tile: nwarps * 16 rows (warp w -> rows 16w..16w+16 = its sub-tile's tokens, its head).
+        let qrows = nwarps * 16;
         let mut i = tid;
         while i < qrows * CH {
             let row = i / CH;
             let c = i % CH;
             let w = row / 16;
-            let r = row % 16;
+            let r = (w / grp) * 16 + row % 16;
             let dst = unsafe { qs.add(sw256(row, c)) } as *mut u32;
             if r < nq {
-                let src = unsafe { q.add(((t0 + r) * h + kv * grp + w) * D + c * 8) } as *const u32;
+                let src = unsafe { q.add(((t0 + r) * h + kv * grp + w % grp) * D + c * 8) } as *const u32;
                 unsafe { cp_async_cg_16(dst, src) };
             } else {
                 unsafe { cp_async_cg_zfill_16(dst, q as *const u8, 0) };
@@ -1740,8 +1745,8 @@ pub mod kernels {
         let tq = lane % 4; // column pair
         let lm = lane / 8; // which of the 4 ldmatrix sub-matrices this lane addresses
         let lr = lane % 8; // row within that sub-matrix
-        let row_a = g; // token index of accumulator regs 0,1
-        let row_b = g + 8; // token index of accumulator regs 2,3
+        let row_a = qoff + g; // token index (within the tile) of accumulator regs 0,1
+        let row_b = qoff + g + 8; // token index of accumulator regs 2,3
 
         let mut acc = [[0.0f32; 4]; 32];
         let mut m_a = -1.0e30f32;

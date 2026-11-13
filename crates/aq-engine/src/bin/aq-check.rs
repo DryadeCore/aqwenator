@@ -429,6 +429,8 @@ fn main() -> Result<()> {
         // runs GEMMs under a different row cap (so different plans).
         let coexec_saved = eng.coexec;
         eng.coexec = false;
+        // Same for background prefill: which sequences share a batch would depend on timing.
+        let bg_saved = std::mem::replace(&mut eng.bg_prefill, 0);
         eng.session_cache = false;
         eng.clear_cache();
         eng.model.attn_split_keys = 64;
@@ -495,6 +497,7 @@ fn main() -> Result<()> {
         }
         (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m) = saved;
         eng.coexec = coexec_saved;
+        eng.bg_prefill = bg_saved;
     }
 
     // ---- 7. memory pressure: shrink the page pool to about two sessions, then interleave
@@ -508,9 +511,10 @@ fn main() -> Result<()> {
         eng.withhold_pages(free_now.saturating_sub(per * 2 + per / 2));
         let pre = (ids.len() - 64) / 16 * 16;
         let prompt = |k: u32| -> Vec<u32> { ids[..pre].iter().copied().chain(ids[pre..].iter().map(|&t| t ^ k)).collect() };
-        let run = |eng: &mut Engine, cached: bool| -> Result<Vec<Vec<u32>>> {
+        let run = |eng: &mut Engine, cached: bool| -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
             eng.session_cache = cached;
             let mut outs: Vec<Vec<u32>> = vec![Vec::new(); 6];
+            let mut prompts: Vec<Vec<u32>> = vec![Vec::new(); 6];
             // Turn 1 for all three, two at a time; turn 2 extends each with its own output.
             for (k, round) in [[0u32, 1], [2, 0], [1, 2]].iter().enumerate() {
                 for &a in round.iter() {
@@ -524,6 +528,7 @@ fn main() -> Result<()> {
                         p
                     };
                     let id = if first { a as u64 } else { 3 + a as u64 };
+                    prompts[id as usize] = p.clone();
                     eng.add(Request { id: 300 + id, prompt: p, max_new_tokens: 8, ignore_eos: true })?;
                 }
                 let _ = k;
@@ -533,13 +538,38 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            Ok(outs)
+            Ok((outs, prompts))
         };
         let before = eng.cache;
-        let warm = run(&mut eng, true)?;
+        let (warm, _) = run(&mut eng, true)?;
         let after = eng.cache;
-        let cold = run(&mut eng, false)?;
-        let ok = warm == cold;
+        let (cold, prompts) = run(&mut eng, false)?;
+        let mut ok = true;
+        for k in 0..6 {
+            let same = warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
+            if same == cold[k].len() && warm[k].len() == cold[k].len() {
+                continue;
+            }
+            // Turn-2 prompts quote the session's own turn-1 output: if turn 1 already diverged
+            // (classified above), the two runs were given different turn-2 prompts.
+            if k >= 3 && warm[k - 3][..7] != cold[k - 3][..7] {
+                println!("  memory pressure request {k}: not comparable (its turn 1 diverged at a near-tie)");
+                continue;
+            }
+            // Classify the divergence by the cold logits' top-2 margin at that position.
+            let p: Vec<u32> = prompts[k].iter().chain(&cold[k][..same]).copied().collect();
+            eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+            while eng.has_work() {
+                eng.step()?;
+            }
+            let (_, a, b) = top2(&eng.model.logits()?);
+            if a - b < NEAR_TIE {
+                println!("  memory pressure request {k}: identical for {same} tokens, then diverges at a near-tie (margin {:.3}): ok", a - b);
+            } else {
+                ok = false;
+                println!("  memory pressure request {k}: diverges after {same} tokens where the margin is {:.3}: REAL MISMATCH", a - b);
+            }
+        }
         println!(
             "memory pressure: {} evictions, {} hits during the run; 6 requests {}",
             after.evictions - before.evictions,

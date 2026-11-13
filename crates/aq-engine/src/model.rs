@@ -220,6 +220,8 @@ pub struct Model {
     cur_nd_rows: usize,
     /// This step has at least one state tap (set by `upload`).
     cur_tap: bool,
+    /// Logits buffer of the last step that sampled, whichever lane ran it.
+    last_logits: u64,
     /// Fixed decode-attention slice size in use this step (0 = slices sized per step).
     cur_split_keys: u32,
     /// Fixed decode-attention slice size (keys); 0 = size slices from the batch. Fixed slices
@@ -237,6 +239,9 @@ pub struct Model {
     tile_attn: bool,
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
+    /// 16-token sub-tiles per `attention_tc` block (AQ_ATTN_QT, default 2): each K/V tile a
+    /// block loads serves `16 * attn_qt` query tokens.
+    attn_qt: usize,
     cc_gdn: bool,
     /// Rows of the active lane's scratch: the GEMM row cap and the per-step token limit.
     s_cap: usize,
@@ -321,10 +326,10 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool) ->
     })
 }
 
-/// Shared-memory bytes of `attention_tc`: Q rows (16 per query head of the group) plus one
-/// 32-key K tile and one V tile, all 256-wide bf16.
-fn attention_tc_smem(group: usize) -> u32 {
-    ((group * 16 + 2 * 32) * 256 * 2) as u32
+/// Shared-memory bytes of `attention_tc`: Q rows (16 per sub-tile and query head of the group)
+/// plus one 32-key K tile and one V tile, all 256-wide bf16.
+fn attention_tc_smem(group: usize, qt: usize) -> u32 {
+    ((qt * group * 16 + 2 * 32) * 256 * 2) as u32
 }
 
 /// Padded batch sizes that get a captured decode graph.
@@ -450,7 +455,14 @@ impl Model {
         gpu.sync()?;
         let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
         let num_sms = gpu.num_sms()?;
-        let attn_tc_smem = attention_tc_smem(cfg.num_attention_heads / cfg.num_key_value_heads);
+        let grp = cfg.num_attention_heads / cfg.num_key_value_heads;
+        // Sub-tiles per block: capped by 1024 threads and 100 KiB of shared memory (the most a
+        // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
+        let mut attn_qt: usize = std::env::var("AQ_ATTN_QT").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4);
+        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt) > 100 << 10) {
+            attn_qt -= 1;
+        }
+        let attn_tc_smem = attention_tc_smem(grp, attn_qt);
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
             attn_tc_smem,
@@ -477,6 +489,7 @@ impl Model {
             cur_splits: 1,
             cur_nd_rows: 0,
             cur_tap: false,
+            last_logits: 0,
             cur_split_keys: 0,
             attn_split_keys: std::env::var("AQ_ATTN_SPLIT_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             num_sms,
@@ -485,6 +498,7 @@ impl Model {
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
+            attn_qt,
             cc_gdn,
             s_cap: lim.max_rows(),
             alt: None,
@@ -517,6 +531,34 @@ impl Model {
         self.alt = Some(LaneState {
             s,
             cap: l2.max_rows(),
+            graphs: Default::default(),
+            cur_chunks: 0,
+            cur_tiles: 0,
+            cur_splits: 1,
+            cur_nd_rows: 0,
+            cur_split_keys: 0,
+        });
+        Ok(())
+    }
+
+    /// Create a background prefill lane: a second, low-priority stream with its own cuBLASLt
+    /// workspace and full-size scratch, so a long prompt can be prefilled while steps for the
+    /// other sequences keep running on lane 0.
+    pub fn enable_prefill_lane(&mut self) -> Result<()> {
+        if self.alt.is_some() {
+            return Ok(());
+        }
+        self.set_lane_raw(0);
+        let prio = self.gpu.lowest_priority()?;
+        let lane = self.gpu.add_lane(prio)?;
+        anyhow::ensure!(lane == 1, "prefill lane must be lane 1");
+        let lim = self.limits;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &lim, self.cc_gdn)?;
+        self.gpu.sync()?;
+        self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
+        self.alt = Some(LaneState {
+            s,
+            cap: lim.max_rows(),
             graphs: Default::default(),
             cur_chunks: 0,
             cur_tiles: 0,
@@ -860,11 +902,12 @@ impl Model {
                 o += chunk;
             }
             cn.push(cs.len() as u32 - *c0.last().unwrap());
+            let qtile = if self.tile_attn || self.ref_attn { ATTN_QTILE } else { ATTN_QTILE * self.attn_qt };
             let mut o = 0;
             while o < len {
                 ts.push((start + o) as u32);
-                tl.push((len - o).min(ATTN_QTILE) as u32);
-                o += ATTN_QTILE;
+                tl.push((len - o).min(qtile) as u32);
+                o += qtile;
             }
         }
         self.cur_chunks = cs.len();
@@ -1348,7 +1391,7 @@ impl Model {
                         let grp = (h / hkv) as u32;
                         let launch = cuda_core::LaunchConfig {
                             grid_dim: (self.cur_tiles as u32, hkv, 1),
-                            block_dim: (32 * grp, 1, 1),
+                            block_dim: (32 * grp * self.attn_qt as u32, 1, 1),
                             shared_mem_bytes: self.attn_tc_smem,
                         };
                         unsafe {
@@ -1450,6 +1493,7 @@ impl Model {
         if ns == 0 {
             return Ok(());
         }
+        self.last_logits = s.logits;
         unsafe {
             g.k.final_norm_rows(
                 &st,
@@ -1488,7 +1532,8 @@ impl Model {
 
     /// Logits of the first sampled row of the last step.
     pub fn logits(&self) -> Result<Vec<f32>> {
-        let v: Vec<u16> = self.gpu.download(self.s.logits, self.cfg.vocab_size)?;
+        let src = if self.last_logits != 0 { self.last_logits } else { self.s.logits };
+        let v: Vec<u16> = self.gpu.download(src, self.cfg.vocab_size)?;
         Ok(v.into_iter().map(|b| bf16::from_bits(b).to_f32()).collect())
     }
 
