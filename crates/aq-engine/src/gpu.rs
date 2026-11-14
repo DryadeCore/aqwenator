@@ -25,6 +25,9 @@ pub struct Gpu {
     pub lt: CublasLt,
     allocs: Vec<u64>,
     pub allocated_bytes: usize,
+    /// Page-locked staging buffers of the weight loader (`upload_bytes`), freed by
+    /// `free_staging` once loading is done.
+    stage: Vec<usize>,
     /// True between `begin_capture` and `end_capture`.
     pub capturing: std::cell::Cell<bool>,
     /// Smallest GEMM M bucket (0 = none). Pinning every GEMM below this size to one plan makes
@@ -51,6 +54,7 @@ impl Gpu {
             k,
             lt,
             allocs: vec![ws],
+            stage: Vec::new(),
             allocated_bytes: WORKSPACE_BYTES,
             capturing: Default::default(),
             gemm_min_m: 0,
@@ -104,6 +108,84 @@ impl Gpu {
         self.allocs.push(p);
         self.allocated_bytes += bytes;
         Ok(p)
+    }
+
+    /// Allocate `bytes` (rounded up to 256) of device memory without zeroing it: for buffers
+    /// the caller overwrites completely (weights).
+    pub fn alloc_uninit(&mut self, bytes: usize) -> Result<u64> {
+        let bytes = bytes.max(1).next_multiple_of(256);
+        let p = unsafe { memory::malloc_sync(bytes) }.map_err(de)?;
+        self.allocs.push(p);
+        self.allocated_bytes += bytes;
+        Ok(p)
+    }
+
+    /// Fast host-to-device copy of a large pageable source (an mmapped checkpoint): reader
+    /// threads fill page-locked staging buffers in parallel (page faults and disk reads
+    /// happen there), and this thread copies each filled buffer to the device. A plain
+    /// `cuMemcpyHtoD` from pageable memory stages through the driver on one thread, which
+    /// measured 0.35-0.5 GB/s on the DGX Spark.
+    ///
+    /// Synchronous copies, not ordered with the compute stream: the caller must have synced
+    /// after anything it queued that touches `dst`.
+    pub fn upload_bytes(&mut self, dst: u64, src: &[u8]) -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        const STAGE_BYTES: usize = 32 << 20;
+        const STAGE_BUFS: usize = 8;
+        if src.len() < (1 << 20) || std::env::var("AQ_SLOW_LOAD").is_ok() {
+            self.upload(dst, src)?;
+            return self.sync();
+        }
+        while self.stage.len() < STAGE_BUFS {
+            self.stage.push(unsafe { memory::malloc_host(STAGE_BYTES) }.map_err(de)? as usize);
+        }
+        let pieces = src.len().div_ceil(STAGE_BYTES);
+        let next = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::channel::<(usize, usize)>();
+        let stage = &self.stage;
+        std::thread::scope(|sc| {
+            let mut back = Vec::new();
+            for (bi, &buf) in stage.iter().enumerate().take(pieces) {
+                let (btx, brx) = mpsc::channel::<()>();
+                back.push(btx);
+                let tx = tx.clone();
+                let next = &next;
+                sc.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= pieces {
+                            break;
+                        }
+                        let part = &src[i * STAGE_BYTES..((i + 1) * STAGE_BYTES).min(src.len())];
+                        // SAFETY: `buf` is this thread's own STAGE_BYTES staging buffer.
+                        unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), buf as *mut u8, part.len()) };
+                        // The buffer is reused only after the main thread has copied it out.
+                        if tx.send((bi, i)).is_err() || brx.recv().is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            let mut res = Ok(());
+            for (bi, i) in rx {
+                if res.is_ok() {
+                    let off = i * STAGE_BYTES;
+                    let len = STAGE_BYTES.min(src.len() - off);
+                    res = unsafe { memory::memcpy_htod_sync(dst + off as u64, stage[bi] as *const u8, len) }.map_err(de);
+                }
+                let _ = back[bi].send(());
+            }
+            res
+        })
+    }
+
+    /// Release the weight loader's staging buffers.
+    pub fn free_staging(&mut self) {
+        for p in self.stage.drain(..) {
+            let _ = unsafe { memory::free_host(p as *mut c_void) };
+        }
     }
 
     /// Host-to-device copy, enqueued on the compute stream so it is ordered after every kernel

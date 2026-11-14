@@ -345,12 +345,16 @@ fn concat_bf16(gpu: &mut Gpu, ck: &Checkpoint, names: &[String]) -> Result<u64> 
 fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize) -> Result<u64> {
     let views = names.iter().map(|n| ck.bf16(n)).collect::<Result<Vec<_>>>()?;
     let total: usize = views.iter().map(|v| v.bytes.len()).sum::<usize>() + pad_bytes;
-    let p = gpu.alloc(total)?;
-    gpu.sync()?;
+    // Not zeroed: the uploads overwrite everything but the padding.
+    let p = gpu.alloc_uninit(total)?;
     let mut off = 0u64;
     for v in views {
-        gpu.upload(p + off, v.bytes)?;
+        gpu.upload_bytes(p + off, v.bytes)?;
         off += v.bytes.len() as u64;
+    }
+    if pad_bytes > 0 {
+        gpu.zero(p + off, pad_bytes)?;
+        gpu.sync()?;
     }
     Ok(p)
 }
@@ -382,6 +386,8 @@ impl Model {
         }
         let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        // Seconds spent allocating and zeroing recurrent state and KV pages (not weights).
+        let mut state_s = 0.0f64;
         for l in 0..cfg.num_hidden_layers {
             let n = |s: &str| format!("{P}layers.{l}.{s}");
             let kind = cfg.kind(l);
@@ -421,8 +427,11 @@ impl Model {
                     layer.dt_bias = gpu.alloc_upload(&ck.f32_vec(&la("dt_bias"))?)?;
                     layer.gnorm = gpu.alloc_upload(&ck.f32_vec(&la("norm.weight"))?)?;
                     layer.out_proj = concat_bf16(&mut gpu, &ck, &[la("out_proj.weight")])?;
+                    let t = Instant::now();
                     layer.delta_state = gpu.alloc((lim.max_seqs + 1) * hv * 128 * 128 * 4)?;
                     layer.conv_state = gpu.alloc((lim.max_seqs + 1) * cfg.conv_dim() * 3 * 2)?;
+                    gpu.sync()?;
+                    state_s += t.elapsed().as_secs_f64();
                 }
                 LayerKind::Full => {
                     let sa = |s: &str| n(&format!("self_attn.{s}"));
@@ -434,13 +443,23 @@ impl Model {
                     layer.q_norm = gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?;
                     layer.k_norm = gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?;
                     layer.o_proj = concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?;
+                    let t = Instant::now();
                     layer.k_cache = gpu.alloc(kv_bytes)?;
                     layer.v_cache = gpu.alloc(kv_bytes)?;
+                    gpu.sync()?;
+                    state_s += t.elapsed().as_secs_f64();
                 }
             }
             layers.push(layer);
         }
         let weight_bytes = gpu.allocated_bytes;
+        gpu.sync()?;
+        gpu.free_staging();
+        let layers_s = t1.elapsed().as_secs_f64();
+        eprintln!(
+            "load: open {open_s:.2}s, weights {:.2}s, state+KV alloc {state_s:.2}s",
+            layers_s - state_s
+        );
         eprintln!(
             "memory: {:.2} GiB weights+state+KV ({} KV pages = {} tokens, {} state slots of {:.1} MiB)",
             weight_bytes as f64 / (1u64 << 30) as f64,
@@ -471,6 +490,7 @@ impl Model {
         gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
         let upload_s = t1.elapsed().as_secs_f64();
+        eprintln!("load: scratch + kernel setup {:.2}s", upload_s - layers_s);
         Ok(Self {
             cfg,
             gpu,

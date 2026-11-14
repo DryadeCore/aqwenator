@@ -32,6 +32,9 @@ impl Checkpoint {
         for (fi, p) in paths.iter().enumerate() {
             let f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
             let mmap = unsafe { Mmap::map(&f)? };
+            // Start reading the whole shard now: the loader touches all of it within seconds.
+            #[cfg(unix)]
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
             let (header_len, meta) = SafeTensors::read_metadata(&mmap)?;
             let base = 8 + header_len;
             for (name, info) in meta.tensors() {
