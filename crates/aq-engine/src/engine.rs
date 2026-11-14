@@ -20,7 +20,7 @@
 //! copy plus shared read-only pages. Exact, because no sequence ever writes below its own
 //! `computed` position, so shared pages are never written.
 
-use crate::draft::DraftIndex;
+use crate::draft::{DraftIndex, NgramModel};
 use crate::model::{Batch, GDN_TC_CHUNK, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
@@ -65,6 +65,10 @@ struct Seq {
     turns: u32,
     /// Session id: parked entries left by the same chain of turns share it.
     sid: u64,
+    /// Draft tokens this sequence may carry next step: `spec_k` normally, doubled (up to the
+    /// row limit) after a step that accepted a full draft, because copy runs are long and a
+    /// longer draft only pays while they last.
+    k_cur: usize,
     /// When the request was submitted and admitted, and the steps it took part in before its
     /// first token (AQ_TRACE request log).
     t_add: Instant,
@@ -217,6 +221,9 @@ pub struct SpecStats {
     /// Decode entries that emitted tokens (with or without drafts) and tokens they emitted.
     pub decode_entries: u64,
     pub emitted: u64,
+    /// Draft tokens that came from the cross-session model (the rest: prompt lookup).
+    pub global_drafted: u64,
+    pub global_accepted: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -258,6 +265,14 @@ pub struct Engine {
     pub spec_max_ngram: usize,
     pub spec_min_ngram: usize,
     pub spec: SpecStats,
+    /// Cross-session draft model: extends (or supplies) drafts with what the server's own
+    /// earlier generations most often produced after the same few tokens. On unless
+    /// AQ_NO_GLOBAL_DRAFT is set.
+    pub global_draft: bool,
+    global: NgramModel,
+    /// Grow a sequence's draft length while its drafts are fully accepted (off with
+    /// AQ_NO_SPEC_ADAPT).
+    pub spec_adaptive: bool,
     /// Max prefill tokens in a step that also carries decode tokens. Bounds how long a running
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
@@ -333,6 +348,9 @@ impl Engine {
             spec_max_ngram: 4,
             spec_min_ngram: 2,
             spec: SpecStats::default(),
+            global_draft: std::env::var("AQ_NO_GLOBAL_DRAFT").is_err(),
+            global: NgramModel::new(2, 4),
+            spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
             mixed_prefill_budget: usize::MAX,
             coexec: false,
             inflight: None,
@@ -970,13 +988,15 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed, k_cur: 0 });
         Ok(true)
     }
 
     /// Prompt-lookup draft for running sequence `i`: what followed the most recent earlier
     /// occurrence of the longest suffix n-gram of its known tokens (see [`DraftIndex`]).
-    fn draft(&mut self, i: usize, k: usize) -> Vec<u32> {
+    /// Returns the draft and how many of its leading tokens came from the prompt lookup; the
+    /// rest were added by the cross-session model.
+    fn draft(&mut self, i: usize, k: usize) -> (Vec<u32>, usize) {
         let (min_n, max_n) = (self.spec_min_ngram, self.spec_max_ngram);
         let s = &mut self.running[i];
         let mut idx = match s.draft.take() {
@@ -986,9 +1006,15 @@ impl Engine {
         for p in idx.len()..s.known() {
             idx.push(s.token_at(p));
         }
-        let d = idx.draft(k);
+        let mut d = idx.draft(k);
         s.draft = Some(idx);
-        d
+        let local = d.len();
+        if self.global_draft && d.len() < k {
+            let n = s.known();
+            let tail: Vec<u32> = (n.saturating_sub(4)..n).map(|p| s.token_at(p)).collect();
+            self.global.extend(&tail, &mut d, k);
+        }
+        (d, local)
     }
 
     fn ensure_blocks(&mut self, si: usize, upto: usize) -> Result<()> {
@@ -1277,6 +1303,7 @@ impl Engine {
         // admission order.
         let mut plan: Vec<(usize, usize)> = Vec::new(); // (running index, n tokens)
         let mut drafts: Vec<Vec<u32>> = Vec::new(); // per decode entry
+        let mut draft_local: Vec<usize> = Vec::new(); // leading tokens from the prompt lookup
         for i in 0..self.running.len() {
             let s = &self.running[i];
             if s.computed < s.req.prompt.len() || budget == 0 {
@@ -1285,10 +1312,12 @@ impl Engine {
             let pending = s.known() - s.computed;
             let rem = s.req.max_new_tokens - s.out.len();
             let mut d = Vec::new();
+            let mut local = 0;
             if self.spec_k > 0 && rem > 1 {
-                let kmax = self.spec_k.min(rem - 1).min(MAX_DECODE_ROWS_PER_SEQ.saturating_sub(pending));
+                let k_cur = s.k_cur.max(self.spec_k);
+                let kmax = k_cur.min(rem - 1).min(MAX_DECODE_ROWS_PER_SEQ.saturating_sub(pending));
                 if kmax > 0 {
-                    d = self.draft(i, kmax);
+                    (d, local) = self.draft(i, kmax);
                 }
             }
             if !d.is_empty() && self.running[i].spare.is_none() {
@@ -1310,6 +1339,7 @@ impl Engine {
             // (`Limits::max_rows`), so speculation never changes how much prefill fits.
             let n = pending + d.len();
             plan.push((i, n));
+            draft_local.push(local.min(d.len()));
             drafts.push(d);
             budget -= 1;
         }
@@ -1492,6 +1522,7 @@ impl Engine {
                 s.computed += n;
             } else if m == d.len() {
                 // Every draft accepted: the spare slot holds the state after all n tokens.
+                s.k_cur = if self.spec_adaptive && d.len() >= s.k_cur.max(self.spec_k) { (2 * d.len()).min(MAX_DECODE_ROWS_PER_SEQ - 1) } else { 0 };
                 s.computed += n;
                 let old = s.slot;
                 s.slot = s.spare.unwrap();
@@ -1499,17 +1530,27 @@ impl Engine {
             }
             // else: rejection. The old slot still holds the state before this step; the
             // accepted tokens become pending and are fed again next step.
+            if !d.is_empty() && m < d.len() {
+                s.k_cur = 0;
+            }
             if k < decode_seqs && nr > 0 {
                 st.decode_entries += 1;
                 if !d.is_empty() {
                     st.spec_entries += 1;
                     st.drafted += d.len() as u64;
                     st.accepted += m as u64;
+                    st.global_drafted += (d.len() - draft_local[k]) as u64;
+                    st.global_accepted += m.saturating_sub(draft_local[k]) as u64;
                 }
             }
             let mut finished = false;
             for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
                 s.out.push(tok);
+                if self.global_draft {
+                    let n = s.known() - 1;
+                    let ctx: Vec<u32> = (n.saturating_sub(4)..n).map(|p| s.token_at(p)).collect();
+                    self.global.observe(&ctx, tok);
+                }
                 if self.trace && s.out.len() == 1 {
                     eprintln!(
                         "[req] id {} prompt {} reused {} wait_ms {:.1} ttft_ms {:.1} steps {}",

@@ -128,6 +128,95 @@ impl DraftIndex {
     }
 }
 
+/// Cross-session next-token model for drafting text a sequence has not produced before but
+/// the server has: tool-call syntax, section headers, stock phrases. Agents repeat these
+/// across turns and sessions, and the per-sequence prompt lookup cannot draft them the first
+/// time they appear in a session.
+///
+/// For every context of `min_n..=max_n` generated tokens it keeps a majority-vote candidate
+/// for the token that follows (Boyer-Moore: the candidate's lead over everything else), so
+/// memory is one entry per distinct context. A prediction is offered only when the candidate
+/// leads by `MIN_LEAD` and has won most of its contests, because a draft row is not free: at
+/// long context it costs KV traffic for every sequence in the step.
+pub struct NgramModel {
+    /// One table per context length, `min_n` first.
+    tables: Vec<HashMap<u64, Vote, BuildHasherDefault<Passthrough>>>,
+    min_n: usize,
+    max_n: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Vote {
+    tok: u32,
+    /// The candidate's lead (majority-vote counter).
+    lead: u32,
+    /// Times this context was seen, and times the current candidate followed it.
+    seen: u32,
+    hits: u32,
+}
+
+const MIN_LEAD: u32 = 2;
+
+impl NgramModel {
+    pub fn new(min_n: usize, max_n: usize) -> Self {
+        let min_n = min_n.max(1);
+        Self { tables: (min_n..=max_n.max(min_n)).map(|_| HashMap::default()).collect(), min_n, max_n: max_n.max(min_n) }
+    }
+
+    fn key(ctx: &[u32]) -> u64 {
+        let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ ctx.len() as u64;
+        for &t in ctx {
+            h = (h ^ t as u64).wrapping_mul(0x0000_0100_0000_01B3);
+            h ^= h >> 29;
+        }
+        h.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// Record that `next` followed `ctx` (the tokens before it; only the last `max_n` matter).
+    pub fn observe(&mut self, ctx: &[u32], next: u32) {
+        for n in self.min_n..=self.max_n.min(ctx.len()) {
+            let v = self.tables[n - self.min_n].entry(Self::key(&ctx[ctx.len() - n..])).or_insert(Vote { tok: next, lead: 0, seen: 0, hits: 0 });
+            v.seen += 1;
+            if v.tok == next {
+                v.lead += 1;
+                v.hits += 1;
+            } else if v.lead == 0 {
+                *v = Vote { tok: next, lead: 1, seen: v.seen, hits: 1 };
+            } else {
+                v.lead -= 1;
+            }
+        }
+    }
+
+    /// The token expected after `ctx`, from the longest context that has a confident vote.
+    pub fn predict(&self, ctx: &[u32]) -> Option<u32> {
+        for n in (self.min_n..=self.max_n.min(ctx.len())).rev() {
+            if let Some(v) = self.tables[n - self.min_n].get(&Self::key(&ctx[ctx.len() - n..])) {
+                // A longer context that has been seen decides, whether or not it is confident:
+                // falling back to a shorter one would ignore what the longer one learned.
+                return (v.lead >= MIN_LEAD && 2 * v.hits > v.seen).then_some(v.tok);
+            }
+        }
+        None
+    }
+
+    /// Extend `draft` (which follows `tail`, the sequence's last tokens) to at most `k` tokens.
+    pub fn extend(&self, tail: &[u32], draft: &mut Vec<u32>, k: usize) {
+        let mut ctx: Vec<u32> = tail[tail.len().saturating_sub(self.max_n)..].to_vec();
+        ctx.extend_from_slice(draft);
+        while draft.len() < k {
+            let from = ctx.len().saturating_sub(self.max_n);
+            let Some(t) = self.predict(&ctx[from..]) else { break };
+            draft.push(t);
+            ctx.push(t);
+        }
+    }
+
+    pub fn contexts(&self) -> usize {
+        self.tables.iter().map(|t| t.len()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +271,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ngram_model_learns_boilerplate_and_stays_quiet_when_unsure() {
+        let mut m = NgramModel::new(2, 4);
+        let call = [900u32, 901, 902, 903, 904, 905];
+        // The same tool-call header generated in three sessions, after different text.
+        for prefix in [[1u32, 2, 3], [4, 5, 6], [7, 8, 9]] {
+            let seq: Vec<u32> = prefix.iter().chain(&call).copied().collect();
+            for i in 1..seq.len() {
+                m.observe(&seq[..i], seq[i]);
+            }
+        }
+        // A fourth session reaches the start of the header: the rest is drafted.
+        let mut d = Vec::new();
+        m.extend(&[50, 51, 900, 901], &mut d, 4);
+        assert_eq!(d, vec![902, 903, 904, 905]);
+        // After the header nothing was ever generated: no draft.
+        let mut d = Vec::new();
+        m.extend(&[903, 904, 905], &mut d, 4);
+        assert!(d.is_empty());
+        // A context seen once is not trusted.
+        let mut d = Vec::new();
+        m.extend(&[1, 2, 3], &mut d, 4);
+        assert!(d.is_empty());
+        // A context followed by different tokens each time is not trusted either.
+        let mut m = NgramModel::new(2, 4);
+        for next in [10u32, 11, 12, 13, 10, 11] {
+            m.observe(&[7, 7, 7], next);
+        }
+        assert_eq!(m.predict(&[7, 7, 7]), None);
+        // An existing draft is extended, not replaced.
+        let mut m = NgramModel::new(2, 4);
+        for _ in 0..3 {
+            m.observe(&[1, 2], 3);
+            m.observe(&[1, 2, 3], 4);
+        }
+        let mut d = vec![2];
+        m.extend(&[0, 1], &mut d, 3);
+        assert_eq!(d, vec![2, 3, 4]);
     }
 
     #[test]
