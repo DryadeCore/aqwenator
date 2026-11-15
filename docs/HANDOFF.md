@@ -21,8 +21,12 @@ memory-policy lane, and:
 - **Numerics**: cuBLASLt algorithms used to be picked by timing three runs, so a busy GPU gave
   each process different rounding; at a bifurcation point of repetitive text (9b-long, sequence
   1, token 223) that alone moves logits by 2-3 and showed up as a rare speculation "REAL
-  MISMATCH". The pick is now stable (heuristic's first candidate unless another is 3% faster,
-  best of 5), and `aq-check` judges a divergence against how far its two plain paths (decode,
+  MISMATCH". A stabilized timing pick (first candidate unless another is 3% faster, best of 5)
+  still let one gate leg in eleven fail on the B200 (9b-long, `AQ_MTP=0`: two or three different
+  token paths across identical runs), so there is no timing any more: always the heuristic's
+  first candidate. Six runs of that leg then take one path, token-identical to plain decoding.
+  Speed on real traces, 16 agents: Spark 92.2 and 93.2 turns/min vs 93.0 timed; B200 434.4 vs
+  438.6 (noise). `aq-check` judges a divergence against how far its two plain paths (decode,
   prefill) disagree there. Diagnostics: `AQ_GEMM_PICK=seed` (random plans), `AQ_GEMM_MIN_M`,
   `AQ_SPEC_FAULT=N` (fault injection: the check must fail), `AQ_SPEC_TRACE`,
   `AQ_CHECK_DRIFT_AT=seq:tok`, `AQ_CHECK_ROWDEP=N`, `AQ_CHECK_TF_ONLY`, `AQ_CHECK_SPEC_REPEAT=N`.
@@ -284,7 +288,7 @@ the driver recovers: `~/aq/logs/mem_gate.log`; sweeps: `tools/agentic_sweep_mem.
 batched greedy, session resume, shared-prefix fork. Divergences are classified by top-2 margin
 (near-tie < 0.25). Always run the full suite: 6 goldens × {default, `AQ_CHECK_BUDGET=1000
 AQ_CHECK_CHUNK=777`} (the odd budget found a real upload/compute stream race), plus `AQ_SPEC_K=4`.
-Byte-identity comparisons need `AQ_GEMM_HEURISTIC=1` (cuBLASLt plans are picked by timing).
+(2026-11-15: cuBLASLt plans are no longer picked by timing, so runs are repeatable without a switch.)
 
 ## Open branches (not merged)
 - `worktree-agent-ae9e174bba1af161f` @ d7e410c — lossless KV compression (400 B rows, 1.28× tokens,

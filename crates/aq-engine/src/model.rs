@@ -786,9 +786,9 @@ impl Model {
 
     /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
     /// before they are read and need no reset).
-    /// Tune every cuBLASLt plan the engine can hit (each M bucket up to `max_tokens` for every
-    /// weight shape, and the LM head up to `max_seqs`) on scratch buffers, so no step ever
-    /// stalls on a first-use autotune mid-run. Results in the scratch buffers are garbage and
+    /// Create and run once every cuBLASLt plan the engine can hit (each M bucket up to
+    /// `max_tokens` for every weight shape, and the LM head up to `max_seqs`) on scratch
+    /// buffers, so no step pays for a plan's first use mid-run. Results in the scratch buffers are garbage and
     /// are overwritten by the next real step. Returns the number of M values tried.
     pub fn prewarm_gemms(&mut self) -> Result<usize> {
         let c = self.cfg.clone();
