@@ -90,6 +90,54 @@ unsafe fn block_sum(v: f32, smem: *mut f32) -> f32 {
     t
 }
 
+/// Maximum over the whole block; every thread gets the result. `smem` holds >= 32 f32.
+#[inline(always)]
+unsafe fn block_max(v: f32, smem: *mut f32) -> f32 {
+    let v = warp_max(v);
+    let tid = thread::threadIdx_x();
+    let nw = thread::blockDim_x().div_ceil(32);
+    if tid % 32 == 0 {
+        unsafe { *smem.add((tid / 32) as usize) = v };
+    }
+    thread::sync_threads();
+    let mut t = 0.0f32;
+    let mut i = 0u32;
+    while i < nw {
+        t = t.max(unsafe { *smem.add(i as usize) });
+        i += 1;
+    }
+    thread::sync_threads();
+    t
+}
+
+/// FP8 E4M3 code of `v`: round to nearest even, saturating at +-448 (NaN saturates too).
+/// E4M3 is sign, 4 exponent bits (bias 7), 3 mantissa bits; subnormals are multiples of 2^-9.
+#[inline(always)]
+fn e4m3(v: f32) -> u32 {
+    let b = v.to_bits();
+    let sign = (b >> 24) & 0x80;
+    let a = b & 0x7fff_ffff;
+    if a >= 0x43e0_0000 {
+        return sign | 0x7e; // |v| >= 448
+    }
+    if a < 0x3c80_0000 {
+        // |v| < 2^-6
+        let x = f32::from_bits(a) * 512.0;
+        let f = x as u32;
+        let r = x - f as f32;
+        let up = r > 0.5 || (r == 0.5 && (f & 1) == 1);
+        return sign | (f + up as u32);
+    }
+    let m = a & 0x7f_ffff;
+    let keep = m >> 20;
+    let rem = m & 0xf_ffff;
+    let mut code = (((a >> 23) - 120) << 3) | keep;
+    if rem > 0x8_0000 || (rem == 0x8_0000 && (keep & 1) == 1) {
+        code += 1; // a mantissa carry moves into the exponent field, as it should
+    }
+    sign | code
+}
+
 /// Offset (in bf16 elements) of 16-byte chunk `chunk` of row `row` in a shared tile whose rows
 /// are 256 bf16 (32 chunks). Chunks are XOR-swizzled by `row % 8`, so the 8 row addresses an
 /// `ldmatrix` reads for one logical chunk land in 8 different bank groups.
@@ -313,6 +361,75 @@ pub mod kernels {
                 }
                 unsafe { *ov.add(v) = U32x4::new(packed) };
             }
+        }
+    }
+
+    /// Per-row FP8 quantization of a bf16 matrix: `out[r, :] = e4m3(x[r, :] / scale[r])`, with
+    /// `scale[r]` the power of two that puts the row's largest magnitude in [128, 256) (E4M3
+    /// tops out at 448). A power of two keeps the scaling exact, and since E4M3 is a
+    /// floating-point format the scale only places its range, it does not cost precision.
+    /// Requires k % 8 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn quant_e4m3(x: *const u16, out: *mut u8, scale: *mut f32, k: u32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let tid = thread::threadIdx_x() as usize;
+        let nv = k as usize / 8;
+        let r = thread::blockIdx_x() as usize;
+        let xv = unsafe { x.cast::<U32x4>().add(r * nv) };
+        // Largest magnitude, compared as bf16 bit patterns (monotone in the magnitude).
+        let mut top = 0u32;
+        let mut v = tid;
+        while v < nv {
+            let w = unsafe { *xv.add(v) }.to_array();
+            #[unroll]
+            for e in 0..4 {
+                top = top.max(w[e] & 0x7fff).max((w[e] >> 16) & 0x7fff);
+            }
+            v += 256;
+        }
+        let top = unsafe { block_max(top as f32, red) } as u32;
+        // Biased exponent of the row maximum; the scale is 2^(exponent - 7).
+        let ex = top >> 7;
+        let (s, inv) = if ex >= 8 { (f32::from_bits((ex - 7) << 23), f32::from_bits((261 - ex) << 23)) } else { (1.0, 1.0) };
+        if tid == 0 {
+            unsafe { *scale.add(r) = s };
+        }
+        let ov = unsafe { out.add(r * k as usize) }.cast::<u64>();
+        let mut v = tid;
+        while v < nv {
+            let w = unsafe { *xv.add(v) }.to_array();
+            let mut packed = 0u64;
+            #[unroll]
+            for e in 0..4 {
+                let (a0, a1) = cvt_f32x2_bf16x2(w[e]);
+                packed |= ((e4m3(a0 * inv) | (e4m3(a1 * inv) << 8)) as u64) << (16 * e);
+            }
+            unsafe { *ov.add(v) = packed };
+            v += 256;
+        }
+    }
+
+    /// `y[r, c] *= rs[r] * cs[c]` in place on a bf16 matrix.
+    /// Requires n % 8 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn scale_outer(y: *mut u16, rs: *const f32, cs: *const f32, n: u32) {
+        let nv = n as usize / 8;
+        let r = thread::blockIdx_x() as usize;
+        let yv = unsafe { y.cast::<U32x4>().add(r * nv) };
+        let a = unsafe { *rs.add(r) };
+        let mut v = thread::threadIdx_x() as usize;
+        while v < nv {
+            let w = unsafe { *yv.add(v) }.to_array();
+            let mut packed = [0u32; 4];
+            #[unroll]
+            for e in 0..4 {
+                let (y0, y1) = cvt_f32x2_bf16x2(w[e]);
+                let (c0, c1) = unsafe { (*cs.add(v * 8 + 2 * e), *cs.add(v * 8 + 2 * e + 1)) };
+                packed[e] = pk(y0 * a * c0, y1 * a * c1);
+            }
+            unsafe { *yv.add(v) = U32x4::new(packed) };
+            v += 256;
         }
     }
 

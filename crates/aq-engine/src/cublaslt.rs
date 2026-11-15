@@ -210,6 +210,14 @@ impl CublasLt {
         self.gemm_ty(stream, m, n, k, x, w, y, (CUDA_R_16BF, CUDA_R_16BF, out_ty))
     }
 
+    /// As `gemm` with FP8 (E4M3) operands, f32 accumulate. The caller applies the operands'
+    /// scales to `y`: cuBLASLt 13.1 has per-row scale modes, but its heuristic rejects them
+    /// for this problem (status 7 on sm_121).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
+        self.gemm_ty(stream, m, n, k, x, w, y, (CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_ty))
+    }
+
     /// As `gemm`, with element types `(w, x, y)`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_ty(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32)) -> Result<()> {

@@ -582,9 +582,27 @@ impl Model {
         if mtp.is_some() {
             eprintln!("MTP draft head loaded");
         }
-        let weight_bytes = gpu.allocated_bytes;
         gpu.sync()?;
         gpu.flush_uploads()?;
+        // AQ_FP8=1 (experimental): the layers' GEMMs run on FP8 (E4M3) weights and
+        // activations. Not exact: outputs differ from the bf16 reference.
+        if std::env::var("AQ_FP8").as_deref() == Ok("1") {
+            let t = Instant::now();
+            let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
+            let rows = lim.max_tokens.max(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ) + 512;
+            let k_max = inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim);
+            for l in &layers {
+                let ws = match l.kind {
+                    LayerKind::Linear => [(l.gdn_proj, cfg.gdn_proj_ld(), h), (l.out_proj, h, cfg.value_dim())],
+                    LayerKind::Full => [(l.qkv, cfg.attn_proj_dim(), h), (l.o_proj, h, cfg.num_attention_heads * cfg.head_dim)],
+                };
+                for (w, n, k) in ws.into_iter().chain([(l.gate_up, 2 * inter, h), (l.down, h, inter)]) {
+                    gpu.quantize_weight(w, n, k, rows, k_max)?;
+                }
+            }
+            eprintln!("FP8 layer weights: quantized in {:.2}s", t.elapsed().as_secs_f64());
+        }
+        let weight_bytes = gpu.allocated_bytes;
         let layers_s = t1.elapsed().as_secs_f64();
         eprintln!(
             "load: open {open_s:.2}s, weights {:.2}s, state+KV alloc {state_s:.2}s",

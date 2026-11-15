@@ -29,6 +29,12 @@ pub struct Gpu {
     loader: Option<Loader>,
     /// True between `begin_capture` and `end_capture`.
     pub capturing: std::cell::Cell<bool>,
+    /// FP8 weights: bf16 weight pointer handed to `gemm` -> (E4M3 weights, per-row scales).
+    w8: std::collections::HashMap<u64, (u64, u64)>,
+    /// Per lane: E4M3 activations and their per-row scales for the GEMM being issued.
+    x8: Vec<(u64, u64)>,
+    /// Rows and columns the `x8` buffers hold.
+    x8_dims: (usize, usize),
     /// Smallest GEMM M bucket (0 = none). Pinning every GEMM below this size to one plan makes
     /// a row's result independent of how many other rows share the GEMM (used by tests).
     pub gemm_min_m: usize,
@@ -163,6 +169,9 @@ impl Gpu {
             loader: None,
             allocated_bytes: WORKSPACE_BYTES,
             capturing: Default::default(),
+            w8: Default::default(),
+            x8: Vec::new(),
+            x8_dims: (0, 0),
             // AQ_GEMM_MIN_M: debugging aid, pins small GEMMs to one plan size.
             gemm_min_m: std::env::var("AQ_GEMM_MIN_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         };
@@ -181,7 +190,34 @@ impl Gpu {
         self.allocated_bytes += WORKSPACE_BYTES;
         self.streams.push(stream);
         self.workspaces.push(ws);
+        if self.x8_dims.0 > 0 {
+            let (rows, k) = self.x8_dims;
+            let x8 = (self.alloc(rows * k)?, self.alloc(rows * 4)?);
+            self.x8.push(x8);
+        }
         Ok(self.streams.len() - 1)
+    }
+
+    /// Give the bf16 weight matrix `w` (`[n, k]`, fully uploaded) an FP8 (E4M3) copy with one
+    /// power-of-two scale per row; `gemm` calls that name `w` then run in FP8, with the
+    /// activations quantized per row on the fly. `rows` and `k_max` bound the activations of
+    /// any such GEMM (the first call sizes the buffers).
+    ///
+    /// Experimental (AQ_FP8=1): the bf16 copy stays allocated, as the weight's name.
+    pub fn quantize_weight(&mut self, w: u64, n: usize, k: usize, rows: usize, k_max: usize) -> Result<()> {
+        if self.x8.is_empty() {
+            self.x8_dims = (rows, k_max);
+            for _ in 0..self.streams.len() {
+                let x8 = (self.alloc(rows * k_max)?, self.alloc(rows * 4)?);
+                self.x8.push(x8);
+            }
+        }
+        let q = self.alloc_uninit(n * k)?;
+        let sc = self.alloc_uninit(n * 4)?;
+        unsafe { self.k.quant_e4m3(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, sc as *mut f32, k as u32) }.map_err(de)?;
+        self.sync()?;
+        self.w8.insert(w, (q, sc));
+        Ok(())
     }
 
     /// Highest scheduling priority this device supports (numerically smallest).
@@ -320,7 +356,16 @@ impl Gpu {
         .min(cap)
         .max(m);
         let s = self.raw_stream();
-        self.lt.gemm(s, mb, n, k, x, w, y, out_ty)
+        let Some(&(w8, w_scale)) = self.w8.get(&w) else {
+            return self.lt.gemm(s, mb, n, k, x, w, y, out_ty);
+        };
+        let (x8, x_scale) = self.x8[self.lane];
+        unsafe { self.k.quant_e4m3(&self.stream, cfg((mb as u32, 1, 1), 256), x as *const u16, x8 as *mut u8, x_scale as *mut f32, k as u32) }.map_err(de)?;
+        anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "FP8 GEMMs write bf16");
+        self.lt.gemm_fp8(s, mb, n, k, x8, w8, y, out_ty)?;
+        // y[r, c] *= x_scale[r] * w_scale[c]: powers of two, so exact.
+        let (xs, wsc) = (x_scale as *const f32, w_scale as *const f32);
+        unsafe { self.k.scale_outer(&self.stream, cfg((mb as u32, 1, 1), 256), y as *mut u16, xs, wsc, n as u32) }.map_err(de)
     }
 }
 
