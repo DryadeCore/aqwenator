@@ -419,7 +419,7 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
     let mut off = 0u64;
     for v in views {
         // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
-        unsafe { gpu.queue_upload(p + off, v.bytes, v.direct) };
+        unsafe { gpu.queue_upload(p + off, v.bytes, v.direct)? };
         off += v.bytes.len() as u64;
     }
     if pad_bytes > 0 {

@@ -6,7 +6,7 @@ use aq_kernels::kernels::LoadedModule;
 use cuda_core::{CudaContext, LaunchConfig, Stream, memory};
 use std::ffi::c_void;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 
 pub fn de<E: Debug>(e: E) -> anyhow::Error {
     anyhow!("{e:?}")
@@ -25,8 +25,8 @@ pub struct Gpu {
     pub lt: CublasLt,
     allocs: Vec<u64>,
     pub allocated_bytes: usize,
-    /// Checkpoint copies waiting for `flush_uploads`.
-    uploads: Vec<Upload>,
+    /// The weight loader, between the first `queue_upload` and `flush_uploads`.
+    loader: Option<Loader>,
     /// True between `begin_capture` and `end_capture`.
     pub capturing: std::cell::Cell<bool>,
     /// Smallest GEMM M bucket (0 = none). Pinning every GEMM below this size to one plan makes
@@ -34,12 +34,94 @@ pub struct Gpu {
     pub gemm_min_m: usize,
 }
 
-/// A queued checkpoint copy (`Gpu::queue_upload`).
-struct Upload {
+/// One piece (at most `STAGE_BYTES`) of a checkpoint copy.
+struct Piece {
     dst: u64,
     src: usize,
     len: usize,
     direct: Option<(std::os::fd::RawFd, u64)>,
+}
+
+const STAGE_BYTES: usize = 32 << 20;
+const STAGE_BUFS: usize = 12;
+/// Direct reads need block-aligned offsets, lengths and buffers.
+const ALIGN: usize = 4096;
+
+/// The weight loader: reader threads fill page-locked staging buffers in parallel and the
+/// thread that owns the `Gpu` copies each filled buffer to the device. With direct I/O the
+/// readers bypass the page cache, which reads an NVMe drive at its full speed whether or
+/// not the file is cached (faulting in a cold mapping gave 1 GB/s on the DGX Spark). A
+/// plain `cuMemcpyHtoD` from pageable memory stages through the driver on one thread, which
+/// measured 0.35-0.5 GB/s there.
+struct Loader {
+    jobs: Option<mpsc::Sender<Piece>>,
+    /// (buffer, piece, offset of the piece's first byte in the buffer or the read error)
+    done: mpsc::Receiver<(usize, Piece, std::io::Result<usize>)>,
+    /// Hands a buffer back to its reader once it has been copied out.
+    back: Vec<mpsc::Sender<()>>,
+    stage: Vec<usize>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    pending: usize,
+}
+
+impl Loader {
+    fn new() -> Result<Self> {
+        let (jobs, jobs_rx) = mpsc::channel::<Piece>();
+        let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        let (tx, done) = mpsc::channel();
+        let mut l = Loader { jobs: Some(jobs), done, back: Vec::new(), stage: Vec::new(), threads: Vec::new(), pending: 0 };
+        for bi in 0..STAGE_BUFS {
+            let buf = unsafe { memory::malloc_host(STAGE_BYTES + ALIGN) }.map_err(de)? as usize;
+            l.stage.push(buf);
+            let (btx, brx) = mpsc::channel::<()>();
+            l.back.push(btx);
+            let (jobs_rx, tx) = (jobs_rx.clone(), tx.clone());
+            l.threads.push(std::thread::spawn(move || {
+                loop {
+                    let Ok(p) = jobs_rx.lock().unwrap().recv() else { break };
+                    let head = match p.direct {
+                        Some((fd, at)) => {
+                            let head = (at % ALIGN as u64) as usize;
+                            // SAFETY: `buf` is this thread's own staging buffer of STAGE_BYTES + ALIGN bytes.
+                            unsafe { read_at_least(fd, buf as *mut u8, (head + p.len).next_multiple_of(ALIGN), at - head as u64, head + p.len) }.map(|()| head)
+                        }
+                        None => {
+                            // SAFETY: as above; the source is valid by `queue_upload`'s contract.
+                            unsafe { std::ptr::copy_nonoverlapping(p.src as *const u8, buf as *mut u8, p.len) };
+                            Ok(0)
+                        }
+                    };
+                    // The buffer is reused only after the owner has copied it out.
+                    if tx.send((bi, p, head)).is_err() || brx.recv().is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        Ok(l)
+    }
+
+    /// Copy one filled staging buffer to the device and release it to its reader.
+    fn copy_out(&mut self, (bi, p, head): (usize, Piece, std::io::Result<usize>)) -> Result<()> {
+        let head = head.map_err(|e| anyhow::anyhow!("reading weights: {e}"))?;
+        unsafe { memory::memcpy_htod_sync(p.dst, (self.stage[bi] + head) as *const u8, p.len) }.map_err(de)?;
+        self.pending -= 1;
+        let _ = self.back[bi].send(());
+        Ok(())
+    }
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        self.jobs = None;
+        self.back.clear();
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        for p in self.stage.drain(..) {
+            let _ = unsafe { memory::free_host(p as *mut c_void) };
+        }
+    }
 }
 
 /// Read `cap` bytes at file offset `at` into `buf`, until at least `need` of them are there
@@ -78,7 +160,7 @@ impl Gpu {
             k,
             lt,
             allocs: vec![ws],
-            uploads: Vec::new(),
+            loader: None,
             allocated_bytes: WORKSPACE_BYTES,
             capturing: Default::default(),
             // AQ_GEMM_MIN_M: debugging aid, pins small GEMMs to one plan size.
@@ -145,98 +227,47 @@ impl Gpu {
         Ok(p)
     }
 
-    /// Queue a host-to-device copy of checkpoint bytes for `flush_uploads`. `direct` is the
-    /// shard's direct-I/O handle and the offset of `src` in it; without one the bytes are
-    /// copied from `src` (the mapping).
+    /// Start a host-to-device copy of checkpoint bytes on the weight loader; `flush_uploads`
+    /// completes it. `direct` is the shard's direct-I/O handle and the offset of `src` in
+    /// it; without one the bytes are copied from `src` (the mapping). Buffers that readers
+    /// have already filled are copied to the device here, so reading overlaps with the
+    /// caller's device allocations.
+    ///
+    /// Synchronous copies, not ordered with the compute stream: nothing queued there may
+    /// touch `dst` before `flush_uploads`.
     ///
     /// # Safety
     /// `src` and the file must stay valid until `flush_uploads` returns.
-    pub unsafe fn queue_upload(&mut self, dst: u64, src: &[u8], direct: Option<(&std::fs::File, u64)>) {
+    pub unsafe fn queue_upload(&mut self, dst: u64, src: &[u8], direct: Option<(&std::fs::File, u64)>) -> Result<()> {
         use std::os::fd::AsRawFd;
-        self.uploads.push(Upload { dst, src: src.as_ptr() as usize, len: src.len(), direct: direct.map(|(f, at)| (f.as_raw_fd(), at)) });
+        if self.loader.is_none() {
+            self.loader = Some(Loader::new()?);
+        }
+        let l = self.loader.as_mut().unwrap();
+        for off in (0..src.len()).step_by(STAGE_BYTES) {
+            let piece = Piece {
+                dst: dst + off as u64,
+                src: src.as_ptr() as usize + off,
+                len: STAGE_BYTES.min(src.len() - off),
+                direct: direct.map(|(f, at)| (f.as_raw_fd(), at + off as u64)),
+            };
+            l.jobs.as_ref().unwrap().send(piece).map_err(de)?;
+            l.pending += 1;
+        }
+        while let Ok(filled) = l.done.try_recv() {
+            l.copy_out(filled)?;
+        }
+        Ok(())
     }
 
-    /// Run the queued copies: reader threads fill page-locked staging buffers in parallel
-    /// and this thread copies each filled buffer to the device. With direct I/O the readers
-    /// bypass the page cache, which reads an NVMe drive at its full speed whether or not the
-    /// file is cached (faulting in a cold mapping gave 1 GB/s on the DGX Spark). A plain
-    /// `cuMemcpyHtoD` from pageable memory stages through the driver on one thread, which
-    /// measured 0.35-0.5 GB/s there.
-    ///
-    /// Synchronous copies, not ordered with the compute stream: the caller must have synced
-    /// after anything it queued that touches the destinations.
+    /// Wait for every queued checkpoint copy and stop the weight loader.
     pub fn flush_uploads(&mut self) -> Result<()> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::mpsc;
-        const STAGE_BYTES: usize = 32 << 20;
-        const STAGE_BUFS: usize = 12;
-        /// Direct reads need block-aligned offsets, lengths and buffers.
-        const ALIGN: usize = 4096;
-        let uploads = std::mem::take(&mut self.uploads);
-        // (upload, offset in it, length)
-        let pieces: Vec<(usize, usize, usize)> = uploads
-            .iter()
-            .enumerate()
-            .flat_map(|(u, up)| (0..up.len).step_by(STAGE_BYTES).map(move |off| (u, off, STAGE_BYTES.min(up.len - off))))
-            .collect();
-        let mut stage = Vec::new();
-        for _ in 0..STAGE_BUFS.min(pieces.len()) {
-            stage.push(unsafe { memory::malloc_host(STAGE_BYTES + ALIGN) }.map_err(de)? as usize);
+        let Some(mut l) = self.loader.take() else { return Ok(()) };
+        while l.pending > 0 {
+            let filled = l.done.recv().map_err(de)?;
+            l.copy_out(filled)?;
         }
-        let next = AtomicUsize::new(0);
-        // (buffer, piece, offset of the piece's first byte in the buffer or the read error)
-        let (tx, rx) = mpsc::channel::<(usize, usize, std::io::Result<usize>)>();
-        let (pieces, uploads) = (&pieces, &uploads);
-        let res = std::thread::scope(|sc| {
-            let mut back = Vec::new();
-            for (bi, &buf) in stage.iter().enumerate() {
-                let (btx, brx) = mpsc::channel::<()>();
-                back.push(btx);
-                let tx = tx.clone();
-                let next = &next;
-                sc.spawn(move || {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(u, off, len)) = pieces.get(i) else { break };
-                        let up = &uploads[u];
-                        let head = match up.direct {
-                            Some((fd, base)) => {
-                                let at = base + off as u64;
-                                let head = (at % ALIGN as u64) as usize;
-                                // SAFETY: `buf` is this thread's own staging buffer of STAGE_BYTES + ALIGN bytes.
-                                unsafe { read_at_least(fd, buf as *mut u8, (head + len).next_multiple_of(ALIGN), at - head as u64, head + len) }.map(|()| head)
-                            }
-                            None => {
-                                // SAFETY: as above; the source is valid by `queue_upload`'s contract.
-                                unsafe { std::ptr::copy_nonoverlapping((up.src + off) as *const u8, buf as *mut u8, len) };
-                                Ok(0)
-                            }
-                        };
-                        // The buffer is reused only after the main thread has copied it out.
-                        if tx.send((bi, i, head)).is_err() || brx.recv().is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(tx);
-            let mut res = Ok(());
-            for (bi, i, head) in rx {
-                if res.is_ok() {
-                    let (u, off, len) = pieces[i];
-                    res = match head {
-                        Ok(head) => unsafe { memory::memcpy_htod_sync(uploads[u].dst + off as u64, (stage[bi] + head) as *const u8, len) }.map_err(de),
-                        Err(e) => Err(anyhow::anyhow!("reading weights: {e}")),
-                    };
-                }
-                let _ = back[bi].send(());
-            }
-            res
-        });
-        for p in stage {
-            let _ = unsafe { memory::free_host(p as *mut c_void) };
-        }
-        res
+        Ok(())
     }
 
     /// Host-to-device copy, enqueued on the compute stream so it is ordered after every kernel
