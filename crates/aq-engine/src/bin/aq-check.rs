@@ -464,7 +464,7 @@ fn main() -> Result<()> {
     {
         let k = if spec_env > 0 { spec_env } else { 4 };
         let prompts: Vec<Vec<u32>> = vec![ids.clone(), ids[..ids.len() * 3 / 4].to_vec(), ids[ids.len() / 4..].to_vec()];
-        let saved = (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m);
+        let saved = (eng.session_cache, eng.spec_k, eng.model.gpu.gemm_min_m);
         // The bit-identity baseline (spec off) must take the same single-stream path as the
         // speculative run: co-execution is not used while speculating, and its decode lane
         // runs GEMMs under a different row cap (so different plans).
@@ -474,7 +474,6 @@ fn main() -> Result<()> {
         let bg_saved = std::mem::replace(&mut eng.bg_prefill, 0);
         eng.session_cache = false;
         eng.clear_cache();
-        eng.model.attn_split_keys = 64;
         // One GEMM plan for every decode-sized GEMM: rows then compute identically whatever
         // else shares the GEMM, so speculative and plain decoding must match bit for bit.
         // With a small step budget, prefill and decode share steps; pin every GEMM to the full
@@ -634,7 +633,7 @@ fn main() -> Result<()> {
             );
             failed |= !ok;
         }
-        (eng.session_cache, eng.spec_k, eng.model.attn_split_keys, eng.model.gpu.gemm_min_m) = saved;
+        (eng.session_cache, eng.spec_k, eng.model.gpu.gemm_min_m) = saved;
         eng.coexec = coexec_saved;
         eng.bg_prefill = bg_saved;
     }

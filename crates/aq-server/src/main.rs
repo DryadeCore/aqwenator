@@ -228,10 +228,6 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
     }
     eng.session_cache = opts.session_cache;
     eng.spec_k = opts.spec_k;
-    if opts.spec_k > 0 {
-        // Fixed decode-attention slices keep speculative and plain decoding numerically aligned.
-        eng.model.attn_split_keys = 64;
-    }
     eng.policy = opts.policy;
     // AQ_BURST_PREFILL / AQ_BURST_EVERY (read by the engine) win over the flags when set.
     if std::env::var("AQ_BURST_PREFILL").is_err() {

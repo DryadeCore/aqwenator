@@ -130,14 +130,14 @@ Where the engine stands (decode step time against the bandwidth floor = weights 
 - B200 prefill at 16k context: `attn_prefill` is 31% of the step and far below both ceilings
   (a block scans the whole context serially; no split-K in prefill). Open.
 
-### Decode attention on tensor cores (`attn_decode_tq`, default; `AQ_DEC_TC=0` = old kernel)
+### Decode attention on tensor cores (`attn_decode_tq`; the split kernel it replaced is deleted)
 
 One block per (sequence tile, KV head, slice) serves every row of the sequence (the token plus
 its drafts) and all query heads of the GQA group: K/V is fetched once per sequence instead of
 once per row and head. Slices come from a fixed table of absolute key bounds (32 fine slices
 of `AQ_DEC_TC_SLICE` = 128 keys, then 32 coarse ones up to max_ctx), so a row's result does not
-depend on the batch or on its drafts. Gate: 30/30 PASS on the B200 (6 goldens x default,
-`AQ_DEC_TC=0`, SRPT + burst, small budget, `AQ_MTP=0`), fault injection fails as required.
+depend on the batch or on its drafts (this replaces `AQ_ATTN_SPLIT_KEYS`, `AQ_ATTN_FILL` and the
+row-local slicing mode, all removed).
 
 Findings on the way:
 - The K/V page lookup did two 64-bit divisions per 16-byte copy; that was most of a tile's

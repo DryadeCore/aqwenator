@@ -63,6 +63,10 @@ impl TextConfig {
         if self.head_dim != 256 {
             bail!("attention kernel assumes head_dim 256, got {}", self.head_dim);
         }
+        let group = self.num_attention_heads / self.num_key_value_heads.max(1);
+        if self.num_attention_heads % self.num_key_value_heads.max(1) != 0 || 8 % group != 0 {
+            bail!("decode attention kernel needs a GQA group of 1, 2, 4 or 8 query heads per KV head");
+        }
         if self.linear_key_head_dim != 128 || self.linear_value_head_dim != 128 {
             bail!("gated delta rule kernel assumes 128x128 heads");
         }
