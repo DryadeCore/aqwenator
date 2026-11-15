@@ -1044,8 +1044,16 @@ impl Model {
             bucket * 100_000 + rows * 10 + 1 + self.mtp_active() as usize * 50_000_000,
             self.cur_splits + self.s.dec_tiles * 1000 + self.s.dec_warps * 100_000_000,
         );
-        if let Some((exec, _)) = self.graphs.get(&key) {
+        if let Some((exec, names)) = self.graphs.get(&key) {
+            if let Some(p) = self.prof.as_mut() {
+                // The graph replays the event records captured with it.
+                p.active = p.filter != 2;
+                p.names = names.clone();
+            }
             self.gpu.launch_graph(*exec)?;
+            if let Some(p) = self.prof.as_mut() {
+                p.finish()?;
+            }
         } else {
             self.forward(rows, bucket + 1, rows, bucket + 1, None)?;
             if let Some(pr) = self.prof.as_mut() {

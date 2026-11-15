@@ -257,6 +257,7 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
             }
         }
     };
+    let mut reports = 0u32;
     loop {
         if !eng.has_work() {
             match rx.recv() {
@@ -276,6 +277,13 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
                 eng.spec.drafted, eng.spec.accepted, eng.spec.global_accepted, eng.spec.global_drafted, eng.spec.mtp_accepted, eng.spec.mtp_drafted, eng.spec.emitted as f64 / eng.spec.decode_entries.max(1) as f64
             );
             last_report = Instant::now();
+            // AQ_PROFILE=1|decode|prefill: per-op GPU time of the steps since the last report.
+            reports += 1;
+            if reports % 6 == 0 {
+                if let Some(p) = eng.model.prof.as_mut().filter(|p| p.steps > 0) {
+                    eprintln!("[profile]\n{}", p.report());
+                }
+            }
         }
         match eng.step() {
             Ok(events) => {
