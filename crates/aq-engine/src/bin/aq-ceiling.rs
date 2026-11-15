@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use aq_engine::config::{LayerKind, TextConfig};
-use aq_engine::cublaslt::CUDA_R_16BF;
+use aq_engine::cublaslt::{CUDA_R_8F_E4M3, CUDA_R_16BF};
 use aq_engine::gpu::{Gpu, cfg, de};
 use aq_engine::weights::resolve_model;
 use serde_json::json;
@@ -178,6 +178,8 @@ fn main() -> Result<()> {
         let x = g.alloc(4096 * kmax * 2)?;
         let ymax = gemms.iter().map(|x| x.n * x.max_m.min(4096) * 2).max().unwrap();
         let y = g.alloc(ymax)?;
+        g.zero(x, 4096 * kmax * 2)?;
+        g.zero(w, wmax)?;
         g.sync()?;
         println!("\n{:>5} {:>10} {:>10} {:>10} {:>9} {:>11} {:>11}   per-GEMM ms (x count)", "M", "flop ms", "mem ms", "cublas ms", "of bound", "rows/s", "ceil rows/s");
         for m in MS {
@@ -207,6 +209,32 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             })?;
+            // The same step with 8-bit (E4M3) operands: weights and activations, and weights only.
+            let mut alt = String::new();
+            for (label, tys) in [("w8a8", (CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF)), ("w8a16", (CUDA_R_8F_E4M3, CUDA_R_16BF, CUDA_R_16BF))] {
+                let ok = gemms.iter().all(|q| g.lt.gemm_ty(stream, m.min(q.max_m), q.n, q.k, x, w, y, tys).is_ok());
+                g.sync()?;
+                if !ok {
+                    alt += &format!(" {label}=unsupported");
+                    continue;
+                }
+                let t8 = best(&mut g, 3, |g| {
+                    for (q, wq) in gemms.iter().zip(&ws) {
+                        for &wb in wq {
+                            g.lt.gemm_ty(stream, m.min(q.max_m), q.n, q.k, x, wb, y, tys)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                alt += &format!(" {label}={:.3}ms", t8 * 1e3);
+                for q in &gemms {
+                    let mm = m.min(q.max_m);
+                    let tq = best(&mut g, 5, |g| g.lt.gemm_ty(stream, mm, q.n, q.k, x, w, y, tys))?;
+                    alt += &format!(" {}={:.3}", q.name, tq * 1e3);
+                }
+                step_rows.push(json!({"m": m, "types": label, "cublas_ms": t8 * 1e3}));
+            }
+            println!("{m:>5} 8-bit step:{alt}");
             let flop_ms = flops / (peak * 1e12) * 1e3;
             let bound = flop_ms.max(mem_ms);
             println!(

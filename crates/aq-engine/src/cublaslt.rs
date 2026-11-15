@@ -2,8 +2,8 @@
 //!
 //! Row-major activations and HF-layout weights (`[out, in]`) map to cuBLASLt's
 //! column-major "TN" problem: `C(N x M) = op(A)^T . B` with `A = W` (K x N col-major,
-//! transposed) and `B = X` (K x M col-major). Plans are cached per shape; on first use of a
-//! shape the top heuristic candidates are timed on the real buffers and the fastest is kept.
+//! transposed) and `B = X` (K x M col-major). Plans are cached per shape and element types and
+//! use the heuristic's first candidate.
 #![allow(non_camel_case_types)]
 
 use anyhow::{Result, bail};
@@ -101,7 +101,8 @@ pub struct CublasLt {
     handle: Handle,
     workspace: u64,
     workspace_size: usize,
-    plans: HashMap<(usize, usize, usize, i32), Plan>,
+    /// Keyed by (m, n, k, weight type, activation type, output type).
+    plans: HashMap<(usize, usize, usize, i32, i32, i32), Plan>,
 }
 
 // The handle is only used from the engine thread.
@@ -121,8 +122,9 @@ impl CublasLt {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn plan(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<&Plan> {
-        let key = (m, n, k, out_ty);
+    fn plan(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32)) -> Result<&Plan> {
+        let (w_ty, x_ty, out_ty) = tys;
+        let key = (m, n, k, w_ty, x_ty, out_ty);
         if !self.plans.contains_key(&key) {
             unsafe {
                 let mut desc = std::ptr::null_mut();
@@ -132,8 +134,8 @@ impl CublasLt {
                 check(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSB, (&tb as *const i32).cast(), 4), "transb")?;
                 let (mut a, mut b, mut c) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
                 // A = W stored as K x N col-major (ld K); B = X as K x M (ld K); C = N x M (ld N).
-                check(cublasLtMatrixLayoutCreate(&mut a, CUDA_R_16BF, k as u64, n as u64, k as i64), "layout a")?;
-                check(cublasLtMatrixLayoutCreate(&mut b, CUDA_R_16BF, k as u64, m as u64, k as i64), "layout b")?;
+                check(cublasLtMatrixLayoutCreate(&mut a, w_ty, k as u64, n as u64, k as i64), "layout a")?;
+                check(cublasLtMatrixLayoutCreate(&mut b, x_ty, k as u64, m as u64, k as i64), "layout b")?;
                 check(cublasLtMatrixLayoutCreate(&mut c, out_ty, n as u64, m as u64, n as i64), "layout c")?;
                 let mut pref = std::ptr::null_mut();
                 check(cublasLtMatmulPreferenceCreate(&mut pref), "pref")?;
@@ -150,7 +152,7 @@ impl CublasLt {
                     "heuristic",
                 )?;
                 if got == 0 {
-                    bail!("no cuBLASLt algo for m={m} n={n} k={k}");
+                    bail!("no cuBLASLt algo for m={m} n={n} k={k} types {tys:?}");
                 }
                 // The heuristic's first candidate, always. Picking by timing made the choice
                 // (and with it the rounding of every result) differ between processes, which
@@ -205,8 +207,14 @@ impl CublasLt {
     /// `y[m, n] = x[m, k] . w[n, k]^T`, bf16 inputs, f32 accumulate, `out_ty` output.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
-        self.plan(stream, m, n, k, x, w, y, out_ty)?;
-        let p = &self.plans[&(m, n, k, out_ty)];
+        self.gemm_ty(stream, m, n, k, x, w, y, (CUDA_R_16BF, CUDA_R_16BF, out_ty))
+    }
+
+    /// As `gemm`, with element types `(w, x, y)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ty(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32)) -> Result<()> {
+        self.plan(stream, m, n, k, x, w, y, tys)?;
+        let p = &self.plans[&(m, n, k, tys.0, tys.1, tys.2)];
         self.run(stream, p, x, w, y)
     }
 }
