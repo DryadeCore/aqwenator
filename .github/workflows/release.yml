@@ -1,0 +1,80 @@
+name: release
+
+# A tag `vX.Y.Z` publishes ghcr.io/<owner>/<repo>:X.Y.Z (and :latest) for amd64 and arm64,
+# and a GitHub release with the binaries of both.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+      - name: Binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: binaries
+          outputs: type=local,dest=bin
+          cache-from: type=gha,scope=${{ matrix.arch }}
+      - run: |
+          mkdir -p out/digests
+          touch "out/digests/${DIGEST#sha256:}"
+          tar -czf "out/aqwenator-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz" -C bin .
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.arch }}
+          path: out
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: out-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Manifest
+        working-directory: out/digests
+        run: |
+          docker buildx imagetools create -t "$IMAGE:${GITHUB_REF_NAME#v}" -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: GitHub release
+        run: gh release create "$GITHUB_REF_NAME" out/*.tar.gz --repo "$GITHUB_REPOSITORY" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
