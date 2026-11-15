@@ -280,7 +280,9 @@ pub struct Engine {
     /// AQ_NO_SPEC_ADAPT).
     pub spec_adaptive: bool,
     /// Draft tokens taken from the MTP head per step: the first comes with the main pass,
-    /// the rest from chained passes of the head alone (AQ_MTP_K, default 3).
+    /// the rest from chained passes of the head alone (AQ_MTP_K, default 1: on real traces
+    /// chaining raised tokens per step from 3.78 to 4.21 but not throughput, because the
+    /// prompt-lookup and cross-session drafts already extend the first MTP token for free).
     pub mtp_k: usize,
     /// AQ_SPEC_TRACE: log every decode entry's draft, targets and acceptance.
     spec_trace: bool,
@@ -366,7 +368,7 @@ impl Engine {
             global_draft: std::env::var("AQ_NO_GLOBAL_DRAFT").is_err(),
             global: NgramModel::new(2, 4),
             spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
-            mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             spec_trace: std::env::var("AQ_SPEC_TRACE").is_ok(),
             spec_fault: std::env::var("AQ_SPEC_FAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             spec_rejects: 0,
