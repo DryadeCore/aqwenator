@@ -69,9 +69,9 @@ struct Seq {
     /// row limit) after a step that accepted a full draft, because copy runs are long and a
     /// longer draft only pays while they last.
     k_cur: usize,
-    /// The MTP head's prediction for the token after the last known one, with the number of
-    /// known tokens it was made at.
-    mtp_next: Option<(usize, u32)>,
+    /// The MTP head's predictions for the tokens after the last known one (the first from the
+    /// main pass, the rest chained), with the number of known tokens they were made at.
+    mtp_next: Option<(usize, Vec<u32>)>,
     /// When the request was submitted and admitted, and the steps it took part in before its
     /// first token (AQ_TRACE request log).
     t_add: Instant,
@@ -279,6 +279,9 @@ pub struct Engine {
     /// Grow a sequence's draft length while its drafts are fully accepted (off with
     /// AQ_NO_SPEC_ADAPT).
     pub spec_adaptive: bool,
+    /// Draft tokens taken from the MTP head per step: the first comes with the main pass,
+    /// the rest from chained passes of the head alone (AQ_MTP_K, default 3).
+    pub mtp_k: usize,
     /// AQ_SPEC_TRACE: log every decode entry's draft, targets and acceptance.
     spec_trace: bool,
     /// AQ_SPEC_FAULT=N: test hook for the correctness check itself. Every Nth rejected draft
@@ -363,6 +366,7 @@ impl Engine {
             global_draft: std::env::var("AQ_NO_GLOBAL_DRAFT").is_err(),
             global: NgramModel::new(2, 4),
             spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
+            mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             spec_trace: std::env::var("AQ_SPEC_TRACE").is_ok(),
             spec_fault: std::env::var("AQ_SPEC_FAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             spec_rejects: 0,
@@ -501,6 +505,7 @@ impl Engine {
                 lim.num_blocks()
             );
         }
+        self.model.mtp_note(req.prompt.iter().copied());
         self.waiting.push_back((req, Instant::now()));
         Ok(())
     }
@@ -1030,20 +1035,22 @@ impl Engine {
         let mut local = d.len();
         // The MTP head's prediction for the next token outranks a lookup that disagrees with
         // it: the head has seen the whole context, the lookup only the last few tokens.
-        let mtp = s.mtp_next.filter(|&(at, _)| at == s.known()).map(|(_, t)| t);
+        let n_known = s.known();
+        let mtp = s.mtp_next.as_ref().filter(|(at, t)| *at == n_known && !t.is_empty()).map(|(_, t)| t);
         if let Some(t) = mtp {
-            if d.first() != Some(&t) {
+            if d.first() != Some(&t[0]) {
                 d.clear();
-                d.push(t);
+                d.extend_from_slice(&t[..t.len().min(k)]);
                 local = 0;
             }
         }
+        let from_mtp = mtp.is_some();
         if self.global_draft && d.len() < k {
             let n = s.known();
             let tail: Vec<u32> = (n.saturating_sub(4)..n).map(|p| s.token_at(p)).collect();
             self.global.extend(&tail, &mut d, k);
         }
-        (d, local, mtp.is_some())
+        (d, local, from_mtp)
     }
 
     fn ensure_blocks(&mut self, si: usize, upto: usize) -> Result<()> {
@@ -1560,6 +1567,8 @@ impl Engine {
         // decoded the next token of the same sequence.
         let mut events = bg_events;
         let mut done = Vec::new();
+        // (running index, sampled row) of sequences to chain MTP drafts for.
+        let mut chain: Vec<(usize, usize)> = Vec::new();
         let eos = self.eos.clone();
         let mut st = self.spec;
         for (k, &(i, n)) in plan.iter().enumerate() {
@@ -1621,6 +1630,7 @@ impl Engine {
             let mut finished = false;
             for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
                 s.out.push(tok);
+                self.model.mtp_note([tok]);
                 if self.global_draft {
                     let n = s.known() - 1;
                     let ctx: Vec<u32> = (n.saturating_sub(4)..n).map(|p| s.token_at(p)).collect();
@@ -1647,12 +1657,36 @@ impl Engine {
                     break;
                 }
             }
-            s.mtp_next = mtp_pred.map(|t| (s.known(), t));
+            s.mtp_next = mtp_pred.map(|t| (s.known(), vec![t]));
             if finished {
                 done.push(i);
+            } else if mtp_pred.is_some() {
+                chain.push((i, r0 + m));
             }
         }
         self.spec = st;
+        // Chained MTP drafts for the sequences that keep decoding: as many as the draft
+        // budget and the KV pages they already own allow (chained rows write to the head's
+        // cache at the positions the next pass overwrites).
+        if self.spec_k > 1 && self.mtp_k > 1 && !chain.is_empty() {
+            let bs = self.limits().block_size;
+            let want = self.mtp_k.min(self.spec_k) - 1;
+            let rows: Vec<(usize, u32, usize, &[u32])> = chain
+                .iter()
+                .map(|&(i, sample)| {
+                    let s = &self.running[i];
+                    let pos = s.known() - 1;
+                    let rem = (s.req.max_new_tokens - s.out.len()).saturating_sub(2);
+                    (sample, pos as u32, want.min(rem).min((s.blocks.len() * bs).saturating_sub(pos)), &s.blocks[..])
+                })
+                .collect();
+            let more = self.model.mtp_chain(&rows)?;
+            for (&(i, _), toks) in chain.iter().zip(more) {
+                if let Some((_, t)) = self.running[i].mtp_next.as_mut() {
+                    t.extend(toks);
+                }
+            }
+        }
         // Tapped checkpoints: the tap slot holds the state at `c`; park it with the pages below.
         for &(k, c, slot) in &taps {
             self.park_tap(plan[k].0, c, slot);

@@ -2723,6 +2723,84 @@ pub mod kernels {
         }
     }
 
+    /// Input rows of a chained MTP pass (drafts after the first), `2 * hidden` wide:
+    /// `out[t] = [rmsnorm(table[tok[sel[t]]], we), rmsnorm(hid[sel[t]], wh)]`, where `hid` and
+    /// `tok` are the previous MTP pass's normed output rows and predicted tokens.
+    /// Requires hidden <= 8192. grid = (T), block = (256).
+    #[kernel]
+    pub unsafe fn mtp_chain_prep(
+        hid: *const u16,
+        tok: *const u32,
+        sel: *const u32,
+        wh: *const u16,
+        we: *const u16,
+        table: *const u16,
+        out: *mut u16,
+        hidden: u32,
+        eps: f32,
+    ) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let t = thread::blockIdx_x() as usize;
+        let h = hidden as usize;
+        let bd = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let src = unsafe { *sel.add(t) } as usize;
+        let id = unsafe { *tok.add(src) } as usize;
+        let mut ss = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            let v = unsafe { ld(hid, src * h + i) };
+            ss += v * v;
+            i += bd;
+        }
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        let mut i = tid;
+        while i < h {
+            unsafe { st(out, t * 2 * h + h + i, ld(hid, src * h + i) * inv * (1.0 + ld(wh, i))) };
+            i += bd;
+        }
+        let mut ss = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            let v = unsafe { ld(table, id * h + i) };
+            ss += v * v;
+            i += bd;
+        }
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        let mut i = tid;
+        while i < h {
+            unsafe { st(out, t * 2 * h + i, ld(table, id * h + i) * inv * (1.0 + ld(we, i))) };
+            i += bd;
+        }
+    }
+
+    /// `out[slots[b], :] = table[ids[slots[b]], :]`: (re)fill rows of a gathered copy of an
+    /// embedding-shaped table. grid = (number of slots), block = (256).
+    #[kernel]
+    pub unsafe fn gather_rows(table: *const u16, ids: *const u32, slots: *const u32, out: *mut u16, hidden: u32) {
+        let slot = unsafe { *slots.add(thread::blockIdx_x() as usize) } as usize;
+        let id = unsafe { *ids.add(slot) } as usize;
+        let h = hidden as usize;
+        let mut i = thread::threadIdx_x() as usize;
+        while i < h {
+            unsafe { *out.add(slot * h + i) = *table.add(id * h + i) };
+            i += thread::blockDim_x() as usize;
+        }
+    }
+
+    /// `tok[i] = ids[tok[i]]` for i < n: shortlist indices back to token ids.
+    /// grid = (ceil(n / 256)), block = (256).
+    #[kernel]
+    pub unsafe fn remap_ids(tok: *mut u32, ids: *const u32, n: u32) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if i < n as usize {
+            unsafe { *tok.add(i) = *ids.add(*tok.add(i) as usize) };
+        }
+    }
+
     /// Row-wise argmax, phase 1: grid = (S, P) blocks of 256 threads; block p scans its 1/P of
     /// the row with 16-byte loads and writes its (value, index). Ties go to the lowest index.
     /// Requires n % 8 == 0.

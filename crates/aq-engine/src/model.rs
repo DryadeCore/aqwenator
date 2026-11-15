@@ -109,6 +109,28 @@ pub struct Mtp {
     norm: u64,
     pre_e: u64,
     pre_h: u64,
+    /// Shortlisted output head: the head's argmax runs over a gathered copy of `short_n`
+    /// output-embedding rows instead of the whole vocabulary (reading the full table costs
+    /// more than the rest of the head). A wrong shortlist only costs a rejected draft.
+    /// 0 = full vocabulary.
+    short_n: usize,
+    /// Token id in each slot, and each token's slot (`u32::MAX` = not shortlisted).
+    short_ids: Vec<u32>,
+    short_pos: Vec<u32>,
+    /// Next slot to recycle (the lower half keeps the lowest token ids for good).
+    short_ring: usize,
+    /// Slots whose row has to be gathered again before the next step.
+    short_dirty: Vec<u32>,
+    g_short_ids: u64,
+    g_short_slots: u64,
+    short_w: u64,
+}
+
+impl Mtp {
+    /// Width of the head's logits rows.
+    fn head_width(&self, cfg: &TextConfig) -> usize {
+        if self.short_n > 0 { self.short_n } else { cfg.vocab_size }
+    }
 }
 
 pub struct LoadStats {
@@ -231,6 +253,11 @@ pub struct Model {
     /// MTP predictions of the last step, one per sampled row: the token expected after the
     /// one that row sampled. Empty when the head did not run.
     pub last_mtp: Vec<u32>,
+    /// For each entry of `last_mtp`, its row in the MTP head's GPU buffers (a graph step
+    /// samples every row and picks the caller's afterwards).
+    last_mtp_rows: Vec<u32>,
+    /// The forward pass being enqueued is a chained MTP pass (no backbone).
+    chain_mode: bool,
     s: Scratch,
     pub limits: Limits,
     pub load: LoadStats,
@@ -293,7 +320,10 @@ struct LaneState {
 }
 
 /// Allocate one lane's scratch for `lim.max_rows()` token rows (and `lim.max_seqs` sequences).
-fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mtp: bool) -> Result<Scratch> {
+fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mtp: Option<usize>) -> Result<Scratch> {
+    // `mtp`: width of the MTP head's logits (shortlist size or the vocabulary), if loaded.
+    let mtp_width = mtp.unwrap_or(0);
+    let mtp = mtp.is_some();
     let mrows = if mtp { lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ } else { 0 };
     let hd = cfg.hidden_size;
     let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
@@ -353,7 +383,7 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
         next: gpu.alloc(if mtp { t * 4 } else { 0 })?,
         mtp_hfinal: gpu.alloc(mrows * hd * 2)?,
-        mtp_logits: gpu.alloc(mrows * cfg.vocab_size * 2)?,
+        mtp_logits: gpu.alloc(mrows * mtp_width * 2)?,
         mtp_tok: gpu.alloc(mrows * 4)?,
     })
 }
@@ -510,7 +540,25 @@ impl Model {
                 k_cache: gpu.alloc(kv_bytes)?,
                 v_cache: gpu.alloc(kv_bytes)?,
             };
+            // AQ_MTP_SHORT=N: shortlist size (default 32768; 0 = argmax over the whole vocabulary).
+            let mut short_n: usize = std::env::var("AQ_MTP_SHORT").ok().and_then(|v| v.parse().ok()).unwrap_or(32768);
+            if short_n >= cfg.vocab_size || short_n % 8 != 0 {
+                short_n = 0;
+            }
+            let short_ids: Vec<u32> = (0..short_n as u32).collect();
+            let mut short_pos = vec![u32::MAX; cfg.vocab_size];
+            for (slot, &t) in short_ids.iter().enumerate() {
+                short_pos[t as usize] = slot as u32;
+            }
             Some(Mtp {
+                short_n,
+                short_dirty: short_ids.clone(),
+                short_ring: short_n / 2,
+                g_short_ids: gpu.alloc(short_n * 4)?,
+                g_short_slots: gpu.alloc(short_n * 4)?,
+                short_w: gpu.alloc(short_n * cfg.hidden_size * 2)?,
+                short_ids,
+                short_pos,
                 layer,
                 fc: concat_bf16(&mut gpu, &ck, &["mtp.fc.weight".to_string()])?,
                 norm: concat_bf16(&mut gpu, &ck, &["mtp.norm.weight".to_string()])?,
@@ -541,7 +589,7 @@ impl Model {
         );
 
         let cc_gdn = std::env::var("AQ_GDN_CHUNK_CC").as_deref() == Ok("1");
-        let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn, mtp.is_some())?;
+        let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn, mtp.as_ref().map(|m| m.head_width(&cfg)))?;
         gpu.sync()?;
         let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
         let num_sms = gpu.num_sms()?;
@@ -572,6 +620,8 @@ impl Model {
             mtp,
             mtp_on: false,
             last_mtp: Vec::new(),
+            last_mtp_rows: Vec::new(),
+            chain_mode: false,
             s,
             limits: lim,
             load: LoadStats { open_s, upload_s, weight_bytes },
@@ -619,7 +669,7 @@ impl Model {
         anyhow::ensure!(lane == 1, "decode lane must be lane 1");
         let mut l2 = self.limits;
         l2.max_tokens = l2.max_seqs;
-        let s = alloc_scratch(&mut self.gpu, &self.cfg, &l2, self.cc_gdn, self.mtp.is_some())?;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &l2, self.cc_gdn, self.mtp.as_ref().map(|m| m.head_width(&self.cfg)))?;
         self.gpu.sync()?;
         self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
         self.alt = Some(LaneState {
@@ -647,7 +697,7 @@ impl Model {
         let lane = self.gpu.add_lane(prio)?;
         anyhow::ensure!(lane == 1, "prefill lane must be lane 1");
         let lim = self.limits;
-        let s = alloc_scratch(&mut self.gpu, &self.cfg, &lim, self.cc_gdn, self.mtp.is_some())?;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &lim, self.cc_gdn, self.mtp.as_ref().map(|m| m.head_width(&self.cfg)))?;
         self.gpu.sync()?;
         self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
         self.alt = Some(LaneState {
@@ -839,6 +889,7 @@ impl Model {
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
         anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
         self.last_mtp.clear();
+        self.last_mtp_rows.clear();
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
         if self.use_graphs && pure_decode && dump.is_none() {
             return self.step_graph(b);
@@ -857,6 +908,7 @@ impl Model {
         }
         if self.mtp_active() {
             self.last_mtp = self.gpu.download(self.s.mtp_tok, ns)?;
+            self.last_mtp_rows = (0..ns as u32).collect();
         }
         self.gpu.download(self.s.tok, ns)
     }
@@ -914,6 +966,7 @@ impl Model {
         if self.mtp_active() {
             self.last_mtp = self.gpu.download(self.s.mtp_tok, bucket)?;
             self.last_mtp.truncate(n);
+            self.last_mtp_rows = (0..n as u32).collect();
         }
         let mut toks = self.gpu.download(self.s.tok, bucket)?;
         toks.truncate(n);
@@ -990,6 +1043,7 @@ impl Model {
         if self.mtp_active() {
             let all: Vec<u32> = self.gpu.download(self.s.mtp_tok, rows)?;
             self.last_mtp = b.sample_rows.iter().map(|&r| all[r as usize]).collect();
+            self.last_mtp_rows = b.sample_rows.clone();
         }
         let all = self.gpu.download(self.s.tok, rows)?;
         Ok(b.sample_rows.iter().map(|&r| all[r as usize]).collect())
@@ -1002,6 +1056,79 @@ impl Model {
 
     fn mtp_active(&self) -> bool {
         self.mtp_on && self.mtp.is_some()
+    }
+
+    /// Chained MTP drafts after a step that ran the head. Each entry of `rows` continues from
+    /// one of that step's sampled rows: `(index into last_mtp, position of the first chained
+    /// row, how many drafts to chain, block table)`. Pass j feeds draft j and the previous
+    /// pass's output at the next position and yields draft j + 1; the KV rows it writes to
+    /// the head's cache sit at positions the next real pass overwrites. Returns the chained
+    /// drafts per entry. Must be called before the next step on this lane.
+    pub fn mtp_chain(&mut self, rows: &[(usize, u32, usize, &[u32])]) -> Result<Vec<Vec<u32>>> {
+        let mut out = vec![Vec::new(); rows.len()];
+        if !self.mtp_active() || rows.is_empty() {
+            return Ok(out);
+        }
+        let mb = self.limits.max_blocks_per_seq();
+        // `alive[i]`: (entry, its row in the previous pass's GPU buffers).
+        let mut alive: Vec<(usize, u32)> = rows.iter().enumerate().map(|(e, r)| (e, self.last_mtp_rows[r.0])).collect();
+        let kmax = rows.iter().map(|r| r.2).max().unwrap_or(0);
+        self.chain_mode = true;
+        let mut run = || -> Result<()> {
+            for j in 0..kmax {
+                alive.retain(|&(e, _)| rows[e].2 > j);
+                if alive.is_empty() {
+                    break;
+                }
+                let n = alive.len();
+                let mut b = Batch { n_decode: n, ..Batch::default() };
+                for (i, &(e, _)) in alive.iter().enumerate() {
+                    b.tokens.push(0);
+                    b.tok_pos.push(rows[e].1 + j as u32);
+                    b.tok_seq.push(i as u32);
+                    b.seq_start.push(i as u32);
+                    b.seq_len.push(1);
+                    b.seq_slot.push(self.limits.max_seqs as u32);
+                    let mut row = rows[e].3.to_vec();
+                    row.resize(mb, 0);
+                    b.block_tables.extend_from_slice(&row);
+                    b.sample_rows.push(i as u32);
+                }
+                self.upload(&b)?;
+                let sel: Vec<u32> = alive.iter().map(|&(_, r)| r).collect();
+                self.gpu.upload(self.s.next, &sel)?;
+                self.forward(n, n, n, n, None)?;
+                if let Some(p) = self.prof.as_mut() {
+                    p.finish()?;
+                }
+                let toks: Vec<u32> = self.gpu.download(self.s.mtp_tok, n)?;
+                for (i, a) in alive.iter_mut().enumerate() {
+                    out[a.0].push(toks[i]);
+                    a.1 = i as u32;
+                }
+            }
+            Ok(())
+        };
+        let r = run();
+        self.chain_mode = false;
+        r.map(|_| out)
+    }
+
+    /// Tell the MTP head's shortlist about tokens that are in play (prompt and generated
+    /// tokens): each one not yet shortlisted takes over the oldest recyclable slot.
+    pub fn mtp_note(&mut self, toks: impl IntoIterator<Item = u32>) {
+        let Some(m) = self.mtp.as_mut().filter(|m| m.short_n > 0) else { return };
+        for t in toks {
+            if m.short_pos.get(t as usize).copied() != Some(u32::MAX) {
+                continue;
+            }
+            let slot = m.short_ring;
+            m.short_ring = if slot + 1 == m.short_n { m.short_n / 2 } else { slot + 1 };
+            m.short_pos[m.short_ids[slot] as usize] = u32::MAX;
+            m.short_ids[slot] = t;
+            m.short_pos[t as usize] = slot as u32;
+            m.short_dirty.push(slot as u32);
+        }
     }
 
     fn upload(&mut self, b: &Batch) -> Result<()> {
@@ -1092,6 +1219,29 @@ impl Model {
         g.upload(s.seq_slot_out, if b.seq_slot_out.is_empty() { &b.seq_slot } else { &b.seq_slot_out })?;
         g.upload(s.tables, &b.block_tables)?;
         g.upload(s.rows, &b.sample_rows)?;
+        let mtp_on = self.mtp_on;
+        if let Some(m) = self.mtp.as_mut().filter(|m| mtp_on && !m.short_dirty.is_empty()) {
+            let st = g.stream.clone();
+            // Refresh the shortlisted output rows that changed since the last step.
+            if m.short_dirty.len() > m.short_n {
+                m.short_dirty = (0..m.short_n as u32).collect();
+            }
+            g.upload(m.g_short_ids, &m.short_ids)?;
+            g.upload(m.g_short_slots, &m.short_dirty)?;
+            unsafe {
+                g.k.gather_rows(
+                    &st,
+                    cfg((m.short_dirty.len() as u32, 1, 1), 256),
+                    self.lm_head as *const u16,
+                    m.g_short_ids as *const u32,
+                    m.g_short_slots as *const u32,
+                    m.short_w as *mut u16,
+                    self.cfg.hidden_size as u32,
+                )
+            }
+            .map_err(de)?;
+            m.short_dirty.clear();
+        }
         if self.mtp_on && self.mtp.is_some() {
             // The token after each row: the next row of its sequence, the token it samples
             // (top bit + sample index, resolved on the GPU), or what the caller says follows.
@@ -1141,16 +1291,19 @@ impl Model {
         let st = g.stream.clone();
         let mb = lim.max_blocks_per_seq() as u32;
         let bs = lim.block_size as u32;
-        unsafe {
-            g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
+        let chain = self.chain_mode;
+        if !chain {
+            unsafe {
+                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
+            }
+            .map_err(de)?;
+            mark!("embed");
         }
-        .map_err(de)?;
-        mark!("embed");
 
         // Final norm, output head and argmax for the sampled rows, from the residual stream
         // (x + delta) as the last layer left it.
         macro_rules! head {
-            ($norm:expr, $hfinal:expr, $logits:expr, $tok:expr) => {{
+            ($norm:expr, $hfinal:expr, $logits:expr, $tok:expr, $w:expr, $width:expr) => {{
                 unsafe {
                     g.k.final_norm_rows(
                         &st,
@@ -1166,14 +1319,14 @@ impl Model {
                 }
                 .map_err(de)?;
                 mark!("final_norm");
-                g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, c.vocab_size, c.hidden_size, $hfinal, self.lm_head, $logits, CUDA_R_16BF)?;
+                g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, $width, c.hidden_size, $hfinal, $w, $logits, CUDA_R_16BF)?;
                 mark!("gemm_lm_head");
                 unsafe {
                     g.k.argmax_part(
                         &st,
                         cfg((ns as u32, ARGMAX_PARTS as u32, 1), 256),
                         $logits as *const u16,
-                        c.vocab_size as u32,
+                        $width as u32,
                         s.amax_v as *mut f32,
                         s.amax_i as *mut u32,
                     )
@@ -1186,15 +1339,36 @@ impl Model {
                 mark!("argmax");
             }};
         }
-        let nl = self.layers.len();
+        // A chained MTP pass runs the head alone, fed by the previous pass's output.
+        let backbone = if chain { &self.layers[..0] } else { &self.layers[..] };
+        let nl = backbone.len();
         let mtp = if self.mtp_on { self.mtp.as_ref() } else { None };
-        for (li, l) in self.layers.iter().chain(mtp.map(|m| &m.layer)).enumerate() {
-            if li == nl {
+        for (li, l) in backbone.iter().chain(mtp.map(|m| &m.layer)).enumerate() {
+            if li == nl && chain {
+                let m = mtp.unwrap();
+                unsafe {
+                    g.k.mtp_chain_prep(
+                        &st,
+                        cfg((t as u32, 1, 1), 256),
+                        s.mtp_hfinal as *const u16,
+                        s.mtp_tok as *const u32,
+                        s.next as *const u32,
+                        m.pre_h as *const u16,
+                        m.pre_e as *const u16,
+                        self.embed as *const u16,
+                        s.proj as *mut u16,
+                        hd,
+                        eps,
+                    )
+                }
+                .map_err(de)?;
+                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, m.fc, s.x, CUDA_R_16BF)?;
+            } else if li == nl {
                 // The backbone is done: sample, then start the MTP head's residual stream.
                 let m = mtp.unwrap();
                 if ns > 0 {
                     self.last_logits = s.logits;
-                    head!(self.final_norm, s.hfinal, s.logits, s.tok);
+                    head!(self.final_norm, s.hfinal, s.logits, s.tok, self.lm_head, c.vocab_size);
                 }
                 unsafe {
                     g.k.mtp_prep(
@@ -1694,10 +1868,14 @@ impl Model {
             return Ok(());
         }
         match mtp {
-            Some(m) => head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok),
+            Some(m) if m.short_n > 0 => {
+                head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok, m.short_w, m.short_n);
+                unsafe { g.k.remap_ids(&st, cfg(((ns as u32).div_ceil(256), 1, 1), 256), s.mtp_tok as *mut u32, m.g_short_ids as *const u32, ns as u32) }.map_err(de)?;
+            }
+            Some(m) => head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok, self.lm_head, c.vocab_size),
             None => {
                 self.last_logits = s.logits;
-                head!(self.final_norm, s.hfinal, s.logits, s.tok);
+                head!(self.final_norm, s.hfinal, s.logits, s.tok, self.lm_head, c.vocab_size);
             }
         }
         Ok(())
