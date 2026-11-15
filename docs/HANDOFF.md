@@ -100,6 +100,57 @@ keyed on log lines only (one sat dead for 11 hours).
 
 ---
 
+## Hardware ceilings (2026-11-15, uncommitted at the time of writing: commit signing needs the user)
+
+`aq-ceiling [<model>] [--gb N] [--distinct] [--out f.json]` (crates/aq-engine/src/bin/aq-ceiling.rs)
+measures what the device can do and what that means for one step of a model: read/copy/write
+bandwidth, peak bf16 GEMM rate, launch overhead, and per row count M two lower bounds on the
+step's GEMM time (every weight byte read once; every multiply-add at the peak rate) next to
+what cuBLASLt takes for the same GEMMs. `--distinct` gives each GEMM its own weight buffer
+(the engine's situation; costs the model's weight footprint in memory).
+
+| | DGX Spark (GB10, 48 SMs) | B200 (148 SMs) |
+|---|---|---|
+| Read bandwidth | 237 GB/s | 6.7 TB/s |
+| Peak bf16 GEMM | 98 TFLOP/s | 2.1 PFLOP/s |
+| Launch (enqueue / launch + sync) | 1.9 / 4.9 us | 1.7 / 6.9 us |
+| 9B weights read once (15.9 GB) | 67 ms | 2.4 ms (3.0 ms with distinct buffers) |
+| KV read, 16 seqs x 20k ctx (10.5 GB) | 44 ms | 1.6 ms |
+
+Qwen3.5-9B: 15.9 GB of GEMM weights per step (lm_head alone is 2.0 GB), 32 KiB of attention
+KV per context token, 49 MiB of recurrent state per sequence.
+
+Where the engine stands (decode step time against the bandwidth floor = weights + KV + state):
+- Spark: 84 ms single stream (floor 70 ms), 141 ms at 16 seqs x 16k context (floor about
+  110 ms). About 80% of the ceiling; cuBLASLt itself runs at 92-99% of the weight-read bound
+  for M <= 64. The Spark is bandwidth-bound: more throughput has to come from more tokens per
+  weight pass (drafts, batch) or fewer bytes per pass (quantized weights, not exact).
+- B200: 4.1 ms single stream (floor 2.4-3.0 ms), 5.6 ms at 16 seqs, 10.7 ms at 64 seqs x 4k
+  context (floor 4.7 ms). 45-58% of the ceiling before the attention work below.
+- B200 prefill at 16k context: `attn_prefill` is 31% of the step and far below both ceilings
+  (a block scans the whole context serially; no split-K in prefill). Open.
+
+### Decode attention on tensor cores (`attn_decode_tq`, default; `AQ_DEC_TC=0` = old kernel)
+
+One block per (sequence tile, KV head, slice) serves every row of the sequence (the token plus
+its drafts) and all query heads of the GQA group: K/V is fetched once per sequence instead of
+once per row and head. Slices come from a fixed table of absolute key bounds (32 fine slices
+of `AQ_DEC_TC_SLICE` = 128 keys, then 32 coarse ones up to max_ctx), so a row's result does not
+depend on the batch or on its drafts. Gate: 30/30 PASS on the B200 (6 goldens x default,
+`AQ_DEC_TC=0`, SRPT + burst, small budget, `AQ_MTP=0`), fault injection fails as required.
+
+Findings on the way:
+- The K/V page lookup did two 64-bit divisions per 16-byte copy; that was most of a tile's
+  time. `kv_tile_cp_async` does one 32-bit division per thread and tile. `attention_tc`
+  (prefill), `attn_prep` and the reference kernels still divide per element.
+- Per 16-key tile on the B200: about 1.75 us fetching K/V, 0.5 us of MMAs. Double buffering
+  and fetching four tiles per round trip did not help (more shared memory, fewer blocks).
+
+B200, 9B, decode attention per step: 64 seqs x 4k ctx 4.77 -> 1.61 ms (floor 1.36), 16 seqs
+1.31 -> 0.60 ms, single stream 0.17 -> 0.28 ms. End to end: 64 streams 2267 -> 2547 tok/s (ITL p50
+10.75 -> 7.69 ms), 16 streams 1576 -> 1672, single stream 227 -> 224; with k=4 speculation at 16k
+context 291 -> 322 (1 stream) and 521 -> 567 tok/s (16 streams).
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)

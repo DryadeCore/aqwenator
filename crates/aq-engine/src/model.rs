@@ -48,6 +48,12 @@ pub struct Scratch {
     // split-K decode attention partials
     attn_part: u64,
     attn_ml: u64,
+    // tensor-core decode attention: this step's decode tiles (0 = split kernel in use)
+    dtile_start: u64,
+    dtile_len: u64,
+    dec_tiles: usize,
+    /// Warps per `attn_decode_tq` block this step (sized for the longest decode sequence).
+    dec_warps: usize,
     // chunked GDN + tiled attention (prefill)
     chunk_start: u64,
     chunk_len: u64,
@@ -157,7 +163,7 @@ pub const ARGMAX_PARTS: usize = 32;
 /// `MAX_ATTN_SPLITS` slices, or up to `MAX_DECODE_ROWS_PER_SEQ` rows per sequence with
 /// row-local slicing (at most `ROW_LOCAL_SPLITS` slices).
 fn attn_part_rows(max_seqs: usize) -> usize {
-    max_seqs * MAX_ATTN_SPLITS.max(MAX_DECODE_ROWS_PER_SEQ * ROW_LOCAL_SPLITS)
+    max_seqs * MAX_ATTN_SPLITS.max(MAX_DECODE_ROWS_PER_SEQ * ROW_LOCAL_SPLITS.max(DEC_TC_SLICES))
 }
 
 /// Max tokens one decode-path sequence may feed in a step (speculative verification).
@@ -166,6 +172,8 @@ pub const MAX_DECODE_ROWS_PER_SEQ: usize = 9;
 pub const ROW_LOCAL_SPLITS: usize = 32;
 /// Upper bound on split-K slices for decode attention.
 pub const MAX_ATTN_SPLITS: usize = 128;
+/// Slices of the tensor-core decode attention's fixed bounds table.
+pub const DEC_TC_SLICES: usize = 64;
 
 /// Engine sizing, fixed at load time (every buffer is preallocated).
 #[derive(Debug, Clone, Copy)]
@@ -293,6 +301,13 @@ pub struct Model {
     tile_attn: bool,
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
+    /// Decode attention on tensor cores (`attn_decode_tq`): one K/V pass per sequence instead
+    /// of one per row and query head. AQ_DEC_TC=0 goes back to `attn_decode_split`.
+    dec_tc: bool,
+    /// Slice bounds of `attn_decode_tq` (keys, DEC_TC_SLICES + 1 entries; device copy and host
+    /// copy): fine slices first, coarser ones for long contexts, the last one open-ended.
+    dec_bounds: u64,
+    dec_bounds_h: Vec<u32>,
     /// 16-token sub-tiles per `attention_tc` block (AQ_ATTN_QT, default 2): each K/V tile a
     /// block loads serves `16 * attn_qt` query tokens.
     attn_qt: usize,
@@ -339,6 +354,10 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         amax_i: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * ARGMAX_PARTS * 4)?,
         attn_part: gpu.alloc(attn_part_rows(sq) * hq * cfg.head_dim * 4)?,
         attn_ml: gpu.alloc(attn_part_rows(sq) * hq * 2 * 4)?,
+        dtile_start: gpu.alloc((sq * MAX_DECODE_ROWS_PER_SEQ + 8) * 4)?,
+        dtile_len: gpu.alloc((sq * MAX_DECODE_ROWS_PER_SEQ + 8) * 4)?,
+        dec_tiles: 0,
+        dec_warps: 1,
         chunk_start: gpu.alloc(lim.max_chunks() * 4)?,
         chunk_len: gpu.alloc(lim.max_chunks() * 4)?,
         seq_chunk0: gpu.alloc(sq * 4)?,
@@ -394,6 +413,12 @@ fn attention_tc_smem(group: usize, qt: usize) -> u32 {
     ((qt * group * 16 + 2 * 32) * 256 * 2) as u32
 }
 
+/// Shared-memory bytes of `attn_decode_tq`: 8 query slots and a 16-key P tile per warp plus one
+/// K and one V tile of 16 keys.
+fn attn_decode_tq_smem(warps: usize) -> u32 {
+    ((8 * warps + 2 * 16) * 512 + 256 * warps) as u32
+}
+
 /// Padded batch sizes that get a captured decode graph.
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
@@ -423,6 +448,8 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 
 impl Model {
     pub fn load(dir: &Path, limits: Limits) -> Result<Self> {
+        // The tensor-core attention kernels fetch K/V in 16-key tiles that must not straddle pages.
+        anyhow::ensure!(limits.block_size % 16 == 0, "KV page size must be a multiple of 16 tokens");
         let t0 = Instant::now();
         let cfg = TextConfig::load(dir)?;
         let ck = Checkpoint::open(dir)?;
@@ -606,6 +633,17 @@ impl Model {
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
             attn_tc_smem,
         )?;
+        gpu.opt_in_dynamic_smem(
+            <aq_kernels::kernels::__attn_decode_tq_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
+            attn_decode_tq_smem(8),
+        )?;
+        // Fixed slices: 32 fine ones (AQ_DEC_TC_SLICE keys, default 128), then 32 coarse ones
+        // sized to reach max_ctx; the last is open-ended. Bounds are multiples of the KV page.
+        let fine = std::env::var("AQ_DEC_TC_SLICE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(128).next_multiple_of(32.max(lim.block_size));
+        let coarse = lim.max_ctx.saturating_sub(32 * fine).div_ceil(32).next_multiple_of(32.max(lim.block_size)).max(fine);
+        let mut dec_bounds_h: Vec<u32> = (0..=DEC_TC_SLICES).map(|j| (if j <= 32 { j * fine } else { 32 * fine + (j - 32) * coarse }) as u32).collect();
+        dec_bounds_h[DEC_TC_SLICES] = u32::MAX;
+        let dec_bounds = gpu.alloc_upload(&dec_bounds_h)?;
         gpu.set_max_dynamic_smem("gdn_tc_prep", GDN_TC_PREP_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
@@ -643,6 +681,9 @@ impl Model {
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
+            dec_tc: std::env::var("AQ_DEC_TC").as_deref() != Ok("0"),
+            dec_bounds,
+            dec_bounds_h,
             attn_qt,
             cc_gdn,
             s_cap: lim.max_rows(),
@@ -938,7 +979,7 @@ impl Model {
         }
         p.n_decode = bucket;
         self.upload(&p)?;
-        let key = (bucket + self.mtp_active() as usize * 50_000_000, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        let key = (bucket + self.mtp_active() as usize * 50_000_000, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize + self.s.dec_tiles * 1000);
         if let Some((exec, names)) = self.graphs.get(&key) {
             if let Some(p) = self.prof.as_mut() {
                 // The graph replays the event records captured with it.
@@ -1023,9 +1064,16 @@ impl Model {
         // Every row runs through attention (padding rows read only the dummy page), and the
         // slice count is rounded up so a few graphs cover all context lengths.
         self.cur_nd_rows = rows;
-        self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
+        if self.s.dec_tiles == 0 {
+            self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
+        }
         anyhow::ensure!(rows * self.cur_splits <= attn_part_rows(lim.max_seqs), "decode attention partials overflow");
-        let key = (bucket * 100_000 + rows * 10 + 1 + self.mtp_active() as usize * 50_000_000, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        // With tensor-core decode attention the tile list is graph data (uploaded per step), but
+        // the tile count is the grid: it joins the key.
+        let key = (
+            bucket * 100_000 + rows * 10 + 1 + self.mtp_active() as usize * 50_000_000,
+            self.cur_splits * 2 + (self.cur_split_keys > 0) as usize + self.s.dec_tiles * 1000 + self.s.dec_warps * 100_000_000,
+        );
         if let Some((exec, _)) = self.graphs.get(&key) {
             self.gpu.launch_graph(*exec)?;
         } else {
@@ -1183,6 +1231,56 @@ impl Model {
             let cap = (attn_part_rows(self.limits.max_seqs) / nd).max(1);
             fill.min(max_ctx.div_ceil(64)).clamp(1, MAX_ATTN_SPLITS).next_power_of_two().min(MAX_ATTN_SPLITS).min(cap)
         };
+        // Tensor-core decode attention: cut the decode rows (and, in a decode-only batch, any
+        // trailing padding rows) into tiles of up to 16 rows of one sequence at consecutive
+        // positions; slices come from the fixed bounds table, rounded up to a power of two so
+        // a few graphs cover every context length. Falls back to the split kernel when the
+        // partials would not fit.
+        self.s.dec_tiles = 0;
+        let (mut ds, mut dl): (Vec<u32>, Vec<u32>) = (vec![], vec![]);
+        let grp = self.cfg.num_attention_heads / self.cfg.num_key_value_heads;
+        // Query slots per warp of `attn_decode_tq`; KV pages must hold whole 16-key tiles.
+        let slots = 8;
+        if self.dec_tc && nd > 0 && !self.ref_attn && slots % grp == 0 && self.limits.block_size % 16 == 0 {
+            let rows = if b.n_decode == b.seq_start.len() { b.tokens.len() } else { nd };
+            let max_keys = b.tok_pos[..rows].iter().copied().max().unwrap_or(0) + 1;
+            let need = self.dec_bounds_h.iter().position(|&x| x >= max_keys).unwrap_or(DEC_TC_SLICES).max(1);
+            let splits = need.next_power_of_two().min(DEC_TC_SLICES);
+            // Warps per block: enough query slots for the longest real decode sequence
+            // (slots / grp rows per warp, at most 16 rows); longer runs are cut into more tiles.
+            let rpw = slots / grp;
+            let longest = b.seq_len[..nd_seqs].iter().copied().max().unwrap_or(1).max(1) as usize;
+            let warps = longest.div_ceil(rpw).min(16 / rpw);
+            let cap = (warps * rpw) as u32;
+            anyhow::ensure!(
+                rows * splits <= attn_part_rows(self.limits.max_seqs) && rows <= self.limits.max_seqs * MAX_DECODE_ROWS_PER_SEQ,
+                "decode attention partials overflow ({rows} rows x {splits} slices)"
+            );
+            {
+                for r in 0..rows {
+                    let new = r == 0
+                        || *dl.last().unwrap() == cap
+                        || b.tok_seq[r] != b.tok_seq[r - 1]
+                        || b.tok_pos[r] != b.tok_pos[r - 1] + 1;
+                    if new {
+                        ds.push(r as u32);
+                        dl.push(1);
+                    } else {
+                        *dl.last_mut().unwrap() += 1;
+                    }
+                }
+                // Empty tiles round the count up to a multiple of 8: the count is the launch
+                // grid, so it is part of a captured graph's shape.
+                while ds.len() % 8 != 0 {
+                    ds.push(0);
+                    dl.push(0);
+                }
+                self.s.dec_tiles = ds.len();
+                self.s.dec_warps = warps;
+                self.cur_splits = splits;
+                self.cur_split_keys = 0;
+            }
+        }
         anyhow::ensure!(
             nd * self.cur_splits <= attn_part_rows(self.limits.max_seqs),
             "decode attention partials overflow ({nd} rows x {} slices)",
@@ -1210,6 +1308,10 @@ impl Model {
             g.upload(s.seq_nchunk, &cn)?;
             g.upload(s.tile_start, &ts)?;
             g.upload(s.tile_len, &tl)?;
+        }
+        if !ds.is_empty() {
+            g.upload(s.dtile_start, &ds)?;
+            g.upload(s.dtile_len, &dl)?;
         }
         g.upload(s.ids, &b.tokens)?;
         g.upload(s.tok_pos, &b.tok_pos)?;
@@ -1724,6 +1826,35 @@ impl Model {
                         .map_err(de)?;
                     } else if nd_total > 0 {
                         let ns = self.cur_splits as u32;
+                        if s.dec_tiles > 0 {
+                            unsafe {
+                                g.k.attn_decode_tq(
+                                    &st,
+                                    LaunchConfig {
+                                        grid_dim: (s.dec_tiles as u32, hkv, ns),
+                                        block_dim: (32 * s.dec_warps as u32, 1, 1),
+                                        shared_mem_bytes: attn_decode_tq_smem(s.dec_warps),
+                                    },
+                                    s.q as *const u16,
+                                    l.k_cache as *const u16,
+                                    l.v_cache as *const u16,
+                                    s.dtile_start as *const u32,
+                                    s.dtile_len as *const u32,
+                                    self.dec_bounds as *const u32,
+                                    s.tok_pos as *const u32,
+                                    s.tok_seq as *const u32,
+                                    s.tables as *const u32,
+                                    mb,
+                                    bs,
+                                    h,
+                                    hkv,
+                                    scale,
+                                    s.attn_part as *mut f32,
+                                    s.attn_ml as *mut f32,
+                                )
+                            }
+                            .map_err(de)?;
+                        } else {
                         unsafe {
                             g.k.attn_decode_split(
                                 &st,
@@ -1745,6 +1876,7 @@ impl Model {
                             )
                         }
                         .map_err(de)?;
+                        }
                         mark!("attn_dec_split");
                         unsafe {
                             g.k.attn_decode_combine(
