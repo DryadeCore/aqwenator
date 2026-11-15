@@ -280,9 +280,10 @@ pub struct Engine {
     /// AQ_NO_SPEC_ADAPT).
     pub spec_adaptive: bool,
     /// Draft tokens taken from the MTP head per step: the first comes with the main pass,
-    /// the rest from chained passes of the head alone (AQ_MTP_K, default 1: on real traces
-    /// chaining raised tokens per step from 3.78 to 4.21 but not throughput, because the
-    /// prompt-lookup and cross-session drafts already extend the first MTP token for free).
+    /// the rest from chained passes of the head alone (AQ_MTP_K, default 3). Chaining paid
+    /// off once decode attention read K/V once per sequence instead of once per row: on the
+    /// DGX Spark's real traces 3.37 -> 3.97 tokens per step and +10% turns per minute; it is
+    /// neutral on the B200.
     pub mtp_k: usize,
     /// Burst prefill (AQ_BURST_PREFILL=tokens, 0 = off) and the minimum number of steps
     /// between two bursts (AQ_BURST_EVERY, default 3).
@@ -373,7 +374,7 @@ impl Engine {
             global_draft: std::env::var("AQ_NO_GLOBAL_DRAFT").is_err(),
             global: NgramModel::new(2, 4),
             spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
-            mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             burst_prefill: std::env::var("AQ_BURST_PREFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             burst_every: std::env::var("AQ_BURST_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             since_burst: 0,

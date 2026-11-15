@@ -168,6 +168,44 @@ against a 0.94 ms floor at 64 streams); cuBLASLt at 128-512 rows (67-80% of its 
 Spark: lm_head reads 2 GB per step (13% of the weight bytes) and prefill has not been
 measured against the FLOP ceiling.
 
+### Ceiling-gap investigation and chained drafts (2026-11-15, afternoon)
+
+Verdicts on the gaps listed above:
+- Prefill attention (B200): per tile, fetch 28%, MMAs 43%, softmax and bookkeeping 25%. The
+  kernel needs 252 registers per thread, so one block (8 warps) per SM. Double-buffered K/V
+  gave nothing. On the Spark it is 8% of a prefill step. No cheap win found.
+- Small kernels in decode (B200 only): on real traces about 1.9 ms of a 7.9 ms step at ~8 us
+  each. Fusing conv1d with the GDN step would save about 3%; not done.
+- GDN decode: at its bandwidth floor on the Spark, 65% on the B200 (at most 6% of a step).
+- cuBLASLt at 128-512 rows: not a gap. Workspace size (4 MB to 1 GB) changes nothing; it is
+  the range where the bandwidth and FLOP limits both bind.
+- lm_head: an exact shortcut (low-precision screen, exact recheck) would save 3-5% of a decode
+  step; not worth the machinery.
+- Spark prefill (16 seqs x 16k, 4096 rows per step, 950 ms): GEMMs 666 ms against a 591 ms
+  FLOP floor (88%); attention 77 ms, GDN 83 ms, silu 40 ms and norm 35 ms (both at their
+  bandwidth floor), conv1d 18 ms.
+- Tried and dropped: 32-bit divisions in silu_mul and attn_prep (no change), padded instead of
+  XOR-swizzled shared tiles in attn_decode_tq (170 -> 130 registers, 225 -> 220 us per call),
+  four-tile K/V fetches.
+
+Real-trace profile (`AQ_PROFILE=decode` with aq-serve, B200, 16 agents, mean context 20.9k):
+decode step 7.9 ms; attention 2.0 ms (floor 1.64), gate_up 1.4, down 0.84, gdn_in 0.62,
+gdn 0.58, norm 0.54, lm_head 0.36.
+
+Chained MTP drafts are now the default (`AQ_MTP_K=3`, was 1). With K/V read once per sequence
+the extra draft rows are nearly free on a bandwidth-bound machine. Spark, 16 agents, 5 min:
+K=1 82.8 turns/min, 195 tok/s, 3.37 tok/step; K=2 90.6, 221, 3.77; K=3 91.4, 222, 3.97;
+K=4 89.2, 215, 4.12; `--spec-k 8` alone 85.0, 203; K=3 with `--spec-k 8` 90.8, 220. B200:
+437.6 / 435.4 / 441.2 / 443.2 turns/min for K=1 / K=3 / K=3 + k8 / k8 (neutral). Gate on the
+B200: 30/30 PASS (6 goldens x default, SRPT + burst, small budget, AQ_MTP=0, AQ_MTP_K=1), fault
+injection fails as required.
+
+Spark, 10-minute runs with K=3 (tags mtpk-k3-16, mtpk-k3-8): 16 agents 91.9 turns/min, 229
+tok/s, TTFT p50/p90/p99 483/1573/3864 ms, ITL p99 466 ms; 8 agents 57.4 turns/min, 157 tok/s,
+TTFT 365/981/2445, ITL p99 360. vLLM (5 min): 57.4, 122, 1022/1882/2909, 763 at 16 agents;
+44.6, 102, 665/1583/2601, 489 at 8. B200, 16 agents: 437.6 turns/min, 1146 tok/s (368.6 and
+973 in the morning).
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
