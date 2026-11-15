@@ -621,11 +621,16 @@ fn main() -> Result<()> {
                 }
             }
             println!(
-                "speculative ({name}, k={k}): {} identical to non-speculative; drafted {drafted}, accepted {accepted} ({:.0}%), {:.2} tokens per decode step, {:.2}s",
+                "speculative ({name}, k={k}): {} identical to non-speculative; drafted {drafted}, accepted {accepted} ({:.0}%), {:.2} tokens per decode step, {:.2}s{}",
                 if !ok { "NOT" } else if ties > 0 { "up to near-ties" } else { "all tokens" },
                 100.0 * accepted as f64 / drafted.max(1) as f64,
                 emitted as f64 / entries.max(1) as f64,
-                dt
+                dt,
+                if st.mtp_drafted > before.mtp_drafted {
+                    format!("; MTP first-draft acceptance {}/{}", st.mtp_accepted - before.mtp_accepted, st.mtp_drafted - before.mtp_drafted)
+                } else {
+                    String::new()
+                }
             );
             failed |= !ok;
         }

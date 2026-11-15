@@ -2648,6 +2648,81 @@ pub mod kernels {
         }
     }
 
+    /// Input rows of the multi-token-prediction (MTP) head, `2 * hidden` wide:
+    /// `out[t] = [rmsnorm(table[tok], we), rmsnorm(rmsnorm(x[t] + delta[t], wf), wh)]`, where
+    /// `tok` is the token that follows row t: `next[t]`, or, when its top bit is set, the
+    /// token just sampled at sample index `next[t] & 0x7fff_ffff`. `wf` is the backbone's
+    /// final norm; its output is rounded to bf16 as the backbone would store it.
+    /// Requires hidden <= 8192. grid = (T), block = (256).
+    #[kernel]
+    pub unsafe fn mtp_prep(
+        x: *const u16,
+        delta: *const u16,
+        wf: *const u16,
+        wh: *const u16,
+        we: *const u16,
+        table: *const u16,
+        next: *const u32,
+        sampled: *const u32,
+        out: *mut u16,
+        hidden: u32,
+        eps: f32,
+    ) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        static mut ROWV: SharedArray<f32, 8192> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let rv = (&raw mut ROWV).cast::<f32>();
+        let t = thread::blockIdx_x() as usize;
+        let h = hidden as usize;
+        let src = t * h;
+        let bd = thread::blockDim_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        // Backbone final norm.
+        let mut ss = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            let v = rb(unsafe { ld(x, src + i) + ld(delta, src + i) });
+            unsafe { *rv.add(i) = v };
+            ss += v * v;
+            i += bd;
+        }
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        let mut ss = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            let v = rb(unsafe { *rv.add(i) * inv * (1.0 + ld(wf, i)) });
+            unsafe { *rv.add(i) = v };
+            ss += v * v;
+            i += bd;
+        }
+        // pre_fc_norm_hidden -> second half.
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        let mut i = tid;
+        while i < h {
+            unsafe { st(out, t * 2 * h + h + i, *rv.add(i) * inv * (1.0 + ld(wh, i))) };
+            i += bd;
+        }
+        // pre_fc_norm_embedding of the next token -> first half.
+        let nx = unsafe { *next.add(t) };
+        let id = if nx & 0x8000_0000 != 0 { unsafe { *sampled.add((nx & 0x7fff_ffff) as usize) } } else { nx } as usize;
+        let mut ss = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            let v = unsafe { ld(table, id * h + i) };
+            ss += v * v;
+            i += bd;
+        }
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        let mut i = tid;
+        while i < h {
+            unsafe { st(out, t * 2 * h + i, ld(table, id * h + i) * inv * (1.0 + ld(we, i))) };
+            i += bd;
+        }
+    }
+
     /// Row-wise argmax, phase 1: grid = (S, P) blocks of 256 threads; block p scans its 1/P of
     /// the row with 16-byte loads and writes its (value, index). Ties go to the lowest index.
     /// Requires n % 8 == 0.

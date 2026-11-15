@@ -93,6 +93,22 @@ pub struct Scratch {
     q: u64,
     logits: u64,
     tok: u64,
+    // MTP head (stubs unless the head is loaded)
+    next: u64,
+    mtp_hfinal: u64,
+    mtp_logits: u64,
+    mtp_tok: u64,
+}
+
+/// The multi-token-prediction head: one full-attention layer over
+/// `fc([norm_e(embed(next token)), norm_h(final-normed hidden)])`, then its own norm and the
+/// shared output head. At position p it predicts token p + 2.
+pub struct Mtp {
+    layer: Layer,
+    fc: u64,
+    norm: u64,
+    pre_e: u64,
+    pre_h: u64,
 }
 
 pub struct LoadStats {
@@ -195,6 +211,10 @@ pub struct Batch {
     /// 64-token chunks of a prefill sequence, its recurrent and conv state are also written to
     /// `slot`. Only with the tensor-core chunked DeltaNet path (`Model::supports_tap`).
     pub seq_tap: Vec<(u32, u32)>,
+    /// Per sequence, the token that follows its last row if it is already known (a prefill
+    /// chunk that does not end the prompt), else `u32::MAX`. Only the MTP head reads it; empty
+    /// = unknown for every sequence.
+    pub next_tok_last: Vec<u32>,
 }
 
 pub struct Model {
@@ -204,6 +224,13 @@ pub struct Model {
     final_norm: u64,
     lm_head: u64,
     pub layers: Vec<Layer>,
+    /// MTP draft head (AQ_MTP=1 and the checkpoint has one).
+    mtp: Option<Mtp>,
+    /// Run the MTP head this step (set by the engine; needs `has_mtp`).
+    pub mtp_on: bool,
+    /// MTP predictions of the last step, one per sampled row: the token expected after the
+    /// one that row sampled. Empty when the head did not run.
+    pub last_mtp: Vec<u32>,
     s: Scratch,
     pub limits: Limits,
     pub load: LoadStats,
@@ -266,7 +293,8 @@ struct LaneState {
 }
 
 /// Allocate one lane's scratch for `lim.max_rows()` token rows (and `lim.max_seqs` sequences).
-fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool) -> Result<Scratch> {
+fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mtp: bool) -> Result<Scratch> {
+    let mrows = if mtp { lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ } else { 0 };
     let hd = cfg.hidden_size;
     let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
     let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
@@ -323,6 +351,10 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool) ->
         q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
         logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
         tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
+        next: gpu.alloc(if mtp { t * 4 } else { 0 })?,
+        mtp_hfinal: gpu.alloc(mrows * hd * 2)?,
+        mtp_logits: gpu.alloc(mrows * cfg.vocab_size * 2)?,
+        mtp_tok: gpu.alloc(mrows * 4)?,
     })
 }
 
@@ -379,8 +411,10 @@ impl Model {
 
         let hv = cfg.linear_num_value_heads;
         let mut lim = limits;
+        // The MTP head is opt-in: it adds one attention layer's KV to every page.
+        let want_mtp = std::env::var("AQ_MTP").as_deref() == Ok("1") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
         if lim.kv_budget_bytes > 0 {
-            let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count();
+            let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
             let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
             lim.kv_blocks = lim.kv_budget_bytes / page_bytes;
         }
@@ -452,6 +486,43 @@ impl Model {
             }
             layers.push(layer);
         }
+        let mtp = if want_mtp {
+            let n = |s: &str| format!("mtp.layers.0.{s}");
+            let sa = |s: &str| n(&format!("self_attn.{s}"));
+            let layer = Layer {
+                kind: LayerKind::Full,
+                in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
+                post_norm: concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])?,
+                gdn_proj: 0,
+                conv_w: 0,
+                a_log: 0,
+                dt_bias: 0,
+                gnorm: 0,
+                out_proj: 0,
+                qkv: concat_bf16(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")])?,
+                q_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?,
+                k_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?,
+                o_proj: concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?,
+                gate_up: concat_bf16(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
+                down: concat_bf16(&mut gpu, &ck, &[n("mlp.down_proj.weight")])?,
+                delta_state: 0,
+                conv_state: 0,
+                k_cache: gpu.alloc(kv_bytes)?,
+                v_cache: gpu.alloc(kv_bytes)?,
+            };
+            Some(Mtp {
+                layer,
+                fc: concat_bf16(&mut gpu, &ck, &["mtp.fc.weight".to_string()])?,
+                norm: concat_bf16(&mut gpu, &ck, &["mtp.norm.weight".to_string()])?,
+                pre_e: concat_bf16(&mut gpu, &ck, &["mtp.pre_fc_norm_embedding.weight".to_string()])?,
+                pre_h: concat_bf16(&mut gpu, &ck, &["mtp.pre_fc_norm_hidden.weight".to_string()])?,
+            })
+        } else {
+            None
+        };
+        if mtp.is_some() {
+            eprintln!("MTP draft head loaded");
+        }
         let weight_bytes = gpu.allocated_bytes;
         gpu.sync()?;
         gpu.free_staging();
@@ -470,7 +541,7 @@ impl Model {
         );
 
         let cc_gdn = std::env::var("AQ_GDN_CHUNK_CC").as_deref() == Ok("1");
-        let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn)?;
+        let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn, mtp.is_some())?;
         gpu.sync()?;
         let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
         let num_sms = gpu.num_sms()?;
@@ -498,6 +569,9 @@ impl Model {
             final_norm,
             lm_head,
             layers,
+            mtp,
+            mtp_on: false,
+            last_mtp: Vec::new(),
             s,
             limits: lim,
             load: LoadStats { open_s, upload_s, weight_bytes },
@@ -545,7 +619,7 @@ impl Model {
         anyhow::ensure!(lane == 1, "decode lane must be lane 1");
         let mut l2 = self.limits;
         l2.max_tokens = l2.max_seqs;
-        let s = alloc_scratch(&mut self.gpu, &self.cfg, &l2, self.cc_gdn)?;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &l2, self.cc_gdn, self.mtp.is_some())?;
         self.gpu.sync()?;
         self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
         self.alt = Some(LaneState {
@@ -573,7 +647,7 @@ impl Model {
         let lane = self.gpu.add_lane(prio)?;
         anyhow::ensure!(lane == 1, "prefill lane must be lane 1");
         let lim = self.limits;
-        let s = alloc_scratch(&mut self.gpu, &self.cfg, &lim, self.cc_gdn)?;
+        let s = alloc_scratch(&mut self.gpu, &self.cfg, &lim, self.cc_gdn, self.mtp.is_some())?;
         self.gpu.sync()?;
         self.lane_events.push(self.gpu.ctx.new_event().map_err(de)?);
         self.alt = Some(LaneState {
@@ -751,6 +825,7 @@ impl Model {
             n_decode: (n == 1) as usize,
             seq_slot_out: Vec::new(),
             seq_tap: Vec::new(),
+            next_tok_last: Vec::new(),
         }
     }
 
@@ -763,6 +838,7 @@ impl Model {
         anyhow::ensure!(!b.tokens.is_empty() && b.tokens.len() <= self.s_cap, "{} tokens exceeds the lane's capacity", b.tokens.len());
         anyhow::ensure!(nseq <= lim.max_seqs, "{nseq} sequences exceeds max_seqs");
         anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
+        self.last_mtp.clear();
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
         if self.use_graphs && pure_decode && dump.is_none() {
             return self.step_graph(b);
@@ -778,6 +854,9 @@ impl Model {
         }
         if ns == 0 {
             return Ok(Vec::new());
+        }
+        if self.mtp_active() {
+            self.last_mtp = self.gpu.download(self.s.mtp_tok, ns)?;
         }
         self.gpu.download(self.s.tok, ns)
     }
@@ -806,7 +885,7 @@ impl Model {
         }
         p.n_decode = bucket;
         self.upload(&p)?;
-        let key = (bucket, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        let key = (bucket + self.mtp_active() as usize * 50_000_000, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
         if let Some((exec, names)) = self.graphs.get(&key) {
             if let Some(p) = self.prof.as_mut() {
                 // The graph replays the event records captured with it.
@@ -831,6 +910,10 @@ impl Model {
             r?;
             let names = self.prof.as_mut().map(|p| std::mem::take(&mut p.names)).unwrap_or_default();
             self.graphs.insert(key, (exec, names));
+        }
+        if self.mtp_active() {
+            self.last_mtp = self.gpu.download(self.s.mtp_tok, bucket)?;
+            self.last_mtp.truncate(n);
         }
         let mut toks = self.gpu.download(self.s.tok, bucket)?;
         toks.truncate(n);
@@ -888,7 +971,7 @@ impl Model {
         self.cur_nd_rows = rows;
         self.cur_splits = self.cur_splits.next_power_of_two().min(if self.cur_split_keys > 0 { ROW_LOCAL_SPLITS } else { MAX_ATTN_SPLITS });
         anyhow::ensure!(rows * self.cur_splits <= attn_part_rows(lim.max_seqs), "decode attention partials overflow");
-        let key = (bucket * 100_000 + rows * 10 + 1, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
+        let key = (bucket * 100_000 + rows * 10 + 1 + self.mtp_active() as usize * 50_000_000, self.cur_splits * 2 + (self.cur_split_keys > 0) as usize);
         if let Some((exec, _)) = self.graphs.get(&key) {
             self.gpu.launch_graph(*exec)?;
         } else {
@@ -904,8 +987,21 @@ impl Model {
             let names = self.prof.as_mut().map(|pr| std::mem::take(&mut pr.names)).unwrap_or_default();
             self.graphs.insert(key, (exec, names));
         }
+        if self.mtp_active() {
+            let all: Vec<u32> = self.gpu.download(self.s.mtp_tok, rows)?;
+            self.last_mtp = b.sample_rows.iter().map(|&r| all[r as usize]).collect();
+        }
         let all = self.gpu.download(self.s.tok, rows)?;
         Ok(b.sample_rows.iter().map(|&r| all[r as usize]).collect())
+    }
+
+    /// Whether the checkpoint's MTP head is loaded.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn mtp_active(&self) -> bool {
+        self.mtp_on && self.mtp.is_some()
     }
 
     fn upload(&mut self, b: &Batch) -> Result<()> {
@@ -996,6 +1092,21 @@ impl Model {
         g.upload(s.seq_slot_out, if b.seq_slot_out.is_empty() { &b.seq_slot } else { &b.seq_slot_out })?;
         g.upload(s.tables, &b.block_tables)?;
         g.upload(s.rows, &b.sample_rows)?;
+        if self.mtp_on && self.mtp.is_some() {
+            // The token after each row: the next row of its sequence, the token it samples
+            // (top bit + sample index, resolved on the GPU), or what the caller says follows.
+            let mut next = vec![0u32; b.tokens.len()];
+            for (k, (&st, &len)) in b.seq_start.iter().zip(&b.seq_len).enumerate() {
+                let (st, len) = (st as usize, len as usize);
+                for r in st..st + len {
+                    next[r] = if r + 1 < st + len { b.tokens[r + 1] } else { b.next_tok_last.get(k).copied().filter(|&t| t != u32::MAX).unwrap_or(0) };
+                }
+            }
+            for (j, &r) in b.sample_rows.iter().enumerate() {
+                next[r as usize] = 0x8000_0000 | j as u32;
+            }
+            g.upload(s.next, &next)?;
+        }
         Ok(())
     }
 
@@ -1036,7 +1147,76 @@ impl Model {
         .map_err(de)?;
         mark!("embed");
 
-        for (li, l) in self.layers.iter().enumerate() {
+        // Final norm, output head and argmax for the sampled rows, from the residual stream
+        // (x + delta) as the last layer left it.
+        macro_rules! head {
+            ($norm:expr, $hfinal:expr, $logits:expr, $tok:expr) => {{
+                unsafe {
+                    g.k.final_norm_rows(
+                        &st,
+                        cfg((ns as u32, 1, 1), 256),
+                        s.x as *const u16,
+                        s.delta as *const u16,
+                        $norm as *const u16,
+                        $hfinal as *mut u16,
+                        s.rows as *const u32,
+                        hd,
+                        eps,
+                    )
+                }
+                .map_err(de)?;
+                mark!("final_norm");
+                g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, c.vocab_size, c.hidden_size, $hfinal, self.lm_head, $logits, CUDA_R_16BF)?;
+                mark!("gemm_lm_head");
+                unsafe {
+                    g.k.argmax_part(
+                        &st,
+                        cfg((ns as u32, ARGMAX_PARTS as u32, 1), 256),
+                        $logits as *const u16,
+                        c.vocab_size as u32,
+                        s.amax_v as *mut f32,
+                        s.amax_i as *mut u32,
+                    )
+                }
+                .map_err(de)?;
+                unsafe {
+                    g.k.argmax_final(&st, cfg((ns as u32, 1, 1), 32), s.amax_v as *const f32, s.amax_i as *const u32, ARGMAX_PARTS as u32, $tok as *mut u32)
+                }
+                .map_err(de)?;
+                mark!("argmax");
+            }};
+        }
+        let nl = self.layers.len();
+        let mtp = if self.mtp_on { self.mtp.as_ref() } else { None };
+        for (li, l) in self.layers.iter().chain(mtp.map(|m| &m.layer)).enumerate() {
+            if li == nl {
+                // The backbone is done: sample, then start the MTP head's residual stream.
+                let m = mtp.unwrap();
+                if ns > 0 {
+                    self.last_logits = s.logits;
+                    head!(self.final_norm, s.hfinal, s.logits, s.tok);
+                }
+                unsafe {
+                    g.k.mtp_prep(
+                        &st,
+                        cfg((t as u32, 1, 1), 256),
+                        s.x as *const u16,
+                        s.delta as *const u16,
+                        self.final_norm as *const u16,
+                        m.pre_h as *const u16,
+                        m.pre_e as *const u16,
+                        self.embed as *const u16,
+                        s.next as *const u32,
+                        s.tok as *const u32,
+                        s.proj as *mut u16,
+                        hd,
+                        eps,
+                    )
+                }
+                .map_err(de)?;
+                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, m.fc, s.x, CUDA_R_16BF)?;
+                mark!("mtp_in");
+            }
             unsafe {
                 g.k.add_rmsnorm(
                     &st,
@@ -1047,7 +1227,7 @@ impl Model {
                     s.h as *mut u16,
                     hd,
                     eps,
-                    (li > 0) as u32,
+                    (li > 0 && li != nl) as u32,
                 )
             }
             .map_err(de)?;
@@ -1496,7 +1676,7 @@ impl Model {
             g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
             mark!("gemm_down");
 
-            if let Some(d) = dump.as_deref_mut() {
+            if let Some(d) = dump.as_deref_mut().filter(|_| li < nl) {
                 let x: Vec<u16> = g.download(s.x, t * c.hidden_size)?;
                 let dl: Vec<u16> = g.download(s.delta, t * c.hidden_size)?;
                 d.push(
@@ -1513,40 +1693,13 @@ impl Model {
         if ns == 0 {
             return Ok(());
         }
-        self.last_logits = s.logits;
-        unsafe {
-            g.k.final_norm_rows(
-                &st,
-                cfg((ns as u32, 1, 1), 256),
-                s.x as *const u16,
-                s.delta as *const u16,
-                self.final_norm as *const u16,
-                s.hfinal as *mut u16,
-                s.rows as *const u32,
-                hd,
-                eps,
-            )
+        match mtp {
+            Some(m) => head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok),
+            None => {
+                self.last_logits = s.logits;
+                head!(self.final_norm, s.hfinal, s.logits, s.tok);
+            }
         }
-        .map_err(de)?;
-        mark!("final_norm");
-        g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, c.vocab_size, c.hidden_size, s.hfinal, self.lm_head, s.logits, CUDA_R_16BF)?;
-        mark!("gemm_lm_head");
-        unsafe {
-            g.k.argmax_part(
-                &st,
-                cfg((ns as u32, ARGMAX_PARTS as u32, 1), 256),
-                s.logits as *const u16,
-                c.vocab_size as u32,
-                s.amax_v as *mut f32,
-                s.amax_i as *mut u32,
-            )
-        }
-        .map_err(de)?;
-        unsafe {
-            g.k.argmax_final(&st, cfg((ns as u32, 1, 1), 32), s.amax_v as *const f32, s.amax_i as *const u32, ARGMAX_PARTS as u32, s.tok as *mut u32)
-        }
-        .map_err(de)?;
-        mark!("argmax");
         Ok(())
     }
 

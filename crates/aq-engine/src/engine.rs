@@ -69,6 +69,9 @@ struct Seq {
     /// row limit) after a step that accepted a full draft, because copy runs are long and a
     /// longer draft only pays while they last.
     k_cur: usize,
+    /// The MTP head's prediction for the token after the last known one, with the number of
+    /// known tokens it was made at.
+    mtp_next: Option<(usize, u32)>,
     /// When the request was submitted and admitted, and the steps it took part in before its
     /// first token (AQ_TRACE request log).
     t_add: Instant,
@@ -224,6 +227,9 @@ pub struct SpecStats {
     /// Draft tokens that came from the cross-session model (the rest: prompt lookup).
     pub global_drafted: u64,
     pub global_accepted: u64,
+    /// Drafts whose first token came from the MTP head, and how many of those were accepted.
+    pub mtp_drafted: u64,
+    pub mtp_accepted: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -378,6 +384,9 @@ impl Engine {
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
             dead_only: false,
         };
+        // The MTP head keeps its own KV over the whole context, so it runs on every step of
+        // every lane once it is loaded (AQ_MTP=1).
+        eng.model.mtp_on = eng.model.has_mtp();
         if let Some(n) = std::env::var("AQ_BG_PREFILL").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
             eng.enable_bg_prefill(n).expect("could not create the background prefill lane");
         } else if std::env::var("AQ_COEXEC").as_deref() == Ok("1") {
@@ -998,7 +1007,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed, k_cur: 0 });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed, k_cur: 0, mtp_next: None });
         Ok(true)
     }
 
@@ -1006,7 +1015,7 @@ impl Engine {
     /// occurrence of the longest suffix n-gram of its known tokens (see [`DraftIndex`]).
     /// Returns the draft and how many of its leading tokens came from the prompt lookup; the
     /// rest were added by the cross-session model.
-    fn draft(&mut self, i: usize, k: usize) -> (Vec<u32>, usize) {
+    fn draft(&mut self, i: usize, k: usize) -> (Vec<u32>, usize, bool) {
         let (min_n, max_n) = (self.spec_min_ngram, self.spec_max_ngram);
         let s = &mut self.running[i];
         let mut idx = match s.draft.take() {
@@ -1018,13 +1027,23 @@ impl Engine {
         }
         let mut d = idx.draft(k);
         s.draft = Some(idx);
-        let local = d.len();
+        let mut local = d.len();
+        // The MTP head's prediction for the next token outranks a lookup that disagrees with
+        // it: the head has seen the whole context, the lookup only the last few tokens.
+        let mtp = s.mtp_next.filter(|&(at, _)| at == s.known()).map(|(_, t)| t);
+        if let Some(t) = mtp {
+            if d.first() != Some(&t) {
+                d.clear();
+                d.push(t);
+                local = 0;
+            }
+        }
         if self.global_draft && d.len() < k {
             let n = s.known();
             let tail: Vec<u32> = (n.saturating_sub(4)..n).map(|p| s.token_at(p)).collect();
             self.global.extend(&tail, &mut d, k);
         }
-        (d, local)
+        (d, local, mtp.is_some())
     }
 
     fn ensure_blocks(&mut self, si: usize, upto: usize) -> Result<()> {
@@ -1058,6 +1077,7 @@ impl Engine {
             let mut row = s.blocks.clone();
             row.resize(mb, 0);
             b.block_tables.extend_from_slice(&row);
+            b.next_tok_last.push(if upto < s.known() { s.token_at(upto) } else { u32::MAX });
             if upto == s.known() {
                 b.sample_rows.push(b.tokens.len() as u32 - 1);
                 sampled.push(i);
@@ -1314,6 +1334,7 @@ impl Engine {
         let mut plan: Vec<(usize, usize)> = Vec::new(); // (running index, n tokens)
         let mut drafts: Vec<Vec<u32>> = Vec::new(); // per decode entry
         let mut draft_local: Vec<usize> = Vec::new(); // leading tokens from the prompt lookup
+        let mut draft_mtp: Vec<bool> = Vec::new(); // first token backed by the MTP head
         for i in 0..self.running.len() {
             let s = &self.running[i];
             if s.computed < s.req.prompt.len() || budget == 0 {
@@ -1323,11 +1344,12 @@ impl Engine {
             let rem = s.req.max_new_tokens - s.out.len();
             let mut d = Vec::new();
             let mut local = 0;
+            let mut from_mtp = false;
             if self.spec_k > 0 && rem > 1 {
                 let k_cur = s.k_cur.max(self.spec_k);
                 let kmax = k_cur.min(rem - 1).min(MAX_DECODE_ROWS_PER_SEQ.saturating_sub(pending));
                 if kmax > 0 {
-                    (d, local) = self.draft(i, kmax);
+                    (d, local, from_mtp) = self.draft(i, kmax);
                 }
             }
             if !d.is_empty() && self.running[i].spare.is_none() {
@@ -1350,6 +1372,7 @@ impl Engine {
             let n = pending + d.len();
             plan.push((i, n));
             draft_local.push(local.min(d.len()));
+            draft_mtp.push(from_mtp && !d.is_empty());
             drafts.push(d);
             budget -= 1;
         }
@@ -1481,6 +1504,7 @@ impl Engine {
             let mut row = s.blocks.clone();
             row.resize(mb, 0);
             b.block_tables.extend_from_slice(&row);
+            b.next_tok_last.push(if upto < s.known() { s.token_at(upto) } else { u32::MAX });
             if s.computed + real == s.known() {
                 // Sample at the last known token and at every draft.
                 let first = b.tokens.len() - d.len() - 1;
@@ -1586,8 +1610,14 @@ impl Engine {
                     st.accepted += m as u64;
                     st.global_drafted += (d.len() - draft_local[k]) as u64;
                     st.global_accepted += m.saturating_sub(draft_local[k]) as u64;
+                    if draft_mtp[k] {
+                        st.mtp_drafted += 1;
+                        st.mtp_accepted += (m >= 1) as u64;
+                    }
                 }
             }
+            // The MTP head's prediction at the row whose sample is the last token emitted.
+            let mtp_pred = if nr > 0 { self.model.last_mtp.get(r0 + m).copied() } else { None };
             let mut finished = false;
             for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
                 s.out.push(tok);
@@ -1617,6 +1647,7 @@ impl Engine {
                     break;
                 }
             }
+            s.mtp_next = mtp_pred.map(|t| (s.known(), t));
             if finished {
                 done.push(i);
             }
