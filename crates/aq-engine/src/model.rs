@@ -246,7 +246,7 @@ pub struct Model {
     final_norm: u64,
     lm_head: u64,
     pub layers: Vec<Layer>,
-    /// MTP draft head (AQ_MTP=1 and the checkpoint has one).
+    /// MTP draft head (when the checkpoint has one, unless AQ_MTP=0).
     mtp: Option<Mtp>,
     /// Run the MTP head this step (set by the engine; needs `has_mtp`).
     pub mtp_on: bool,
@@ -441,8 +441,9 @@ impl Model {
 
         let hv = cfg.linear_num_value_heads;
         let mut lim = limits;
-        // The MTP head is opt-in: it adds one attention layer's KV to every page.
-        let want_mtp = std::env::var("AQ_MTP").as_deref() == Ok("1") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
+        // The MTP draft head is used whenever the checkpoint ships one (AQ_MTP=0 turns it off).
+        // It adds one attention layer's KV to every page (9 instead of 8 layers for the 9B).
+        let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
             let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;

@@ -391,7 +391,7 @@ impl Engine {
             dead_only: false,
         };
         // The MTP head keeps its own KV over the whole context, so it runs on every step of
-        // every lane once it is loaded (AQ_MTP=1).
+        // every lane once it is loaded.
         eng.model.mtp_on = eng.model.has_mtp();
         if let Some(n) = std::env::var("AQ_BG_PREFILL").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
             eng.enable_bg_prefill(n).expect("could not create the background prefill lane");

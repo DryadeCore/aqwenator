@@ -34,8 +34,25 @@ Results (Qwen3.5-9B, real traces):
 | B200 | 16 | aqwenator, no MTP | 319.4 | 842 | 67 / 1898 |
 | B200 | 16 | aqwenator, MTP head (1 draft) | 338.8 | 896 | 72 / 1688 |
 
-Open: the MTP head and the GEMM plan fix have not been measured on the Spark (it was busy);
-vLLM still has the better TTFT p99 at 16 agents on the Spark; merge to main.
+Spark, quiet window, 24 GB KV pool, 5 min per leg (2026-11-15):
+
+| Agents | Build | Turns/min | Tok/s | TPOT p50/p99 (ms) | TTFT p50/p99 (ms) | Tok/step |
+|---|---|---|---|---|---|---|
+| 8 | no MTP | 50.8 | 117 | 47.3 / 127.9 | 342 / 3975 | 2.62 |
+| 8 | MTP head | 58.4 | 151 | 36.7 / 74.0 | 337 / 2426 | 3.47 |
+| 8 | MTP + background prefill lane | 54.0 | 135 | 41.6 / 96.6 | 364 / 3171 | 3.45 |
+| 16 | no MTP | 73.2 | 168 | 73.2 / 161.1 | 547 / 4444 | 2.62 |
+| 16 | MTP head | 80.0 | 193 | 58.4 / 189.6 | 520 / 6850 | 3.47 |
+| 16 | MTP + background prefill lane | 78.0 | 188 | 59.9 / 157.2 | 533 / 6287 | 3.45 |
+
+So the MTP head is on by default when the checkpoint has one (`AQ_MTP=0` disables it). The
+background prefill lane (`AQ_BG_PREFILL=4096`) stays opt-in: on the B200 it cuts the 16-agent
+TTFT p99 from 1236 ms to 351-378 ms (the tail there is head-of-line blocking behind 20-30k-token
+first turns), but on the Spark, which has no spare GPU capacity for a second stream, it costs
+throughput and does not help the tail. `tools/trace_tail.py` dissects the tail from AQ_TRACE logs.
+
+Open: the TTFT p99 at 16 agents on the Spark (4.4-6.9 s here, noisy at 5-minute runs; vLLM had
+2.3 s); the GEMM plan fix has not been re-verified on the Spark with 9B; merge to main.
 
 Gate status: `aq-check` on the B200, 6 goldens x {default, small budget, SRPT}, passes with
 and without `AQ_MTP=1`.
