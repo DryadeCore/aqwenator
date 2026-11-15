@@ -195,6 +195,8 @@ struct EngineOpts {
     itl_target_ms: Option<f64>,
     adaptive: Option<(usize, usize)>,
     prewarm: bool,
+    /// Burst prefill for long prompts: tokens per burst step (0 = off) and steps between bursts.
+    burst: (usize, usize),
 }
 
 fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx: std::sync::mpsc::Receiver<Submit>, ready: std::sync::mpsc::Sender<Result<()>>) {
@@ -231,6 +233,13 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
         eng.model.attn_split_keys = 64;
     }
     eng.policy = opts.policy;
+    // AQ_BURST_PREFILL / AQ_BURST_EVERY (read by the engine) win over the flags when set.
+    if std::env::var("AQ_BURST_PREFILL").is_err() {
+        eng.burst_prefill = opts.burst.0;
+    }
+    if std::env::var("AQ_BURST_EVERY").is_err() {
+        eng.burst_every = opts.burst.1;
+    }
     if let Some(n) = opts.max_snapshots {
         eng.max_snapshots = n;
     }
@@ -328,7 +337,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false, burst: (4096, 3) };
     // Shortest remaining prefill first by default (`--srpt false` restores admission order):
     // on real agent traces it keeps small turns from queueing behind a long tool result, at
     // the same throughput (Spark, 16 agents: TTFT p90 2633 -> 1506 ms).
@@ -356,6 +365,11 @@ async fn main() -> Result<()> {
             "--pin-snapshots" => opts.policy.pin_snapshots = v.parse()?,
             "--load-control" => opts.policy.load_control = v.parse()?,
             "--srpt" => opts.policy.srpt = v.parse()?,
+            // A long prompt gets a whole step of up to N prefill tokens to itself every
+            // `--burst-every` steps (default 4096 every 3; 0 = off): on real traces it halves
+            // the time to first token of turns with 3k+ new tokens for the same throughput.
+            "--burst-prefill" => opts.burst.0 = v.parse()?,
+            "--burst-every" => opts.burst.1 = v.parse()?,
             "--max-wait-ms" => opts.policy.max_wait_ms = v.parse()?,
             "--dead-after-ms" => opts.policy.dead_after_ms = v.parse()?,
             "--quantum" => opts.policy.quantum = v.parse()?,

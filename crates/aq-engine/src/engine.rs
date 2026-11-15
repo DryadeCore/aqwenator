@@ -284,6 +284,11 @@ pub struct Engine {
     /// chaining raised tokens per step from 3.78 to 4.21 but not throughput, because the
     /// prompt-lookup and cross-session drafts already extend the first MTP token for free).
     pub mtp_k: usize,
+    /// Burst prefill (AQ_BURST_PREFILL=tokens, 0 = off) and the minimum number of steps
+    /// between two bursts (AQ_BURST_EVERY, default 3).
+    pub burst_prefill: usize,
+    pub burst_every: usize,
+    since_burst: usize,
     /// AQ_SPEC_TRACE: log every decode entry's draft, targets and acceptance.
     spec_trace: bool,
     /// AQ_SPEC_FAULT=N: test hook for the correctness check itself. Every Nth rejected draft
@@ -369,6 +374,9 @@ impl Engine {
             global: NgramModel::new(2, 4),
             spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
             mtp_k: std::env::var("AQ_MTP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            burst_prefill: std::env::var("AQ_BURST_PREFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            burst_every: std::env::var("AQ_BURST_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            since_burst: 0,
             spec_trace: std::env::var("AQ_SPEC_TRACE").is_ok(),
             spec_fault: std::env::var("AQ_SPEC_FAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             spec_rejects: 0,
@@ -1435,6 +1443,22 @@ impl Engine {
                 }
             }
         }
+        // Burst prefill: a long prompt fed 1280 tokens at a time pays the step's fixed cost
+        // (and the decode rows) once per slice, and shares the slices with other prompts. Every
+        // `burst_every` steps the longest-waiting prompt that needs more than the budget gets a
+        // step's whole prefill allowance up to `burst_prefill` tokens instead: fewer, longer
+        // steps for it, at the price of one long inter-token gap for the decoding sequences.
+        let mut burst = false;
+        if self.burst_prefill > 0 && decode_seqs > 0 && self.since_burst >= self.burst_every {
+            let left = |i: usize| self.running[i].req.prompt.len() - self.running[i].computed;
+            if let Some(&e) = prefill.iter().filter(|&&i| left(i) > budget).min_by_key(|&&i| self.running[i].t_add) {
+                elder = Some((e, self.burst_prefill.max(budget)));
+                prefill.retain(|&i| i != e);
+                prefill.insert(0, e);
+                burst = true;
+            }
+        }
+        self.since_burst = if burst { 0 } else { self.since_burst.saturating_add(1) };
         // Checkpoints taken inside this step's prefill: (plan index, position, slot).
         let mut taps: Vec<(usize, usize, u32)> = Vec::new();
         let can_tap = self.model.supports_tap();

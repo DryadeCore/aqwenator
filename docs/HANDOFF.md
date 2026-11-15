@@ -64,9 +64,25 @@ Same-window head-to-head on the Spark (both with MTP speculation, 5 min per leg,
 `aq-serve` now orders prefill shortest-first by default (`--srpt false` for admission order).
 A larger per-step prefill budget (2560) pushed ITL p99 to ~800 ms without helping.
 
-Open: turns with 3,000+ new tokens on the Spark at 16 agents (TTFT p50/p90 3.4/6.5 s against
-vLLM's 1.3/2.9 s); they set our p99. They take 6-9 throttled steps of 1280 tokens while vLLM
-prefills them in about two large chunks. Also: the GEMM plan fix has not been re-verified on
+Burst prefill (default in `aq-serve`: `--burst-prefill 4096 --burst-every 3`, 0 = off; engine
+knobs `AQ_BURST_PREFILL` / `AQ_BURST_EVERY`): every few steps the longest-waiting prompt that
+needs more than the per-step budget gets a whole step of up to N prefill tokens to itself.
+Spark, 16 agents, 5 min, turns with 3,000+ new tokens (p50/p90 TTFT) and overall:
+
+| Setting | Turns/min | TTFT p50/p90/p99 (ms) | 3k+ turns p50/p90 (ms) | ITL p99 (ms) |
+|---|---|---|---|---|
+| no burst (shortest first) | 82.0 | 469 / 1506 / 5631 | 3409 / 6478 | 464 |
+| burst 4096 every 3 | 85.8 | 455 / 1565 / 4128 | 2355 / 4266 | 482 |
+| burst 3072 every 2 | 83.2 | 533 / 1861 / 3741 | 2566 / 3861 | 511 |
+| burst 6144 every 4 | 79.4 | 552 / 1864 / 3745 | 1725 / 3288 | 496 |
+| vLLM 0.33, MTP | 57.4 | 1022 / 1882 / 2909 | 1347 / 2909 | 763 |
+
+Bursts are rare enough that ITL p99 hardly moves. Larger bursts close more of the gap on big
+turns but make small turns wait a little longer (p90 for <1k-token turns 658-805 ms without,
+782-1054 with 4096, 1138-1439 with 6144; vLLM 1707).
+
+Open: vLLM still has the better TTFT p99 at 16 agents (2.9 s vs 3.7-4.1 s) and the better p90
+for turns with 1k+ new tokens. Also: the GEMM plan fix has not been re-verified on
 the Spark with 9B; merge to main.
 
 Gate status: `aq-check` on the B200, 6 goldens x {default, small budget, SRPT}, passes with
