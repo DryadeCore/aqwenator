@@ -57,7 +57,8 @@ impl Gpu {
             stage: Vec::new(),
             allocated_bytes: WORKSPACE_BYTES,
             capturing: Default::default(),
-            gemm_min_m: 0,
+            // AQ_GEMM_MIN_M: debugging aid, pins small GEMMs to one plan size.
+            gemm_min_m: std::env::var("AQ_GEMM_MIN_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         };
         if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
             me.print_kernel_info()?;

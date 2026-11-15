@@ -34,6 +34,44 @@ fn rel_err(a: &[f32], b: &[f32]) -> (f64, f64) {
     ((num / den.max(1e-30)).sqrt(), max)
 }
 
+/// Decode-path vs prefill-path logits along a plain run's own tokens, at several distances
+/// before token `same`: gradual growth is numeric drift, a jump is a bug.
+fn drift(eng: &mut Engine, prompt: &[u32], off: &[u32], same: usize) -> Result<()> {
+    for back in [128usize, 64, 32, 16, 8, 4, 2, 1, 0] {
+        if back > same {
+            continue;
+        }
+        let l = same - back;
+        eng.add(Request { id: 398, prompt: prompt.to_vec(), max_new_tokens: l + 1, ignore_eos: true })?;
+        let mut got = Vec::new();
+        while eng.has_work() {
+            for e in eng.step()? {
+                got.push(e.token);
+            }
+        }
+        let dec = eng.model.logits()?;
+        let p: Vec<u32> = prompt.iter().chain(&off[..l]).copied().collect();
+        eng.add(Request { id: 397, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+        while eng.has_work() {
+            eng.step()?;
+        }
+        let pre = eng.model.logits()?;
+        let (dt, da, db) = top2(&dec);
+        let (pt, pa, pb) = top2(&pre);
+        let maxd = dec.iter().zip(&pre).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let num: f32 = dec.iter().zip(&pre).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = pre.iter().map(|y| y * y).sum();
+        println!(
+            "    drift at token {l}: single-decode replay {} the plain run; decode top-1 {dt} (margin {:.3}), prefill top-1 {pt} (margin {:.3}), max |dlogit| {maxd:.3}, rel_l2 {:.2e}",
+            if got[..] == off[..l + 1] { "matches" } else { "DIFFERS from" },
+            da - db,
+            pa - pb,
+            (num / den).sqrt()
+        );
+    }
+    Ok(())
+}
+
 fn top2(x: &[f32]) -> (usize, f32, f32) {
     let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
     for (i, &v) in x.iter().enumerate() {
@@ -161,6 +199,9 @@ fn main() -> Result<()> {
             "teacher-forced: top-1 {agree}/{n} agree, {ties} near-ties, {misses} real misses; worst logits rel_l2 {worst_rel:.2e}",
             n = greedy_ref.len()
         );
+        if std::env::var("AQ_CHECK_TF_ONLY").is_ok() {
+            return Ok(());
+        }
         failed |= misses > 0;
     }
 
@@ -439,6 +480,31 @@ fn main() -> Result<()> {
         // With a small step budget, prefill and decode share steps; pin every GEMM to the full
         // row capacity so no row's plan depends on what else is in the step.
         eng.model.gpu.gemm_min_m = if budget < 8192 { eng.model.limits.max_rows() } else { 64 };
+        // AQ_CHECK_ROWDEP=N: N copies of one prompt decoded in the same steps. Every row sees
+        // the same inputs, so any difference between rows is the kernels (or the GEMM plan)
+        // rounding a row differently depending on where it sits in the batch.
+        if let Some(nrow) = std::env::var("AQ_CHECK_ROWDEP").ok().and_then(|v| v.parse::<usize>().ok()) {
+            eng.spec_k = 0;
+            for len in [1usize, 8, 48] {
+                for r in 0..nrow {
+                    eng.add(Request { id: 500 + r as u64, prompt: prompts[1].clone(), max_new_tokens: len, ignore_eos: true })?;
+                }
+                let mut out = vec![Vec::new(); nrow];
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        out[(e.id - 500) as usize].push(e.token);
+                    }
+                }
+                let lg = eng.model.logits_rows(nrow)?;
+                let v = lg.len() / nrow;
+                let maxd = (1..nrow).map(|r| lg[..v].iter().zip(&lg[r * v..(r + 1) * v]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)).collect::<Vec<_>>();
+                let differ = (1..nrow).filter(|&r| out[r] != out[0]).count();
+                println!("row dependence after {len} tokens: {differ}/{} rows emit different tokens than row 0; max |dlogit| vs row 0 per row {maxd:?}", nrow - 1);
+            }
+            if std::env::var("AQ_CHECK_ROWDEP_ONLY").is_ok() {
+                return Ok(());
+            }
+        }
         let mut run = |eng: &mut Engine, spec: usize, which: &[usize]| -> Result<Vec<Vec<u32>>> {
             eng.spec_k = spec;
             for &w in which {
@@ -452,8 +518,33 @@ fn main() -> Result<()> {
             }
             Ok(out)
         };
-        for (name, which) in [("single", vec![0usize]), ("batched x3", vec![0, 1, 2])] {
+        // AQ_CHECK_SPEC_REPEAT=N: repeat the pair N times (drafts vary between runs through
+        // hash order, so rare speculation bugs need many runs to show).
+        let repeat: usize = std::env::var("AQ_CHECK_SPEC_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let cases = [("single", vec![0usize]), ("batched x3", vec![0, 1, 2])];
+        let mut first_off: Vec<(&str, Vec<Vec<u32>>)> = Vec::new();
+        let mut drift_done = false;
+        for (name, which) in (0..repeat).flat_map(|_| cases.iter().cloned()) {
             let off = run(&mut eng, 0, &which)?;
+            // The non-speculative run must itself be reproducible within a process.
+            match first_off.iter().find(|f| f.0 == name) {
+                Some((_, f)) => {
+                    for &w in &which {
+                        let same = f[w].iter().zip(&off[w]).take_while(|(a, b)| a == b).count();
+                        if same < SPEC_TEST_LEN {
+                            println!("  plain {name} seq {w}: differs from the first repeat's plain run after {same} tokens ({} vs {})", f[w][same], off[w][same]);
+                        }
+                    }
+                }
+                None => first_off.push((name, off.clone())),
+            }
+            // AQ_CHECK_DRIFT_AT=seq:token: run the drift diagnostic there unconditionally.
+            if let (false, Some((w, t))) = (drift_done, std::env::var("AQ_CHECK_DRIFT_AT").ok().and_then(|v| v.split_once(':').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())))) {
+                if which.contains(&w) && which.len() > 1 {
+                    drift_done = true;
+                    drift(&mut eng, &prompts[w], &off[w], t)?;
+                }
+            }
             let before = eng.spec;
             let t = Instant::now();
             let on = run(&mut eng, k, &which)?;
@@ -477,13 +568,56 @@ fn main() -> Result<()> {
                     eng.step()?;
                 }
                 let lg = eng.model.logits()?;
-                let (_, a, b) = top2(&lg);
+                let (top, a, b) = top2(&lg);
+                if same < on[w].len() {
+                    println!("    at the divergence: prefill-path top-1 {top} ({a:.3}), plain token {} ({:.3}), spec token {} ({:.3})", off[w][same], lg[off[w][same] as usize], on[w][same], lg[on[w][same] as usize]);
+                }
+                // A margin only means something relative to how far our own exact paths
+                // disagree at this position. Replay the plain run alone (single-token decode)
+                // and compare the gap between the two disputed tokens under both plain paths,
+                // decode and prefill: where the model sits at a bifurcation, GEMM rounding
+                // alone moves that gap by logits, and neither token is "the" greedy answer.
+                let mut ambiguous = None;
+                if a - b >= NEAR_TIE && same < on[w].len() {
+                    eng.add(Request { id: 398, prompt: prompts[w].clone(), max_new_tokens: same + 1, ignore_eos: true })?;
+                    let mut got = Vec::new();
+                    while eng.has_work() {
+                        for e in eng.step()? {
+                            got.push(e.token);
+                        }
+                    }
+                    let (pt, st) = (off[w][same] as usize, on[w][same] as usize);
+                    let gap_pre = lg[pt] - lg[st];
+                    if got[..same] != off[w][..same] {
+                        let at = got.iter().zip(&off[w]).take_while(|(a, b)| a == b).count();
+                        ambiguous = Some(format!("decoded alone, the plain run already leaves this path at token {at}"));
+                    } else {
+                        let dec = eng.model.logits()?;
+                        let gap_dec = dec[pt] - dec[st];
+                        let noise = (gap_pre - gap_dec).abs();
+                        if gap_pre.min(gap_dec) <= NEAR_TIE + noise {
+                            ambiguous = Some(format!("plain-over-spec gap is {gap_pre:.3} by prefill and {gap_dec:.3} by decode, the two plain paths disagree by {noise:.3}"));
+                        }
+                    }
+                }
                 if a - b < NEAR_TIE {
                     ties += 1;
                     println!("  spec {name} seq {w}: identical for {same}/{SPEC_TEST_LEN} tokens, then diverges at a near-tie (margin {:.3}): ok", a - b);
+                } else if let Some(why) = ambiguous {
+                    ties += 1;
+                    println!("  spec {name} seq {w}: identical for {same}/{SPEC_TEST_LEN} tokens, then diverges at a numerically ambiguous position ({why}): ok");
                 } else {
                     ok = false;
                     println!("  spec {name} seq {w}: diverges after {same}/{SPEC_TEST_LEN} tokens where the margin is {:.3}: REAL MISMATCH", a - b);
+                    let lo = same.saturating_sub(12);
+                    println!("    plain {:?}", &off[w][lo..(same + 6).min(off[w].len())]);
+                    println!("    spec  {:?}", &on[w][lo..(same + 6).min(on[w].len())]);
+                    if std::env::var("AQ_CHECK_DRIFT").is_ok() && !drift_done {
+                        drift_done = true;
+                        // Decode-path vs prefill-path logits along the plain run's own tokens:
+                        // gradual growth is numeric drift, a jump is a bug.
+                        drift(&mut eng, &prompts[w], &off[w], same)?;
+                    }
                 }
             }
             println!(

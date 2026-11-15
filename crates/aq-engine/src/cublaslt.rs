@@ -152,22 +152,40 @@ impl CublasLt {
                 if got == 0 {
                     bail!("no cuBLASLt algo for m={m} n={n} k={k}");
                 }
+                // The heuristic's first candidate stays unless another is measurably faster:
+                // best-of-5 timings and a 3% bar keep the choice (and with it the rounding
+                // of every result) from flipping between processes on a busy GPU.
                 let mut best = (f64::INFINITY, res[0].algo);
-                if got > 1 {
-                    for r in &res[..got as usize] {
+                // AQ_GEMM_PICK=seed: debugging aid, picks a pseudo-random working candidate
+                // per plan instead, to test how sensitive outputs are to the plan choice.
+                let pick = std::env::var("AQ_GEMM_PICK").ok().and_then(|v| v.parse::<u64>().ok());
+                if let Some(seed) = pick {
+                    let h = (seed ^ (m as u64) << 40 ^ (n as u64) << 20 ^ k as u64 ^ (out_ty as u64) << 60).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
+                    for o in 0..got as usize {
+                        let r = &res[(h as usize + o) % got as usize];
                         let plan = Plan { desc, a, b, c, algo: r.algo };
-                        // Warm once, then time 3 runs on the real buffers.
+                        if self.run(stream, &plan, x, w, y).is_ok() {
+                            sync(stream)?;
+                            best = (0.0, r.algo);
+                            break;
+                        }
+                    }
+                } else if got > 1 {
+                    for (ci, r) in res[..got as usize].iter().enumerate() {
+                        let plan = Plan { desc, a, b, c, algo: r.algo };
+                        // Warm once, then take the fastest of 5 runs on the real buffers.
                         if self.run(stream, &plan, x, w, y).is_err() {
                             continue;
                         }
                         sync(stream)?;
-                        let t = std::time::Instant::now();
-                        for _ in 0..3 {
+                        let mut dt = f64::INFINITY;
+                        for _ in 0..5 {
+                            let t = std::time::Instant::now();
                             self.run(stream, &plan, x, w, y)?;
+                            sync(stream)?;
+                            dt = dt.min(t.elapsed().as_secs_f64());
                         }
-                        sync(stream)?;
-                        let dt = t.elapsed().as_secs_f64();
-                        if dt < best.0 {
+                        if best.0.is_infinite() || dt < best.0 * if ci == 0 { 1.0 } else { 0.97 } {
                             best = (dt, r.algo);
                         }
                     }

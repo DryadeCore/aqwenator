@@ -273,6 +273,12 @@ pub struct Engine {
     /// Grow a sequence's draft length while its drafts are fully accepted (off with
     /// AQ_NO_SPEC_ADAPT).
     pub spec_adaptive: bool,
+    /// AQ_SPEC_TRACE: log every decode entry's draft, targets and acceptance.
+    spec_trace: bool,
+    /// AQ_SPEC_FAULT=N: test hook for the correctness check itself. Every Nth rejected draft
+    /// is emitted as if it had been accepted, which the check must report as a mismatch.
+    spec_fault: u64,
+    spec_rejects: u64,
     /// Max prefill tokens in a step that also carries decode tokens. Bounds how long a running
     /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
     /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
@@ -351,6 +357,9 @@ impl Engine {
             global_draft: std::env::var("AQ_NO_GLOBAL_DRAFT").is_err(),
             global: NgramModel::new(2, 4),
             spec_adaptive: std::env::var("AQ_NO_SPEC_ADAPT").is_err(),
+            spec_trace: std::env::var("AQ_SPEC_TRACE").is_ok(),
+            spec_fault: std::env::var("AQ_SPEC_FAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            spec_rejects: 0,
             mixed_prefill_budget: usize::MAX,
             coexec: false,
             inflight: None,
@@ -363,7 +372,8 @@ impl Engine {
             prompt_checkpoints: std::env::var("AQ_NO_CKPT").is_err(),
             trace: std::env::var("AQ_TRACE").as_deref() == Ok("1"),
             bg_prefill: 0,
-            policy: Policy::default(),
+            // AQ_SRPT=1: test hook, so aq-check can run its suite under the SRPT prefill order.
+            policy: Policy { srpt: std::env::var("AQ_SRPT").as_deref() == Ok("1"), ..Policy::default() },
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
             dead_only: false,
@@ -1377,8 +1387,21 @@ impl Engine {
                 left > 0 && left < bg_min && !s.in_prefill
             })
             .collect();
+        // With SRPT the longest-waiting prompt would starve behind a stream of shorter ones, so
+        // it goes first with a guaranteed share: half the budget, or more when the shorter
+        // prompts cannot use their half.
+        let mut elder: Option<(usize, usize)> = None;
         if self.policy.srpt {
-            prefill.sort_by_key(|&i| self.running[i].req.prompt.len() - self.running[i].computed);
+            let left = |i: usize| self.running[i].req.prompt.len() - self.running[i].computed;
+            prefill.sort_by_key(|&i| left(i));
+            if let Some(&e) = prefill.iter().min_by_key(|&&i| self.running[i].t_add) {
+                if e != prefill[0] && left(e) > SMALL_PREFILL {
+                    let others: usize = prefill.iter().filter(|&&i| i != e && left(i) > SMALL_PREFILL).map(|&i| left(i)).sum();
+                    elder = Some((e, (budget / 2).max(budget.saturating_sub(others))));
+                    prefill.retain(|&i| i != e);
+                    prefill.insert(0, e);
+                }
+            }
         }
         // Checkpoints taken inside this step's prefill: (plan index, position, slot).
         let mut taps: Vec<(usize, usize, u32)> = Vec::new();
@@ -1393,7 +1416,11 @@ impl Engine {
             // weights a step streams anyway they cost almost nothing, and making a short
             // turn (or the last few tokens after a checkpoint) wait behind a long prompt is
             // what the time-to-first-token tail is made of.
-            let mut n = if rem <= SMALL_PREFILL { rem.min(room) } else { rem.min(budget).min(room) };
+            let cap = match elder {
+                Some((e, share)) if e == i => share,
+                _ => budget,
+            };
+            let mut n = if rem <= SMALL_PREFILL { rem.min(room) } else { rem.min(cap).min(room) };
             if n == 0 {
                 continue;
             }
@@ -1514,10 +1541,28 @@ impl Engine {
         for (k, &(i, n)) in plan.iter().enumerate() {
             let d: &[u32] = if k < decode_seqs { &drafts[k] } else { &[] };
             let (r0, nr) = samples[k];
-            let targets = &toks[r0..r0 + nr];
+            let mut targets = toks[r0..r0 + nr].to_vec();
             // Accept drafts while they equal the target's greedy choice at the previous row.
-            let m = d.iter().zip(targets).take_while(|(a, b)| a == b).count();
+            let m = d.iter().zip(&targets).take_while(|(a, b)| a == b).count();
+            if self.spec_fault > 0 && m < d.len() {
+                self.spec_rejects += 1;
+                if self.spec_rejects % self.spec_fault == 0 {
+                    targets[m] = d[m];
+                }
+            }
             let s = &mut self.running[i];
+            if k < decode_seqs && self.spec_trace {
+                eprintln!(
+                    "[spec] id {} out {} computed {} known {} n {n} slot {} spare {:?} local {} draft {d:?} targets {targets:?} m {m}",
+                    s.req.id,
+                    s.out.len(),
+                    s.computed,
+                    s.known(),
+                    s.slot,
+                    s.spare,
+                    draft_local[k]
+                );
+            }
             if d.is_empty() {
                 s.computed += n;
             } else if m == d.len() {

@@ -1557,6 +1557,13 @@ impl Model {
         Ok(v.into_iter().map(|b| bf16::from_bits(b).to_f32()).collect())
     }
 
+    /// Logits of the first `n` sampled rows of the last step, row after row.
+    pub fn logits_rows(&self, n: usize) -> Result<Vec<f32>> {
+        let src = if self.last_logits != 0 { self.last_logits } else { self.s.logits };
+        let v: Vec<u16> = self.gpu.download(src, n * self.cfg.vocab_size)?;
+        Ok(v.into_iter().map(|b| bf16::from_bits(b).to_f32()).collect())
+    }
+
     /// Post-final-norm hidden state of the first sampled row of the last step, as f32.
     pub fn final_hidden(&self) -> Result<Vec<f32>> {
         let h: Vec<u16> = self.gpu.download(self.s.hfinal, self.cfg.hidden_size)?;
