@@ -1,3 +1,50 @@
+# Update 2026-11-15: branch `mythos-review` (not merged to main)
+
+Everything below this section describes main as of 2026-11-13. Since then all work has gone to
+`mythos-review` (worktree `.claude/worktrees/mythos-review`), which contains main, the
+memory-policy lane, and:
+
+- **Real-trace benchmark** (`tools/trace_bench.py`, `tools/trace_sweep.sh`): replay of recorded
+  OpenHands trajectories. This replaced the synthetic agentic sweep as the benchmark that
+  matters. Traces: `~/aq/traces-9b-40.json` on the Spark and the B200.
+- **Serving**: prompt checkpoints, in-kernel state tap, wider prefill attention tiles,
+  background prefill lane (`AQ_BG_PREFILL`), `AQ_TRACE` step/request logs, SRPT prefill order
+  with an elder share (`--srpt true`, no measurable gain on real traces).
+- **Speculation**: cross-session n-gram draft model and adaptive draft length; the model's own
+  MTP draft head (`AQ_MTP=1`, opt-in; `AQ_MTP_SHORT` shortlist size, `AQ_MTP_K` chained drafts,
+  default 1 because chaining did not raise throughput). ~90% first-draft acceptance on real
+  traces, 2.89 -> 3.78 tokens per step.
+- **Cold start**: parallel pinned-memory weight loader, 9B in ~8 s warm / ~18 s cold page cache.
+- **Numerics**: cuBLASLt algorithms used to be picked by timing three runs, so a busy GPU gave
+  each process different rounding; at a bifurcation point of repetitive text (9b-long, sequence
+  1, token 223) that alone moves logits by 2-3 and showed up as a rare speculation "REAL
+  MISMATCH". The pick is now stable (heuristic's first candidate unless another is 3% faster,
+  best of 5), and `aq-check` judges a divergence against how far its two plain paths (decode,
+  prefill) disagree there. Diagnostics: `AQ_GEMM_PICK=seed` (random plans), `AQ_GEMM_MIN_M`,
+  `AQ_SPEC_FAULT=N` (fault injection: the check must fail), `AQ_SPEC_TRACE`,
+  `AQ_CHECK_DRIFT_AT=seq:tok`, `AQ_CHECK_ROWDEP=N`, `AQ_CHECK_TF_ONLY`, `AQ_CHECK_SPEC_REPEAT=N`.
+
+Results (Qwen3.5-9B, real traces):
+
+| Machine | Agents | Engine | Turns/min | Tok/s | TTFT p50/p99 (ms) |
+|---|---|---|---|---|---|
+| Spark | 16 | aqwenator (cross-session drafts, SRPT) | 78.6 | 182 | 411 / 3834 |
+| Spark | 16 | vLLM 0.33, n-gram speculation | 47.6 | 127 | 722 / 2292 |
+| Spark | 16 | vLLM 0.33, MTP speculation (3) | 62.4 | 137 | 977 / 3729 |
+| B200 | 16 | aqwenator, no MTP | 319.4 | 842 | 67 / 1898 |
+| B200 | 16 | aqwenator, MTP head (1 draft) | 338.8 | 896 | 72 / 1688 |
+
+Open: the MTP head and the GEMM plan fix have not been measured on the Spark (it was busy);
+vLLM still has the better TTFT p99 at 16 agents on the Spark; merge to main.
+
+Gate status: `aq-check` on the B200, 6 goldens x {default, small budget, SRPT}, passes with
+and without `AQ_MTP=1`.
+
+Remote jobs: launch detached with a DONE marker and a timeout per process; never a wait loop
+keyed on log lines only (one sat dead for 11 hours).
+
+---
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
