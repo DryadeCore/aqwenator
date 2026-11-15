@@ -151,6 +151,23 @@ B200, 9B, decode attention per step: 64 seqs x 4k ctx 4.77 -> 1.61 ms (floor 1.3
 10.75 -> 7.69 ms), 16 streams 1576 -> 1672, single stream 227 -> 224; with k=4 speculation at 16k
 context 291 -> 322 (1 stream) and 521 -> 567 tok/s (16 streams).
 
+Spark, real traces (2026-11-15, 24 GB KV pool): quiet 10-minute 16-agent run of the previous
+defaults 82.4 turns/min, 206 tok/s, TTFT p50/p90/p99 459/1673/3596 ms, ITL p99 489 ms (vLLM:
+57.4, 122, 1022/1882/2909, 763). With the new decode attention, 5-minute legs: 8 agents 59.0
+turns/min, 161 tok/s, TTFT 309/924/2344, ITL p99 300 (before: 53.9, 147, 331/964/2546, 340);
+16 agents 84.4 turns/min, 199 tok/s against 83.2 and 200 for the split kernel in the same
+session (an earlier A/B of a first version gave 91.6 against 80.8: trace runs differ by several
+percent between sessions). Per-op profile, 16 seqs x 16k context: decode attention 38.6 ms
+against 40.1 ms with almost no drafts in flight (the floor is 36 ms); the gain grows with
+the number of draft rows per sequence.
+
+Not at the ceiling yet (largest first): B200 prefill attention (20% of its bandwidth floor;
+one block scans the whole context serially); B200 small-kernel overhead in decode (about
+1.1 ms of a 4.2 ms single-stream step, ~300 launches); GDN decode at high concurrency (1.46 ms
+against a 0.94 ms floor at 64 streams); cuBLASLt at 128-512 rows (67-80% of its bound). On the
+Spark: lm_head reads 2 GB per step (13% of the weight bytes) and prefill has not been
+measured against the FLOP ceiling.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
