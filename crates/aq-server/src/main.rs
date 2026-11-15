@@ -329,6 +329,10 @@ async fn main() -> Result<()> {
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
     let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false };
+    // Shortest remaining prefill first by default (`--srpt false` restores admission order):
+    // on real agent traces it keeps small turns from queueing behind a long tool result, at
+    // the same throughput (Spark, 16 agents: TTFT p90 2633 -> 1506 ms).
+    opts.policy.srpt = true;
     let mut kv_gb = 0f64;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;

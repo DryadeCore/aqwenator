@@ -51,8 +51,23 @@ TTFT p99 from 1236 ms to 351-378 ms (the tail there is head-of-line blocking beh
 first turns), but on the Spark, which has no spare GPU capacity for a second stream, it costs
 throughput and does not help the tail. `tools/trace_tail.py` dissects the tail from AQ_TRACE logs.
 
-Open: the TTFT p99 at 16 agents on the Spark (4.4-6.9 s here, noisy at 5-minute runs; vLLM had
-2.3 s); the GEMM plan fix has not been re-verified on the Spark with 9B; merge to main.
+Same-window head-to-head on the Spark (both with MTP speculation, 5 min per leg, 2026-11-15):
+
+| Agents | Engine | Turns/min | Tok/s | TPOT p50 (ms) | TTFT p50/p90/p99 (ms) | ITL p99 (ms) |
+|---|---|---|---|---|---|---|
+| 8 | aqwenator | 54.0 | 138 | 39 | 348 / 1428 / 3444 | 395 |
+| 8 | vLLM 0.33 | 44.6 | 102 | 58 | 665 / 1583 / 2601 | 489 |
+| 16 | aqwenator (FIFO prefill) | 81.4 | 195 | 60 | 597 / 2633 / 5791 | 492 |
+| 16 | aqwenator (shortest prefill first) | 82.0 | 197 | 60 | 469 / 1506 / 5631 | 464 |
+| 16 | vLLM 0.33 | 57.4 | 122 | 108 | 1022 / 1882 / 2909 | 763 |
+
+`aq-serve` now orders prefill shortest-first by default (`--srpt false` for admission order).
+A larger per-step prefill budget (2560) pushed ITL p99 to ~800 ms without helping.
+
+Open: turns with 3,000+ new tokens on the Spark at 16 agents (TTFT p50/p90 3.4/6.5 s against
+vLLM's 1.3/2.9 s); they set our p99. They take 6-9 throttled steps of 1280 tokens while vLLM
+prefills them in about two large chunks. Also: the GEMM plan fix has not been re-verified on
+the Spark with 9B; merge to main.
 
 Gate status: `aq-check` on the B200, 6 goldens x {default, small budget, SRPT}, passes with
 and without `AQ_MTP=1`.
