@@ -586,7 +586,8 @@ impl Model {
         gpu.flush_uploads()?;
         // AQ_FP8=1 (experimental): the layers' GEMMs run on FP8 (E4M3) weights and
         // activations. Not exact: outputs differ from the bf16 reference.
-        if std::env::var("AQ_FP8").as_deref() == Ok("1") {
+        let fp8: u32 = std::env::var("AQ_FP8").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if fp8 > 0 {
             let t = Instant::now();
             let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
             let rows = lim.max_tokens.max(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ) + 512;
@@ -600,7 +601,11 @@ impl Model {
                     gpu.quantize_weight(w, n, k, rows, k_max)?;
                 }
             }
-            eprintln!("FP8 layer weights: quantized in {:.2}s", t.elapsed().as_secs_f64());
+            // AQ_FP8=2: the output head too (the embedding lookup keeps reading bf16).
+            if fp8 >= 2 && cfg.vocab_size % 8 == 0 {
+                gpu.quantize_weight(lm_head, cfg.vocab_size, h, rows, k_max)?;
+            }
+            eprintln!("FP8 weights (level {fp8}): quantized in {:.2}s", t.elapsed().as_secs_f64());
         }
         let weight_bytes = gpu.allocated_bytes;
         let layers_s = t1.elapsed().as_secs_f64();

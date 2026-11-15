@@ -52,6 +52,7 @@ def main():
     p.add_argument("--greedy", type=int, default=32, help="greedy tokens to generate")
     p.add_argument("--long", action="store_true", help="use the ~1.8k-token prompt")
     p.add_argument("--len", type=int, default=0, help="synthetic prompt of about this many tokens")
+    p.add_argument("--ids-file", help="JSON list of prompt token ids (e.g. one turn of a recorded trace)")
     p.add_argument("--no-hidden", action="store_true", help="skip per-layer hidden states (long prompts)")
     p.add_argument("--attn", default="eager", help="attention implementation (eager or sdpa)")
     args = p.parse_args()
@@ -60,8 +61,13 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map="cuda", attn_implementation=args.attn
     ).eval()
-    prompt = synthetic(tok, args.len) if args.len else LONG_PROMPT if args.long else PROMPT
-    ids = tok(prompt, return_tensors="pt").input_ids.cuda()
+    if args.ids_file:
+        import json
+
+        ids = torch.tensor([json.load(open(os.path.expanduser(args.ids_file)))]).cuda()
+    else:
+        prompt = synthetic(tok, args.len) if args.len else LONG_PROMPT if args.long else PROMPT
+        ids = tok(prompt, return_tensors="pt").input_ids.cuda()
 
     tensors = {"input_ids": ids[0].to(torch.int32).cpu()}
     with torch.no_grad():

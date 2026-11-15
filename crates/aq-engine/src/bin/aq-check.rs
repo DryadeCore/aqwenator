@@ -21,6 +21,16 @@ const NEAR_TIE: f32 = 0.25;
 /// Tokens generated per request in the speculative-decoding identity test.
 const SPEC_TEST_LEN: usize = 256;
 
+/// KL(ref || ours) in nats between the softmax distributions of two logits rows.
+fn kl(refr: &[f32], ours: &[f32]) -> f64 {
+    let lse = |v: &[f32]| {
+        let m = v.iter().copied().fold(f32::MIN, f32::max) as f64;
+        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (zr, zo) = (lse(refr), lse(ours));
+    refr.iter().zip(ours).map(|(&r, &o)| (r as f64 - zr).exp() * ((r as f64 - zr) - (o as f64 - zo))).sum()
+}
+
 fn rel_err(a: &[f32], b: &[f32]) -> (f64, f64) {
     let mut num = 0f64;
     let mut den = 0f64;
@@ -174,6 +184,7 @@ fn main() -> Result<()> {
     }
     if has_tf {
         let (mut agree, mut ties, mut misses, mut worst_rel) = (0, 0, 0, 0f64);
+        let (mut kl_sum, mut kl_max) = (0f64, 0f64);
         let mut pos = ids.len();
         for k in 0..greedy_ref.len() {
             if k > 0 {
@@ -184,6 +195,9 @@ fn main() -> Result<()> {
             let refr = &tf[k * vocab..(k + 1) * vocab];
             let (rel, _) = rel_err(&ours, refr);
             worst_rel = worst_rel.max(rel);
+            let d = kl(refr, &ours);
+            kl_sum += d;
+            kl_max = kl_max.max(d);
             let (ro, _, _) = top2(&ours);
             let (rr, r1, r2) = top2(refr);
             if ro == rr {
@@ -196,7 +210,8 @@ fn main() -> Result<()> {
             }
         }
         println!(
-            "teacher-forced: top-1 {agree}/{n} agree, {ties} near-ties, {misses} real misses; worst logits rel_l2 {worst_rel:.2e}",
+            "teacher-forced: top-1 {agree}/{n} agree, {ties} near-ties, {misses} real misses; worst logits rel_l2 {worst_rel:.2e}; KL(ref||ours) mean {:.2e} max {kl_max:.2e} nats",
+            kl_sum / greedy_ref.len() as f64,
             n = greedy_ref.len()
         );
         if std::env::var("AQ_CHECK_TF_ONLY").is_ok() {
