@@ -1,5 +1,8 @@
 //! Safetensors checkpoint access: mmap every shard, index tensor names once, hand out
-//! zero-copy byte views. Host-side conversion only for tiny parameters.
+//! zero-copy byte views. Host-side conversion only for tiny parameters. Each shard is also
+//! opened for direct I/O where the platform has it: the weight loader reads large tensors
+//! that way, past the page cache (an NVMe drive is several times faster than page faults
+//! on a cold mapping, and nothing is left behind in the cache).
 
 use anyhow::{Context, Result, bail};
 use half::bf16;
@@ -10,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 pub struct Checkpoint {
     files: Vec<Mmap>,
+    /// The same shards opened with O_DIRECT (None where that is unavailable).
+    direct: Vec<Option<std::fs::File>>,
     /// name -> (file index, dtype, shape, absolute byte range)
     index: HashMap<String, (usize, Dtype, Vec<usize>, usize, usize)>,
 }
@@ -18,6 +23,22 @@ pub struct View<'a> {
     pub dtype: Dtype,
     pub shape: &'a [usize],
     pub bytes: &'a [u8],
+    /// Direct-I/O handle of the shard and the tensor's byte offset in it.
+    pub direct: Option<(&'a std::fs::File, u64)>,
+}
+
+/// Open `p` for reads that bypass the page cache.
+fn open_direct(p: &Path) -> Option<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(p).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        None
+    }
 }
 
 impl Checkpoint {
@@ -28,13 +49,11 @@ impl Checkpoint {
             .collect();
         paths.sort();
         let mut files = Vec::new();
+        let mut direct = Vec::new();
         let mut index = HashMap::new();
         for (fi, p) in paths.iter().enumerate() {
             let f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
             let mmap = unsafe { Mmap::map(&f)? };
-            // Start reading the whole shard now: the loader touches all of it within seconds.
-            #[cfg(unix)]
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
             let (header_len, meta) = SafeTensors::read_metadata(&mmap)?;
             let base = 8 + header_len;
             for (name, info) in meta.tensors() {
@@ -42,11 +61,12 @@ impl Checkpoint {
                 index.insert(name, (fi, info.dtype, info.shape.clone(), base + s, base + e));
             }
             files.push(mmap);
+            direct.push(open_direct(p));
         }
         if files.is_empty() {
             bail!("no .safetensors files in {}", dir.display());
         }
-        Ok(Self { files, index })
+        Ok(Self { files, direct, index })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -55,7 +75,7 @@ impl Checkpoint {
 
     pub fn get(&self, name: &str) -> Result<View<'_>> {
         let (fi, dtype, shape, s, e) = self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
-        Ok(View { dtype: *dtype, shape, bytes: &self.files[*fi][*s..*e] })
+        Ok(View { dtype: *dtype, shape, bytes: &self.files[*fi][*s..*e], direct: self.direct[*fi].as_ref().map(|f| (f, *s as u64)) })
     }
 
     /// A bf16 tensor's raw bytes; errors on any other dtype.

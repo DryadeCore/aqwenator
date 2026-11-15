@@ -58,6 +58,7 @@ dependencies = [
  "cuda-core",
  "cuda-host",
  "half",
+ "libc",
  "memmap2",
  "safetensors",
  "serde",

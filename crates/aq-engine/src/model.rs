@@ -418,7 +418,8 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
     let p = gpu.alloc_uninit(total)?;
     let mut off = 0u64;
     for v in views {
-        gpu.upload_bytes(p + off, v.bytes)?;
+        // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
+        unsafe { gpu.queue_upload(p + off, v.bytes, v.direct) };
         off += v.bytes.len() as u64;
     }
     if pad_bytes > 0 {
@@ -583,7 +584,7 @@ impl Model {
         }
         let weight_bytes = gpu.allocated_bytes;
         gpu.sync()?;
-        gpu.free_staging();
+        gpu.flush_uploads()?;
         let layers_s = t1.elapsed().as_secs_f64();
         eprintln!(
             "load: open {open_s:.2}s, weights {:.2}s, state+KV alloc {state_s:.2}s",
