@@ -81,8 +81,15 @@ Bursts are rare enough that ITL p99 hardly moves. Larger bursts close more of th
 turns but make small turns wait a little longer (p90 for <1k-token turns 658-805 ms without,
 782-1054 with 4096, 1138-1439 with 6144; vLLM 1707).
 
-Open: vLLM still has the better TTFT p99 at 16 agents (2.9 s vs 3.7-4.1 s) and the better p90
-for turns with 1k+ new tokens. Also: the GEMM plan fix has not been re-verified on
+10-minute run of the final defaults (tag `final-defaults`): at 8 agents 53.9 turns/min, 147
+tok/s, TTFT p50/p90/p99 331/964/2546 ms, ITL p99 340 ms, and every turn-size bucket ahead of
+vLLM (44.6 turns/min, 665/1583/2601, 489), including turns with 3k+ new tokens (p50/p90
+1954/2835 vs 2434/3133 ms). The 16-agent leg ran while other jobs were on the GPU
+(91% busy before the start) and came out at 70.1 turns/min, TTFT p99 7.0 s, ITL p99 833 ms: not
+a valid confirmation of the 5-minute quiet-window numbers above; rerun it on a quiet machine.
+
+Open: at 16 agents vLLM still has the better TTFT p99 (2.9 s vs 3.7-4.1 s in quiet 5-minute
+runs) and the better p90 for turns with 1k+ new tokens. Also: the GEMM plan fix has not been re-verified on
 the Spark with 9B; merge to main.
 
 Gate status: `aq-check` on the B200, 6 goldens x {default, small budget, SRPT}, passes with
