@@ -14,7 +14,10 @@ memory-policy lane, and:
   MTP draft head (`AQ_MTP=1`, opt-in; `AQ_MTP_SHORT` shortlist size, `AQ_MTP_K` chained drafts,
   default 1 because chaining did not raise throughput). ~90% first-draft acceptance on real
   traces, 2.89 -> 3.78 tokens per step.
-- **Cold start**: parallel pinned-memory weight loader, 9B in ~8 s warm / ~18 s cold page cache.
+- **Cold start**: weight loader with direct I/O (O_DIRECT reads into pinned staging buffers,
+  overlapped with device allocation). 9B on the Spark: weights resident at 2.4 s with a warm or
+  cold page cache, first token at 3.2 s (the mmap loader it replaced: 2.1 s warm, 16.7 s cold).
+  The drive reads at ~10 GB/s, so 1.8 s is the floor for 17.7 GiB; allocation is ~0.9 s.
 - **Numerics**: cuBLASLt algorithms used to be picked by timing three runs, so a busy GPU gave
   each process different rounding; at a bifurcation point of repetitive text (9b-long, sequence
   1, token 223) that alone moves logits by 2-3 and showed up as a rare speculation "REAL
@@ -205,6 +208,38 @@ tok/s, TTFT p50/p90/p99 483/1573/3864 ms, ITL p99 466 ms; 8 agents 57.4 turns/mi
 TTFT 365/981/2445, ITL p99 360. vLLM (5 min): 57.4, 122, 1022/1882/2909, 763 at 16 agents;
 44.6, 102, 665/1583/2601, 489 at 8. B200, 16 agents: 437.6 turns/min, 1146 tok/s (368.6 and
 973 in the morning).
+
+### Where the time goes on the Spark (2026-11-15, evening)
+
+16 agents on real traces, K=3 (tag prof-k3-16: 93.4 turns/min, 232 tok/s; the GPU is busy for
+the whole run). A least-squares fit of the `[step]` lines of `AQ_TRACE`: a decode-only step
+costs 78 ms + 0.25 ms per row + 153 ms per million keys read (once per sequence); a prefill
+token costs 0.22 ms. Mean step: 11 decoding sequences, 75 rows (6.7 per sequence: 2.6 pending,
+4.1 drafts), 20.7k keys per sequence.
+
+| Share of GPU time | What | Against its limit |
+|---|---|---|
+| 40% | weights read once per step | 78 ms vs a 67 ms floor |
+| 33% | prefill | GEMMs at 88% of the FLOP ceiling |
+| 18% | K/V read by decode attention | 214 GB/s vs 237 GB/s measured peak |
+| 9% | per-row compute | a third of the rows are rejected drafts or re-fed tokens |
+
+Draft acceptance by position (`AQ_SPEC_TRACE`, 16.8k decode entries): 90% / 85% / 87% / 86%
+at positions 1-4 and 93-95% at 5-8 (only n-gram copies get that deep, 22% of entries). Mean
+4.15 drafted, 3.03 accepted. Deeper head chains do not pay (K=4 measured no better than K=3):
+the head feeding on its own guesses is what limits positions 2+, not the row budget.
+
+Dead ends on the K/V traffic:
+- Lossless KV compression: 1.28x on these values, at most 4% of step time before the cost of
+  decompressing.
+- Skipping the V read of key tiles with negligible attention weight: an instrumented kernel
+  counted tiles where no query slot of the block has a score within 2^-20 / 2^-30 / 2^-40 of
+  its running maximum. On real traces 99.9996% of 625M tiles are needed even at 2^-20, so
+  there is nothing to skip.
+
+What is left on the Spark with exact bf16 is a handful of items worth <= 3% each (base step
+78 -> 67 ms, wasted draft rows, non-GEMM prefill ops). The step change is fewer bytes per
+weight (8-bit weights would halve the 40% share), which gives up exact outputs.
 
 # Handoff: aqwenator state as of 2026-11-13
 
