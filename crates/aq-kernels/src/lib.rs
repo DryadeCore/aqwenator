@@ -479,6 +479,71 @@ pub mod kernels {
         }
     }
 
+    /// int8 quantization of a bf16 matrix with one scale per block of 32 elements along a
+    /// row: `q = rint(x / bmax * 127)`, `bmax[r, b]` = the block's largest magnitude (bf16).
+    /// Requires k % 32 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn quant_i8b(x: *const u16, q: *mut u8, bmax: *mut u16, k: u32) {
+        let nb = k as usize / 32;
+        let r = thread::blockIdx_x() as usize;
+        let mut b = thread::threadIdx_x() as usize;
+        while b < nb {
+            let xv = unsafe { x.cast::<U32x4>().add((r * nb + b) * 4) };
+            let mut w = [[0u32; 4]; 4];
+            let mut top = 0u32;
+            #[unroll]
+            for j in 0..4 {
+                w[j] = unsafe { *xv.add(j) }.to_array();
+                #[unroll]
+                for e in 0..4 {
+                    top = top.max(w[j][e] & 0x7fff).max((w[j][e] >> 16) & 0x7fff);
+                }
+            }
+            unsafe { *bmax.add(r * nb + b) = top as u16 };
+            let m = bf16_to_f32(top as u16);
+            let inv = if m > 0.0 { 127.0 / m } else { 0.0 };
+            let qv = unsafe { q.add((r * nb + b) * 32) }.cast::<u64>();
+            #[unroll]
+            for j in 0..4 {
+                let mut packed = 0u64;
+                #[unroll]
+                for e in 0..4 {
+                    let (a0, a1) = cvt_f32x2_bf16x2(w[j][e]);
+                    let (q0, q1) = (libm::rintf(a0 * inv) as i32 as u32 & 0xff, libm::rintf(a1 * inv) as i32 as u32 & 0xff);
+                    packed |= ((q0 | (q1 << 8)) as u64) << (16 * e);
+                }
+                unsafe { *qv.add(j) = packed };
+            }
+            b += 256;
+        }
+    }
+
+    /// Inverse of `quant_i8b`: `out = bf16(q * bmax / 127)`. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn dequant_i8b(q: *const u8, bmax: *const u16, out: *mut u16, k: u32) {
+        let nb = k as usize / 32;
+        let r = thread::blockIdx_x() as usize;
+        let mut b = thread::threadIdx_x() as usize;
+        while b < nb {
+            let s = bf16_to_f32(unsafe { *bmax.add(r * nb + b) }) * (1.0 / 127.0);
+            let qv = unsafe { q.add((r * nb + b) * 32) }.cast::<u64>();
+            let ov = unsafe { out.cast::<U32x4>().add((r * nb + b) * 4) };
+            #[unroll]
+            for j in 0..4 {
+                let v = unsafe { *qv.add(j) };
+                let mut packed = [0u32; 4];
+                #[unroll]
+                for e in 0..4 {
+                    let q0 = (v >> (16 * e)) as u8 as i8 as f32;
+                    let q1 = (v >> (16 * e + 8)) as u8 as i8 as f32;
+                    packed[e] = pk(q0 * s, q1 * s);
+                }
+                unsafe { *ov.add(j) = U32x4::new(packed) };
+            }
+            b += 256;
+        }
+    }
+
     /// `y[r, c] *= rs[r] * cs[c]` in place on a bf16 matrix.
     /// Requires n % 8 == 0. grid = (rows), block = (256).
     #[kernel]

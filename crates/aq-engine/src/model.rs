@@ -6,7 +6,7 @@
 
 use crate::config::{LayerKind, TextConfig};
 use crate::cublaslt::CUDA_R_16BF;
-use crate::gpu::{Gpu, Prof, Weight, cfg, cfg_smem, de};
+use crate::gpu::{Fmt, Gpu, Prof, Weight, cfg, cfg_smem, de};
 use cuda_core::LaunchConfig;
 use crate::weights::Checkpoint;
 use anyhow::Result;
@@ -432,9 +432,9 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 }
 
 /// A GEMM weight `[n, k]`: the named matrices concatenated along rows, then `pad_bytes` of
-/// zero rows. With `fp8` it is quantized as soon as its upload has landed and the bf16 copy
-/// freed, so the load never holds much more than the final footprint.
-fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fp8: bool) -> Result<Weight> {
+/// zero rows. Unless `fmt` is bf16 it is quantized as soon as its upload has landed and the
+/// bf16 copy freed, so the load never holds much more than the final footprint.
+fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fmt: Fmt) -> Result<Weight> {
     let p = concat_bf16_padded(gpu, ck, names, pad_bytes)?;
     let mut bytes = pad_bytes;
     for n in names {
@@ -445,11 +445,11 @@ fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usiz
         let mode = if gpu.qsim.0 == 3 && k % 2048 != 0 { 2 } else { gpu.qsim.0 };
         unsafe { gpu.k.qsim(&gpu.stream, cfg(((bytes / 2 / k) as u32, 1, 1), 256), p as *mut u16, k as u32, mode) }.map_err(de)?;
     }
-    if !fp8 {
+    if fmt == Fmt::Bf16 || (fmt == Fmt::Int8 && k % 32 != 0) {
         return Ok(Weight::bf16(p));
     }
     gpu.drain_uploads()?;
-    gpu.quantize_weight(p, bytes / 2 / k, k, false)
+    gpu.quantize_weight(p, bytes / 2 / k, k, fmt, false)
 }
 
 impl Model {
@@ -471,13 +471,23 @@ impl Model {
         } else {
             concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?
         };
-        // AQ_FP8 (experimental, not exact: outputs differ from the bf16 reference): 1 runs
-        // the layers' GEMMs on FP8 (E4M3) weights and activations, 2 the output head too.
-        let fp8: u32 = std::env::var("AQ_FP8").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        // AQ_FP8_SET: which layer GEMMs (default all): g = GDN input projection, o = GDN output
-        // projection, q = attention q/k/v, a = attention output, u = MLP gate/up, d = MLP down.
-        let set = std::env::var("AQ_FP8_SET").unwrap_or_else(|_| "goqaud".into());
-        let q = |c: char| fp8 > 0 && set.contains(c);
+        // AQ_QUANT (experimental, not exact: outputs differ from the bf16 reference) stores the
+        // layers' GEMM weights in 8 bits:
+        //   fp8   E4M3 weights and activations: about half the GEMM time, but ~4 significant
+        //         bits (mean KL to the reference 0.03 nats on real traces, bf16 0.002);
+        //   int8  int8 weights with a scale per 32 values, expanded to bf16 for each GEMM:
+        //         at the reference's noise floor (0.003), slower than bf16.
+        // AQ_QUANT_HEAD=1: the output head too. AQ_QUANT_SET: which layer GEMMs (default all):
+        // g = GDN input projection, o = GDN output projection, q = attention q/k/v,
+        // a = attention output, u = MLP gate/up, d = MLP down.
+        let quant = match std::env::var("AQ_QUANT").as_deref() {
+            Ok("fp8") => Fmt::Fp8,
+            Ok("int8") => Fmt::Int8,
+            Ok(other) if !other.is_empty() => anyhow::bail!("AQ_QUANT={other}: expected fp8 or int8"),
+            _ => Fmt::Bf16,
+        };
+        let set = std::env::var("AQ_QUANT_SET").unwrap_or_else(|_| "goqaud".into());
+        let q = |c: char| if set.contains(c) { quant } else { Fmt::Bf16 };
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
 
         let hv = cfg.linear_num_value_heads;
@@ -614,14 +624,23 @@ impl Model {
         gpu.sync()?;
         gpu.flush_uploads()?;
         let mut lm_head = Weight::bf16(head_table);
-        if fp8 > 0 {
-            let rows = lim.max_tokens.max(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ) + 512;
-            gpu.enable_fp8(rows, inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
-            // The bf16 head stays: the embedding lookup (tied weights) and the MTP shortlist read it.
-            if fp8 >= 2 && cfg.vocab_size % 8 == 0 {
-                lm_head = gpu.quantize_weight(head_table, cfg.vocab_size, h, true)?;
+        if quant != Fmt::Bf16 {
+            let head = std::env::var("AQ_QUANT_HEAD").as_deref() == Ok("1") && cfg.vocab_size % 8 == 0 && h % 32 == 0;
+            match quant {
+                Fmt::Fp8 => {
+                    let rows = lim.max_tokens.max(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ) + 512;
+                    gpu.enable_fp8(rows, inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
+                }
+                _ => {
+                    let layer_max = (2 * inter * h).max(cfg.gdn_proj_ld() * h).max(cfg.attn_proj_dim() * h);
+                    gpu.enable_int8(if head { layer_max.max(cfg.vocab_size * h) } else { layer_max })?;
+                }
             }
-            eprintln!("FP8 weights (AQ_FP8={fp8}, set {set}): not exact");
+            // The bf16 head stays: the embedding lookup (tied weights) and the MTP shortlist read it.
+            if head {
+                lm_head = gpu.quantize_weight(head_table, cfg.vocab_size, h, quant, true)?;
+            }
+            eprintln!("{quant:?} weights (set {set}, head {head}): not exact");
         }
         let weight_bytes = gpu.allocated_bytes;
         let layers_s = t1.elapsed().as_secs_f64();

@@ -12,18 +12,28 @@ pub fn de<E: Debug>(e: E) -> anyhow::Error {
     anyhow!("{e:?}")
 }
 
-/// A GEMM weight matrix `[n, k]`: bf16 at `p`, or FP8 (E4M3) at `p` with one power-of-two
-/// f32 scale per row at `scale`.
+/// How a GEMM weight matrix is stored.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Fmt {
+    #[default]
+    Bf16,
+    /// E4M3 with one power-of-two f32 scale per row; multiplied by E4M3 activations.
+    Fp8,
+    /// int8 with one bf16 magnitude per block of 32 along a row; expanded to bf16 for the GEMM.
+    Int8,
+}
+
+/// A GEMM weight matrix `[n, k]` at `p`, with its scales at `scale` (0 for bf16).
 #[derive(Clone, Copy, Default)]
 pub struct Weight {
     pub p: u64,
-    /// 0 for bf16.
     pub scale: u64,
+    pub fmt: Fmt,
 }
 
 impl Weight {
     pub fn bf16(p: u64) -> Self {
-        Self { p, scale: 0 }
+        Self { p, scale: 0, fmt: Fmt::Bf16 }
     }
 }
 
@@ -49,6 +59,9 @@ pub struct Gpu {
     x8: Vec<(u64, u64)>,
     /// Rows and columns the `x8` buffers hold.
     x8_dims: (usize, usize),
+    /// Per lane: bf16 buffer an int8 weight is expanded into for its GEMM, and its size.
+    wtmp: Vec<u64>,
+    wtmp_bytes: usize,
     /// AQ_QSIM diagnostic: 8-bit round trip of (weights, activations); 0 = off, 1 = E4M3,
     /// 2 = int8. Everything still runs as bf16 GEMMs.
     pub qsim: (u32, u32),
@@ -188,6 +201,8 @@ impl Gpu {
             capturing: Default::default(),
             x8: Vec::new(),
             x8_dims: (0, 0),
+            wtmp: Vec::new(),
+            wtmp_bytes: 0,
             qsim: {
                 // e.g. AQ_QSIM=w:f, a:i, wa:i (f = E4M3, i = int8 per row, b = int8 per block of 32)
                 let v = std::env::var("AQ_QSIM").unwrap_or_default();
@@ -217,6 +232,10 @@ impl Gpu {
             let (rows, k) = self.x8_dims;
             let x8 = (self.alloc(rows * k)?, self.alloc(rows * 4)?);
             self.x8.push(x8);
+        }
+        if self.wtmp_bytes > 0 {
+            let w = self.alloc(self.wtmp_bytes)?;
+            self.wtmp.push(w);
         }
         Ok(self.streams.len() - 1)
     }
@@ -283,16 +302,38 @@ impl Gpu {
         Ok(())
     }
 
-    /// Replace the bf16 weight matrix at `w` (`[n, k]`, fully uploaded) by its FP8 (E4M3)
-    /// form with one power-of-two scale per row, and free the bf16 copy unless `keep`.
-    pub fn quantize_weight(&mut self, w: u64, n: usize, k: usize, keep: bool) -> Result<Weight> {
+    /// Size the per-lane buffer int8 weights are expanded into: the largest such weight.
+    pub fn enable_int8(&mut self, max_weight_elems: usize) -> Result<()> {
+        self.wtmp_bytes = max_weight_elems * 2;
+        for _ in self.wtmp.len()..self.streams.len() {
+            let w = self.alloc(self.wtmp_bytes)?;
+            self.wtmp.push(w);
+        }
+        Ok(())
+    }
+
+    /// Replace the bf16 weight matrix at `w` (`[n, k]`, fully uploaded) by its `fmt` form and
+    /// free the bf16 copy unless `keep`.
+    pub fn quantize_weight(&mut self, w: u64, n: usize, k: usize, fmt: Fmt, keep: bool) -> Result<Weight> {
         let q = self.alloc_uninit(n * k)?;
-        let scale = self.alloc_uninit(n * 4)?;
-        unsafe { self.k.quant_e4m3(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut f32, k as u32) }.map_err(de)?;
+        let scale = match fmt {
+            Fmt::Fp8 => {
+                let scale = self.alloc_uninit(n * 4)?;
+                unsafe { self.k.quant_e4m3(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut f32, k as u32) }.map_err(de)?;
+                scale
+            }
+            Fmt::Int8 => {
+                anyhow::ensure!(k % 32 == 0, "int8 weights need K to be a multiple of 32");
+                let scale = self.alloc_uninit(n * k / 32 * 2)?;
+                unsafe { self.k.quant_i8b(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut u16, k as u32) }.map_err(de)?;
+                scale
+            }
+            Fmt::Bf16 => anyhow::bail!("quantize_weight to bf16"),
+        };
         if !keep {
             self.free(w)?;
         }
-        Ok(Weight { p: q, scale })
+        Ok(Weight { p: q, scale, fmt })
     }
 
     /// Start a host-to-device copy of checkpoint bytes on the weight loader; `flush_uploads`
@@ -399,7 +440,14 @@ impl Gpu {
         .min(cap)
         .max(m);
         let s = self.raw_stream();
-        if w.scale == 0 {
+        if w.fmt == Fmt::Int8 {
+            // Expand to bf16 (exactly what the weight stands for), then the bf16 GEMM.
+            let tmp = self.wtmp[self.lane];
+            anyhow::ensure!(n * k * 2 <= self.wtmp_bytes, "int8 weight larger than its expansion buffer");
+            unsafe { self.k.dequant_i8b(&self.stream, cfg((n as u32, 1, 1), 256), w.p as *const u8, w.scale as *const u16, tmp as *mut u16, k as u32) }.map_err(de)?;
+            return self.lt.gemm(s, mb, n, k, x, tmp, y, out_ty);
+        }
+        if w.fmt == Fmt::Bf16 {
             if self.qsim.1 > 0 {
                 unsafe { self.k.qsim(&self.stream, cfg((mb as u32, 1, 1), 256), x as *mut u16, k as u32, self.qsim.1) }.map_err(de)?;
             }
