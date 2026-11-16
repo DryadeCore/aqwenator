@@ -731,7 +731,10 @@ fn main() -> Result<()> {
                 eng.spec_k = spec;
                 for c in 0..copies {
                     let ctl = Control { pick: Some(Box::new(Sampler::new(Sampling { seed: sp.seed + c, ..sp }))), stop_ids: Vec::new() };
-                    let prompt = prompts[if distinct { c as usize } else { 0 }].clone();
+                    // (One token: the frequency check below, against the reference logits of
+                    // the whole prompt. Else the first 1024 tokens do.)
+                    let p = &prompts[if distinct { c as usize } else { 0 }];
+                    let prompt = p[..if n == 1 { p.len() } else { p.len().min(1024) }].to_vec();
                     eng.add_with(Request { id: 700 + c, prompt, max_new_tokens: n, ignore_eos: true }, ctl)?;
                 }
                 let mut out = vec![Vec::new(); copies as usize];
@@ -759,7 +762,7 @@ fn main() -> Result<()> {
                     return Ok("identical".into());
                 }
                 eng.spec_k = 0;
-                let prompt: Vec<u32> = prompts[0].iter().chain(&a[..p]).copied().collect();
+                let prompt: Vec<u32> = prompts[0][..prompts[0].len().min(1024)].iter().chain(&a[..p]).copied().collect();
                 eng.add(Request { id: 399, prompt, max_new_tokens: 1, ignore_eos: true })?;
                 while eng.has_work() {
                     eng.step()?;
@@ -919,13 +922,15 @@ fn main() -> Result<()> {
     // it runs dry too, its pages let the first go on to its real limit, and nothing fails.
     {
         let saved = (eng.session_cache, eng.spec_k, eng.kv_reserve);
+        // (Page accounting does not depend on the prompt: its first 512 tokens do.)
+        let ids = &ids[..ids.len().min(512)];
         (eng.session_cache, eng.spec_k) = (false, 0);
         eng.clear_cache();
         let bs = eng.limits().block_size;
         let mut run = |eng: &mut Engine, reserve: usize, copies: u64| -> Result<(Vec<Vec<u32>>, usize)> {
             eng.kv_reserve = reserve;
             for c in 0..copies {
-                eng.add(Request { id: 800 + c, prompt: ids.clone(), max_new_tokens: 96, ignore_eos: true })?;
+                eng.add(Request { id: 800 + c, prompt: ids.to_vec(), max_new_tokens: 96, ignore_eos: true })?;
             }
             let (mut out, mut together) = (vec![Vec::new(); copies as usize], 0);
             while eng.has_work() {
