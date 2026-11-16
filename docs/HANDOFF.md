@@ -288,6 +288,21 @@ bf16 copy freed (`gpu::Weight`); activations quantized per row before each GEMM
 | fp8 (layers) | 106.2 | 293 | 397 / 3748 | 40.7 / 98.0 |
 | int8 (layers, whole-weight expansion) | 70.6 | 150 | 709 / 5371 | 84.5 / 181.3 |
 
+**Final matrix** (Spark, 10 min each, one binary with int8 expanded 1024 rows at a time,
+2026-11-16 03:10-04:25, 0 errors; a rebuild used CPU during the first leg):
+
+| Agents | Tier | Turns/min | Tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
+|---|---|---|---|---|---|
+| 16 | bf16 | 91.5 | 228 | 491 / 4550 | 50.6 / 117.9 |
+| 16 | fp8 | 113.7 | 295 | 374 / 3374 | 38.1 / 80.3 |
+| 16 | int8 | 71.6 | 182 | 619 / 3946 | 67.0 / 132.6 |
+| 8 | bf16 | 60.6 | 166 | 342 / 2780 | 32.9 / 65.0 |
+| 8 | fp8 | 79.3 | 209 | 256 / 2075 | 23.4 / 49.9 |
+| 8 | int8 | 47.7 | 124 | 456 / 3383 | 46.1 / 105.1 |
+
+fp8 is +24% (16 agents) and +31% (8) turns/min over bf16 with better latency everywhere; int8
+is -22% and -21% (chunked expansion took its tok/s from 150 to 182 at 16 agents).
+
 **Quality** is measured teacher-forced against transformers on three real trace turns (8k,
 16k, 26k prompt tokens, 256 greedy tokens each; `scripts/golden.py --ids-file`, goldens
 `~/aq/golden/qwen35-9b-trace-{a,b,c}.safetensors` on the Spark; `aq-check` prints
