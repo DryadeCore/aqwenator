@@ -1,3 +1,32 @@
+# Roadmap (agreed 2026-11-16)
+
+The competitors for the local goal are Strata, llama.cpp, gufo and the hardware ceiling itself;
+vLLM stays as the server baseline. In order:
+
+1. **int8-weight GEMM kernel** (`gemm_i8w`, in progress): trace-golden KL against the expansion
+   path, load test, full gate, then merge.
+2. **MTP draft-and-verify.** Draft with the model's MTP head, verify in one pass, keep the agreed
+   prefix. Greedy output must stay identical to plain decoding (gate it). Adaptive draft length
+   with fallback when drafts keep failing. Others report 2.4–3.2 tokens per pass with 3 drafts.
+3. **Prompt-lookup drafting.** Draft copies of earlier text of the same session through the same
+   verify path; coding-agent turns copy a lot.
+4. **8-bit attention cache** (then 8-bit keys / 4-bit values). Decode attention is 30% of the fp8
+   step and bandwidth-bound.
+5. **Session checkpoints in host RAM and on disk**: evicted sessions and restarts resume from the
+   longest exact prefix instead of re-running prefill. Safetensors `main` has a prefetch engine
+   (still changing) worth using for the disk tier.
+6. **6-bit or mixed dense weights.** Measure quality first: others report 4-bit dense at +9%
+   perplexity against +0.2% for 8-bit.
+7. **Benchmarks against Strata, llama.cpp and gufo** on the same traces and machine.
+8. **Qwen3.8-Flash-Next on small hardware** (worth it only if it runs on small cards). New pieces:
+   MoE with 512 experts per layer and 10 active, hyper-connections, sparse attention, a 51 GB
+   n-gram embedding table read from disk. Known lessons: one preallocated expert slot pool with
+   routing remapped to slots so the grouped GEMM is unchanged; LRU is within 3 points of the
+   optimal cache policy; router read-ahead wastes about 40% of its reads; the fastest design keeps
+   all experts in pinned host RAM, the hot ones in VRAM, and computes misses on the CPU.
+9. **Research: zml `attnd`** ("sparse logarithmic attention, on CPU, over UDP"). Only the
+   announcement was read; the mechanism is in its video.
+
 # Update 2026-11-16: branch `mythos-review` (main has everything up to the Docker/CI commits; FP8 is branch-only)
 
 Everything below this section describes main as of 2026-11-13. Since then all work has gone to
