@@ -14,7 +14,11 @@
 //! `ignore_eos`, `skip_special_tokens`, `stream`, `stream_options.include_usage`,
 //! `response_format` (`json_object`, `json_schema`: constrained decoding, see `grammar.rs`).
 //! A field the server does not know, or knows and cannot honour (`n` > 1, `logprobs`,
-//! penalties, ...), is a 400 that names it; nothing is silently dropped.
+//! penalties, ...), is a 400 that names it. The OpenAI fields that change nothing on a
+//! server like this one (`user`, `store`, `metadata`, `service_tier`, `prompt_cache_key`,
+//! `safety_identifier`) are accepted and ignored, and `reasoning_effort` only switches the
+//! template's thinking ("none": off, any other level: on); `--strict-requests true` makes
+//! all of these a 400 too, so that nothing a client sends is dropped unseen.
 //!
 //! Sampling: `temperature` 0 is the engine's greedy path, token-identical to what it always
 //! was (and what a request without `temperature` gets under `--default-temperature 0`). With a temperature the token is drawn on the host from the logits row
@@ -26,7 +30,7 @@
 //!              [--max-seqs 64] [--max-ctx 32768] [--max-tokens 8192] [--mixed-prefill N]
 //!              [--max-running N] [--session-cache true|false] [--kv-gb X] [--kv-reserve N]
 //!              [--spec-k N] [--vllm-metrics true|false]
-//!              [--default-temperature T]
+//!              [--default-temperature T] [--strict-requests true|false]
 //!
 //! `--host`: address to listen on (default 127.0.0.1, or `AQ_HOST`; 0.0.0.0 for every
 //! interface).
@@ -116,6 +120,8 @@ pub struct App {
     grammar: grammar::Grammars,
     /// Sampling of a request that does not say (`default_sampling`); the seed is unused.
     defaults: Sampling,
+    /// `--strict-requests`: refuse the fields that are otherwise accepted and ignored.
+    strict: bool,
 }
 
 #[derive(Deserialize)]
@@ -169,9 +175,17 @@ pub struct Body {
     stream_options: Option<StreamOptions>,
     ignore_eos: Option<bool>,
     pub skip_special_tokens: Option<bool>,
-    /// Accepted and unused (an opaque caller id).
-    #[allow(dead_code)]
+    // OpenAI fields that change nothing here (bookkeeping on the provider's side): accepted
+    // and ignored, or refused under `--strict-requests` (see `ignored`).
     user: Option<Value>,
+    store: Option<Value>,
+    metadata: Option<Value>,
+    service_tier: Option<Value>,
+    prompt_cache_key: Option<Value>,
+    safety_identifier: Option<Value>,
+    /// Chat: "none" turns the template's thinking off, any other level on, unless
+    /// `chat_template_kwargs.enable_thinking` says; ignored by templates without the switch.
+    pub reasoning_effort: Option<String>,
     // Known OpenAI and vLLM fields this server cannot honour: accepted only with a value
     // that asks for nothing (see `refusal`).
     n: Option<Value>,
@@ -232,10 +246,14 @@ impl Body {
                 ("parallel_tool_calls", self.parallel_tool_calls.is_some()),
                 ("chat_template_kwargs", self.chat_template_kwargs.is_some()),
                 ("max_completion_tokens", self.max_completion_tokens.is_some()),
+                ("reasoning_effort", self.reasoning_effort.is_some()),
             ]
         };
         if let Some((name, _)) = foreign.iter().find(|f| f.1) {
             return Some((name, format!("`{name}` is not a field of this endpoint")));
+        }
+        if self.reasoning_effort.as_deref().is_some_and(|e| !["none", "minimal", "low", "medium", "high", "xhigh"].contains(&e)) {
+            return Some(("reasoning_effort", "`reasoning_effort` must be none, minimal, low, medium, high or xhigh".into()));
         }
         if self.stream_options.as_ref().is_some_and(|o| o.continuous_usage_stats == Some(true)) {
             return Some(("stream_options", "`stream_options.continuous_usage_stats` is not supported by this server".into()));
@@ -256,6 +274,15 @@ impl Body {
             return Some(("max_tokens", "`max_tokens` must be at least 1".into()));
         }
         None
+    }
+
+    /// The first field present that this server accepts and ignores.
+    fn ignored(&self) -> Option<&'static str> {
+        [("user", &self.user), ("store", &self.store), ("metadata", &self.metadata), ("service_tier", &self.service_tier),
+         ("prompt_cache_key", &self.prompt_cache_key), ("safety_identifier", &self.safety_identifier)]
+            .into_iter()
+            .find(|f| f.1.as_ref().is_some_and(|v| !v.is_null()))
+            .map(|f| f.0)
     }
 
     pub fn include_usage(&self) -> bool {
@@ -413,6 +440,9 @@ impl App {
         let body: Body = serde_json::from_slice(raw).map_err(|e| bad(None, format!("invalid request: {e}")))?;
         if let Some((param, msg)) = body.refusal(chat) {
             return Err(bad(Some(param), msg));
+        }
+        if let Some(name) = body.ignored().or(body.reasoning_effort.as_ref().map(|_| "reasoning_effort")).filter(|_| self.strict) {
+            return Err(bad(Some(name), format!("`{name}` has no effect on this server and --strict-requests is on")));
         }
         if let Some(m) = body.model.as_ref().filter(|m| **m != self.model) {
             return Err(error(StatusCode::NOT_FOUND, "not_found_error", Some("model"), format!("the model `{m}` does not exist; this server serves `{}`", self.model)));
@@ -817,6 +847,7 @@ async fn main() -> Result<()> {
     opts.policy.srpt = true;
     let mut kv_gb = 0f64;
     let mut default_temperature = None;
+    let mut strict = false;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
         match k.as_str() {
@@ -860,6 +891,7 @@ async fn main() -> Result<()> {
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
+            "--strict-requests" => strict = v.parse()?,
             "--default-temperature" => default_temperature = Some(v.parse::<f32>()?).filter(|t| *t >= 0.0),
             _ => anyhow::bail!("unknown option {k}"),
         }
@@ -897,7 +929,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let app = Arc::new(App { submit: tx, tok, next_id: AtomicU64::new(0), model: served.unwrap_or(model), alive, eos, max_ctx, metrics, vllm_metrics, chat, grammar, defaults });
+    let app = Arc::new(App { submit: tx, tok, next_id: AtomicU64::new(0), model: served.unwrap_or(model), alive, eos, max_ctx, metrics, vllm_metrics, chat, grammar, defaults, strict });
     let router = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat::completions))

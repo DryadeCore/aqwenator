@@ -15,6 +15,7 @@ ap.add_argument("--url", default="http://127.0.0.1:8000")
 ap.add_argument("--model", required=True)
 ap.add_argument("--dead", action="store_true")
 ap.add_argument("--greedy-default", action="store_true", help="the server runs with --default-temperature 0")
+ap.add_argument("--strict", action="store_true", help="the server runs with --strict-requests true")
 args = ap.parse_args()
 fails = []
 
@@ -124,6 +125,21 @@ with section('Nothing is silently dropped'):
         check(f"{path}: n=2 is a 400 naming n", s == 400 and b["error"]["param"] == "n", f"{s} {b}")
         s, b = call(path, {**base, "max_tokens": 4, "n": 1, "presence_penalty": 0, "logprobs": False})
         check(f"{path}: fields that ask for nothing are accepted", s == 200, f"{s}")
+        quiet = {"user": "u1", "store": False, "metadata": {"k": "v"}, "service_tier": "auto", "prompt_cache_key": "k", "safety_identifier": "s"}
+        s, b = call(path, {**base, "max_tokens": 4, **quiet})
+        if args.strict:
+            check(f"{path}: --strict-requests refuses the fields that have no effect", s == 400 and b["error"]["param"] == "user", f"{s} {b}")
+        else:
+            check(f"{path}: OpenAI fields that have no effect here are accepted", s == 200, f"{s} {b}")
+    for effort, want in (("none", False), ("high", True)):
+        s, b = call("/v1/chat/completions", {"messages": msg("What is 17 + 4?"), "max_tokens": 200, "reasoning_effort": effort})
+        got = bool(b["choices"][0]["message"]["reasoning_content"]) if s == 200 else None
+        if args.strict:
+            check(f"--strict-requests refuses reasoning_effort {effort}", s == 400 and b["error"]["param"] == "reasoning_effort", f"{s} {b}")
+        else:
+            check(f"reasoning_effort {effort}: thinking {'on' if want else 'off'}", got is want, b["choices"][0] if s == 200 else b)
+    s, b = chat(messages=msg("Hi"), max_tokens=4, reasoning_effort="max")
+    check("unknown reasoning_effort is a 400 naming it", s == 400 and b["error"]["param"] == "reasoning_effort", f"{s} {b}")
     s, b = chat(messages=msg("Hi"), max_tokens=4, response_format={"type": "xml"})
     check("unknown response_format type is a 400 naming response_format", s == 400 and b["error"]["param"] == "response_format", f"{s} {b}")
     s, b = chat(messages=msg("Hi"), max_tokens=4, tools=[WEATHER], tool_choice={"type": "function", "function": {"name": "nope"}})

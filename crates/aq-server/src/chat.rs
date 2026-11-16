@@ -309,6 +309,10 @@ pub async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         (None, Ok(s)) => s.map(|s| (s, "response_format")),
     };
     let mut ctx = json!({"messages": msgs, "tools": if tools.is_empty() { Value::Null } else { json!(tools) }, "add_generation_prompt": true});
+    if let Some(effort) = &body.reasoning_effort {
+        ctx["reasoning_effort"] = json!(effort);
+        ctx["enable_thinking"] = json!(effort != "none");
+    }
     for (k, v) in body.chat_template_kwargs.iter().flatten() {
         ctx[k.as_str()] = v.clone();
     }
