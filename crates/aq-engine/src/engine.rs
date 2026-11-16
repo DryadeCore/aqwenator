@@ -633,9 +633,12 @@ impl Engine {
 
     /// `add` with per-request controls. Request ids must be unique among live requests.
     pub fn add_with(&mut self, req: Request, ctl: Control) -> Result<()> {
-        // The lanes of co-execution and background prefill sample on the device only.
+        // Co-execution and background prefill collect a batch on a second lane, steps after
+        // the one that launched it, and take its tokens from the device (`apply_sampled`);
+        // a picker would need that batch's logits rows, which the lane's later launches
+        // overwrite. Both are study modes (environment only, off by default).
         if ctl.pick.is_some() && (self.coexec || self.bg_prefill > 0) {
-            bail!("sampling and constrained decoding are not supported with AQ_COEXEC or AQ_BG_PREFILL");
+            bail!("with AQ_COEXEC or AQ_BG_PREFILL tokens are picked on the device: only greedy requests (temperature 0) without constraints, logit_bias, penalties, min_tokens or logprobs");
         }
         let id = req.id;
         self.add(req)?;

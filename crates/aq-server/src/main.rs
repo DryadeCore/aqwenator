@@ -1029,7 +1029,14 @@ async fn main() -> Result<()> {
     let tok = Arc::new(tokenizers::from_json(&json).map_err(|e| anyhow::anyhow!("{e}"))?);
     let eos = eos_ids(&dir, &tok);
     eprintln!("eos ids: {eos:?}");
-    let defaults = default_sampling(&dir, default_temperature);
+    let mut defaults = default_sampling(&dir, default_temperature);
+    // These modes pick tokens on the device only (`Engine::add_with`): a request that does
+    // not say stays servable, greedy, as before there was a default temperature.
+    let lanes = std::env::var("AQ_COEXEC").as_deref() == Ok("1") || std::env::var("AQ_BG_PREFILL").is_ok_and(|v| v.parse::<usize>().is_ok_and(|n| n > 0));
+    if lanes && default_temperature.is_none() && defaults.temperature > 0.0 {
+        eprintln!("AQ_COEXEC / AQ_BG_PREFILL: requests without `temperature` are greedy; one that asks for sampling gets a 400");
+        defaults.temperature = 0.0;
+    }
     eprintln!("default sampling: temperature {} top_p {} top_k {}", defaults.temperature, defaults.top_p, defaults.top_k);
     let limits = Limits { max_tokens, max_seqs, max_ctx, block_size: 16, kv_budget_bytes: (kv_gb * (1u64 << 30) as f64) as usize, kv_blocks: 0 };
     let metrics = Arc::new(Metrics::default());
