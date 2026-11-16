@@ -316,6 +316,19 @@ speculation 3 tokens, same replay, 10 min each, 05:16-05:40, 0 errors):
 2.2x (16 agents) and 1.7x (8) turns/min. vLLM keeps the better TTFT p99 at 8 agents (1719 vs
 2075 ms). vLLM gained little from FP8 at 16 agents (bf16 earlier: 57.4 turns/min, 122 tok/s).
 
+**Scaling points** (4 min each, 06:15-06:37, 0 errors):
+
+| Agents | Tier | Turns/min | Tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
+|---|---|---|---|---|---|
+| 4 | bf16 | 35.2 | 90 | 258 / 5203 | 26.8 / 57.6 |
+| 4 | fp8 | 49.8 | 132 | 197 / 1938 | 17.7 / 33.2 |
+| 32 | bf16 | 137.5 | 247 | 964 / 10992 | 103.7 / 180.7 |
+| 32 | fp8 | 148.2 | 297 | 808 / 9102 | 84.5 / 151.4 |
+
+fp8 tok/s is flat from 16 to 32 agents (295 -> 297): the machine is saturated at 16, and more
+agents only add queueing (TTFT p99 9 s). The fp8 gain shrinks with load (+41% turns/min at 4
+agents, +8% at 32) as attention over the cached context, which fp8 does not touch, takes over.
+
 **Extra tier points** (16 agents, 5 min each, 04:31-05:13; short runs, turns/min moves a few
 percent with the sessions drawn):
 
