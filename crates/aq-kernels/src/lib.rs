@@ -544,6 +544,220 @@ pub mod kernels {
         }
     }
 
+    /// Split a bf16 matrix into two int8 digit planes for `gemm_i8w`:
+    /// `x ~ sx[r, b] * (256 * xh + xl)`, a 16-bit fixed-point form with one scale per block of
+    /// 32 elements along a row, `sx = max|block| / 32639` (the bound keeps the high digit of a
+    /// balanced split in int8 range). A scale per block, not per row: one very large element
+    /// then costs precision only to its 31 neighbours.
+    /// Requires k % 32 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn quant_x16(x: *const u16, xh: *mut u8, xl: *mut u8, sx: *mut f32, k: u32) {
+        let nb = k as usize / 32;
+        let r = thread::blockIdx_x() as usize;
+        let mut b = thread::threadIdx_x() as usize;
+        while b < nb {
+            let xv = unsafe { x.cast::<U32x4>().add((r * nb + b) * 4) };
+            let mut w = [[0u32; 4]; 4];
+            let mut top = 0u32;
+            #[unroll]
+            for j in 0..4 {
+                w[j] = unsafe { *xv.add(j) }.to_array();
+                #[unroll]
+                for e in 0..4 {
+                    top = top.max(w[j][e] & 0x7fff).max((w[j][e] >> 16) & 0x7fff);
+                }
+            }
+            let mx = bf16_to_f32(top as u16);
+            unsafe { *sx.add(r * nb + b) = mx * (1.0 / 32639.0) };
+            let inv = if mx > 0.0 { 32639.0 / mx } else { 0.0 };
+            #[unroll]
+            for j in 0..4 {
+                let (mut hi, mut lo) = (0u64, 0u64);
+                #[unroll]
+                for e in 0..4 {
+                    let (a0, a1) = cvt_f32x2_bf16x2(w[j][e]);
+                    let (i0, i1) = (libm::rintf(a0 * inv) as i32, libm::rintf(a1 * inv) as i32);
+                    lo |= (((i0 & 0xff) | ((i1 & 0xff) << 8)) as u64) << (16 * e);
+                    hi |= (((((i0 + 128) >> 8) & 0xff) | ((((i1 + 128) >> 8) & 0xff) << 8)) as u64) << (16 * e);
+                }
+                unsafe {
+                    *(xh.add((r * nb + b) * 32 + j * 8) as *mut u64) = hi;
+                    *(xl.add((r * nb + b) * 32 + j * 8) as *mut u64) = lo;
+                }
+            }
+            b += 256;
+        }
+    }
+
+    /// `y[m, n] = x[m, k] . w[n, k]^T` for block-scaled int8 weights (`quant_i8b` layout), on
+    /// the integer tensor cores: the weight bytes go from memory into `mma` as they are, read
+    /// once. The activations come as the two int8 digit planes of `quant_x16`; each 32-wide
+    /// block of k is one `m16n8k32` product per digit, and the block's weight and activation
+    /// scales are applied to that partial sum as it is added to the f32 accumulator.
+    ///
+    /// A block owns 128 weight rows (warp w: rows 16w..16w+16, two n8 tiles) and up to 128
+    /// activation rows, and walks K in chunks of 64 through a 4-stage `cp.async` ring, so three
+    /// chunks of weights, scales and activations are in flight while one is multiplied.
+    /// Operands are read with `ldmatrix`; the four 16-byte pieces of a shared row are stored
+    /// XOR-swizzled by `(row >> 1) & 3` so the eight rows of a fragment hit distinct banks.
+    ///
+    /// Stage layout: W [128][64] i8, weight scales [128] x 2 bf16, activation scales
+    /// [mt * 16] x 2 f32, XH then XL [mt * 16][64] i8.
+    /// Requires k % 64 == 0 and n % 8 == 0.
+    /// grid = (ceil(n / 128), ceil(m / 128)), block = (256),
+    /// dynamic shared memory = 4 * (8704 + min(m, 128).div_ceil(16) * 2176) bytes.
+    #[kernel]
+    pub unsafe fn gemm_i8w(xh: *const u8, xl: *const u8, sx: *const f32, q: *const u8, bmax: *const u16, y: *mut u16, m: u32, n: u32, k: u32, ldy: u32) {
+        use cuda_device::async_copy::{cp_async_ca_4, cp_async_ca_8, cp_async_ca_zfill_4, cp_async_ca_zfill_8, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
+        use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k32_s32_s8};
+        const S: usize = 4;
+        // Byte offset of 16-byte piece `c` of shared row `r` (rows of 64 bytes).
+        let sw = |r: usize, c: usize| r * 64 + ((c ^ ((r >> 1) & 3)) * 16);
+        let sm = DynamicSharedArray::<u8, 16>::get_raw();
+        let (m, n, k, ldy) = (m as usize, n as usize, k as usize, ldy as usize);
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let w = tid / 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let (lr, lm) = (lane % 8, lane / 8); // ldmatrix: row and matrix this lane addresses
+        let nb = thread::blockIdx_x() as usize * 128;
+        let m0 = thread::blockIdx_y() as usize * 128;
+        let mc = if m - m0 < 128 { m - m0 } else { 128 };
+        let mtc = mc.div_ceil(16);
+        let plane = mtc * 1024;
+        let xo = 8704 + mtc * 128; // digit planes, after the activation scales
+        let stage = xo + 2 * plane;
+        let kb = k / 32;
+        let chunks = k / 64;
+
+        // Issue chunk `c` into ring slot `c % S` and commit it as one group.
+        let issue = |c: usize| {
+            let sb = unsafe { sm.add((c % S) * stage) };
+            let kc = c * 64;
+            unsafe {
+                // Weights: 128 rows x 4 vectors, two per thread.
+                #[unroll]
+                for u in 0..2 {
+                    let idx = tid + 256 * u;
+                    let (r, v) = (idx / 4, idx % 4);
+                    let dst = sb.add(sw(r, v)) as *mut u32;
+                    if nb + r < n {
+                        cp_async_cg_16(dst, q.add((nb + r) * k + kc + v * 16) as *const u32);
+                    } else {
+                        cp_async_cg_zfill_16(dst, q, 0);
+                    }
+                }
+                // The two block scales of each row.
+                if tid < 128 {
+                    let dst = sb.add(8192 + tid * 4) as *mut u32;
+                    if nb + tid < n {
+                        cp_async_ca_4(dst, bmax.add((nb + tid) * kb + kc / 32) as *const u32);
+                    } else {
+                        cp_async_ca_zfill_4(dst, q, 0);
+                    }
+                }
+                // The two block scales of each activation row.
+                if tid < mtc * 16 {
+                    let dst = sb.add(8704 + tid * 8) as *mut u32;
+                    if tid < mc {
+                        cp_async_ca_8(dst, sx.add((m0 + tid) * kb + kc / 32) as *const u32);
+                    } else {
+                        cp_async_ca_zfill_8(dst, q, 0);
+                    }
+                }
+                // Activation digits: mtc * 16 rows x (4 high + 4 low) vectors.
+                let mut idx = tid;
+                while idx < mtc * 128 {
+                    let (r, v) = (idx / 8, idx % 8);
+                    let dst = sb.add(xo + (v / 4) * plane + sw(r, v % 4)) as *mut u32;
+                    if r < mc {
+                        let src = if v < 4 { xh } else { xl };
+                        cp_async_cg_16(dst, src.add((m0 + r) * k + kc + (v % 4) * 16) as *const u32);
+                    } else {
+                        cp_async_cg_zfill_16(dst, q, 0);
+                    }
+                    idx += 256;
+                }
+                cp_async_commit_group();
+            }
+        };
+
+        #[unroll]
+        for c in 0..3 {
+            if c < chunks {
+                issue(c);
+            } else {
+                unsafe { cp_async_commit_group() };
+            }
+        }
+        let mut acc = [[[0.0f32; 4]; 2]; 8];
+        let mut c = 0;
+        while c < chunks {
+            // Chunk c has landed for this thread; after the barrier, for the block, and
+            // everyone is done with chunk c - 1, whose slot the next issue reuses.
+            unsafe { cp_async_wait_group(2) };
+            thread::sync_threads();
+            if c + 3 < chunks {
+                issue(c + 3);
+            } else {
+                unsafe { cp_async_commit_group() };
+            }
+            let sb = unsafe { sm.add((c % S) * stage) };
+            #[unroll]
+            for blk in 0..2 {
+                // Both n8 tiles of this warp: rows lr and 8 + lr, two 16-byte pieces each.
+                let b = unsafe { ldmatrix_x4(sb.add(sw(w * 16 + 8 * (lm >> 1) + lr, 2 * blk + (lm & 1))) as *const u32) };
+                let mut sc = [[0.0f32; 2]; 2];
+                #[unroll]
+                for nt in 0..2 {
+                    // This lane's two output columns are weight rows 2t and 2t + 1 of the tile.
+                    let sv = unsafe { *(sb.add(8192 + (w * 16 + nt * 8 + 2 * t) * 4) as *const u64) };
+                    sc[nt] = [bf16_to_f32((sv >> (16 * blk)) as u16) * (1.0 / 127.0), bf16_to_f32((sv >> (32 + 16 * blk)) as u16) * (1.0 / 127.0)];
+                }
+                #[unroll]
+                for mt in 0..8 {
+                    if mt < mtc {
+                        let fx = unsafe { [*(sb.add(8704 + (mt * 16 + g) * 8 + blk * 4) as *const f32), *(sb.add(8704 + (mt * 16 + g + 8) * 8 + blk * 4) as *const f32)] };
+                        let o = sw(mt * 16 + 8 * (lm & 1) + lr, 2 * blk + (lm >> 1));
+                        let ah = unsafe { ldmatrix_x4(sb.add(xo + o) as *const u32) };
+                        let al = unsafe { ldmatrix_x4(sb.add(xo + plane + o) as *const u32) };
+                        #[unroll]
+                        for nt in 0..2 {
+                            let bn = [b[2 * nt], b[2 * nt + 1]];
+                            let p = unsafe { mma_m16n8k32_s32_s8([0; 4], ah, bn) };
+                            let p = unsafe { mma_m16n8k32_s32_s8([p[0] << 8, p[1] << 8, p[2] << 8, p[3] << 8], al, bn) };
+                            #[unroll]
+                            for e in 0..4 {
+                                acc[mt][nt][e] += p[e] as f32 * (sc[nt][e & 1] * fx[e >> 1]);
+                            }
+                        }
+                    }
+                }
+            }
+            c += 1;
+        }
+
+        #[unroll]
+        for mt in 0..8 {
+            if mt < mtc {
+                let r0 = m0 + mt * 16 + g;
+                #[unroll]
+                for nt in 0..2 {
+                    let col = nb + w * 16 + nt * 8 + 2 * t;
+                    if col < n {
+                        if r0 < m {
+                            unsafe { *(y.add(r0 * ldy + col) as *mut u32) = pk(acc[mt][nt][0], acc[mt][nt][1]) };
+                        }
+                        if r0 + 8 < m {
+                            unsafe { *(y.add((r0 + 8) * ldy + col) as *mut u32) = pk(acc[mt][nt][2], acc[mt][nt][3]) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `y[r, c] *= rs[r] * cs[c]` in place on a bf16 matrix.
     /// Requires n % 8 == 0. grid = (rows), block = (256).
     #[kernel]

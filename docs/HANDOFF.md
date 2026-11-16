@@ -425,6 +425,49 @@ one-pass row x column scaling measured worse (0.059);
 half the memory, but ~2.3x the decode weight traffic; (c) our own tensor-core GEMM reading
 int8 weights. `AQ_QSIM` and the `qsim` kernel are diagnostics to delete once this is settled.
 
+### int8-weight GEMM kernel (`gemm_i8w`, 2026-11-16, B200 only)
+
+With `AQ_QUANT=int8`, GEMMs of at most 96 rows (`AQ_I8_KERNEL_M`, 0 = off) on weights of at least
+6144 rows (`AQ_I8_KERNEL_MIN_N`) run in a kernel that feeds the weight bytes to the integer tensor
+cores (`mma.m16n8k32` s8), with no bf16 copy of the weight. Activations become two int8 digit
+planes with one f32 scale per 32-wide block (`quant_x16`); each 32-block partial sum is scaled by
+the weight block scale and the activation block scale and accumulated in f32. Everything else
+keeps the expansion path (int8 to bf16 1024 rows at a time, then the bf16 GEMM).
+
+Dead ends: converting int8 to bf16 per weight inside the kernel (compute-bound, 0.23–0.25 ms at
+16 rows); one activation scale per row (one large element in a row cost logits rel_l2 1.14 at a
+decode position; per-block scales fixed it).
+
+One 24576 x 4096 weight, ms: bf16 GEMM 0.044 / 0.045 / 0.047 at 16 / 64 / 128 rows, expansion
+0.347 flat, kernel 0.076 / 0.134 / 0.247 (0.370 at 256, 0.688 at 512: it costs per row, hence
+the row cap).
+
+Decode steps of `aq-serve` under the trace replay (16 agents, us per call, kernel / expansion):
+gate_up 106 / 262, gdn_in 82 / 153, qkv 65 / 92, but down 205 / 81, gdn_out 81 / 52, o 62 / 41.
+On 4096-row weights the kernel launches 32 blocks on 148 SMs and expanding them is cheap, hence
+the minimum weight size; with it the decode step is 5.3 ms against 7.8 ms. The 6144 threshold
+was measured on the B200 only; a 48-SM device probably wants a lower one.
+
+Trace replay, 9B, B200, 4 minutes per point (turns/min, tok/s, TPOT p50 ms):
+
+| | 16 agents | 32 agents |
+|---|---|---|
+| int8, kernel (cap 128) | 363.8 / 955 / 4.8 | 356.0 / 931 / 20.4 |
+| int8, kernel (cap 96) | 362.5 / 949 / 4.9 | 373.5 / 1008 / 18.7 |
+| int8, kernel (cap 64) | 363.0 / 950 / 5.1 | 363.5 / 941 / 20.1 |
+| int8, expansion only (two runs) | 324.0 / 866 / 6.9 and 322.8 / 865 / 6.8 | 383.5 / 1004 / 18.4 and 368.8 / 976 / 18.9 |
+| bf16 | 437.8 / 1158 / 2.3 | 424.8 / 1176 / 16.6 |
+
+12% more turns at 16 agents; at 32 agents (saturated) the runs differ by less than the
+expansion path's own run-to-run spread. bf16 stays the fast tier on the B200; int8 is for memory.
+The point of the kernel is bandwidth-limited devices, where it reads half the bytes of the bf16
+GEMM; that has not been measured (no Spark access since 2026-11-16).
+
+Quality, kernel / expansion, teacher-forced on the three trace references (mean KL, nats):
+a 4.17e-3 / 3.87e-3, b 1.42e-3 / 1.65e-3, c 3.04e-3 / 3.93e-3; top-1 253 / 254, 252 / 253,
+254 / 255 of 256. `aq-check` passes with `AQ_QUANT=int8` on the three 9B references; the exact
+gate is 30/30 with the fault leg failing as it must.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
