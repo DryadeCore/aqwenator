@@ -10,14 +10,14 @@
 //! `/health` (503 once the engine thread has ended), `/metrics` (Prometheus text).
 //!
 //! Request fields, both endpoints: `max_tokens` (default: what is left of the context),
-//! `temperature` (default 0 = greedy), `top_p`, `top_k`, `seed`, `stop`, `stop_token_ids`,
+//! `temperature`, `top_p`, `top_k` (defaults: see `default_sampling`), `seed`, `stop`, `stop_token_ids`,
 //! `ignore_eos`, `skip_special_tokens`, `stream`, `stream_options.include_usage`,
 //! `response_format` (`json_object`, `json_schema`: constrained decoding, see `grammar.rs`).
 //! A field the server does not know, or knows and cannot honour (`n` > 1, `logprobs`,
 //! penalties, ...), is a 400 that names it; nothing is silently dropped.
 //!
-//! Sampling: `temperature` 0 or absent is the engine's greedy path, token-identical to what
-//! it always was. With a temperature the token is drawn on the host from the logits row
+//! Sampling: `temperature` 0 is the engine's greedy path, token-identical to what it always
+//! was (and what a request without `temperature` gets under `--default-temperature 0`). With a temperature the token is drawn on the host from the logits row
 //! (`aq_engine::sample`); `seed` makes a request reproducible as far as its logits are (they
 //! can move by a rounding step with what else shares the batch). Speculative decoding stays
 //! on and exact for sampled requests; fewer drafts are accepted as the temperature rises.
@@ -26,6 +26,7 @@
 //!              [--max-seqs 64] [--max-ctx 32768] [--max-tokens 8192] [--mixed-prefill N]
 //!              [--max-running N] [--session-cache true|false] [--kv-gb X] [--kv-reserve N]
 //!              [--spec-k N] [--vllm-metrics true|false]
+//!              [--default-temperature T]
 //!
 //! `--host`: address to listen on (default 127.0.0.1, or `AQ_HOST`; 0.0.0.0 for every
 //! interface).
@@ -113,6 +114,8 @@ pub struct App {
     vllm_metrics: bool,
     pub chat: Option<chat::Template>,
     grammar: grammar::Grammars,
+    /// Sampling of a request that does not say (`default_sampling`); the seed is unused.
+    defaults: Sampling,
 }
 
 #[derive(Deserialize)]
@@ -437,7 +440,13 @@ impl App {
             h.write_u64(id);
             h.finish()
         });
-        let sampling = Sampling { temperature: body.temperature.unwrap_or(0.0), top_p: body.top_p.unwrap_or(1.0), top_k: body.top_k.filter(|&k| k > 0).unwrap_or(0) as usize, seed };
+        let d = self.defaults;
+        let sampling = Sampling {
+            temperature: body.temperature.unwrap_or(d.temperature),
+            top_p: body.top_p.unwrap_or(d.top_p),
+            top_k: body.top_k.map_or(d.top_k, |k| k.max(0) as usize),
+            seed,
+        };
         // Greedy and unconstrained: no picker, the device decides (the engine's own path).
         let pick: Option<Box<dyn Picker>> = match constraint {
             Some((schema, thinking, field)) => Some(self.grammar.constrain(&schema, thinking, Sampler::new(sampling)).map_err(|e| bad(Some(field), format!("`{field}`: {e}")))?),
@@ -780,6 +789,20 @@ fn eos_ids(dir: &std::path::Path, tok: &PipelineTokenizer) -> Vec<u32> {
     out
 }
 
+/// Sampling of a request that does not set `temperature`, `top_p` or `top_k`: the values of
+/// the model's generation_config.json where it has them (as `transformers` and vLLM do), else
+/// temperature 1 and no truncation (the OpenAI default). `--default-temperature` replaces the
+/// temperature; 0 makes such requests greedy.
+fn default_sampling(dir: &std::path::Path, temperature: Option<f32>) -> Sampling {
+    let g: Value = std::fs::read_to_string(dir.join("generation_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+    Sampling {
+        temperature: temperature.or(g["temperature"].as_f64().map(|t| t as f32)).unwrap_or(1.0),
+        top_p: g["top_p"].as_f64().map_or(1.0, |p| p as f32),
+        top_k: g["top_k"].as_u64().unwrap_or(0) as usize,
+        seed: 0,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -793,6 +816,7 @@ async fn main() -> Result<()> {
     // the same throughput (Spark, 16 agents: TTFT p90 2633 -> 1506 ms).
     opts.policy.srpt = true;
     let mut kv_gb = 0f64;
+    let mut default_temperature = None;
     while let Some(k) = args.next() {
         let v = args.next().with_context(|| format!("missing value for {k}"))?;
         match k.as_str() {
@@ -836,6 +860,7 @@ async fn main() -> Result<()> {
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
+            "--default-temperature" => default_temperature = Some(v.parse::<f32>()?).filter(|t| *t >= 0.0),
             _ => anyhow::bail!("unknown option {k}"),
         }
     }
@@ -845,6 +870,8 @@ async fn main() -> Result<()> {
     let tok = Arc::new(tokenizers::from_json(&json).map_err(|e| anyhow::anyhow!("{e}"))?);
     let eos = eos_ids(&dir, &tok);
     eprintln!("eos ids: {eos:?}");
+    let defaults = default_sampling(&dir, default_temperature);
+    eprintln!("default sampling: temperature {} top_p {} top_k {}", defaults.temperature, defaults.top_p, defaults.top_k);
     let limits = Limits { max_tokens, max_seqs, max_ctx, block_size: 16, kv_budget_bytes: (kv_gb * (1u64 << 30) as f64) as usize, kv_blocks: 0 };
     let metrics = Arc::new(Metrics::default());
     let (tx, rx) = std::sync::mpsc::channel();
@@ -870,7 +897,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let app = Arc::new(App { submit: tx, tok, next_id: AtomicU64::new(0), model: served.unwrap_or(model), alive, eos, max_ctx, metrics, vllm_metrics, chat, grammar });
+    let app = Arc::new(App { submit: tx, tok, next_id: AtomicU64::new(0), model: served.unwrap_or(model), alive, eos, max_ctx, metrics, vllm_metrics, chat, grammar, defaults });
     let router = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat::completions))

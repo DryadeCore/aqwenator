@@ -14,12 +14,15 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:8000")
 ap.add_argument("--model", required=True)
 ap.add_argument("--dead", action="store_true")
+ap.add_argument("--greedy-default", action="store_true", help="the server runs with --default-temperature 0")
 args = ap.parse_args()
 fails = []
 
 
-def call(path, body=None, timeout=300):
-    """(status, parsed JSON | text | list of SSE events)"""
+def call(path, body=None, timeout=300, raw=False):
+    """(status, parsed JSON | text | list of SSE events). Requests are greedy unless they say otherwise or `raw`."""
+    if body is not None and not raw:
+        body = {"temperature": 0, **body}
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(args.url + path, data, {"Content-Type": "application/json"})
     try:
@@ -157,6 +160,11 @@ with section('Sampling'):
     check("temperature 0 is greedy and repeatable", g[0] == g[1] == g[2], g)
     t = [chat(messages=story, max_tokens=24, temperature=1.0, top_p=0.95, seed=sd)[1]["choices"][0]["message"]["content"] for sd in (1, 1, 2, 3, 4)]
     check("seeded sampling repeats; other seeds differ", t[0] == t[1] and len(set(t)) >= 3, t)
+    d = [call("/v1/chat/completions", {"messages": story, "max_tokens": 24, "chat_template_kwargs": {"enable_thinking": False}}, raw=True)[1]["choices"][0]["message"]["content"] for _ in range(4)]
+    if args.greedy_default:
+        check("no temperature under --default-temperature 0: greedy", len(set(d)) == 1 and d[0] == g[0], d)
+    else:
+        check("no temperature: sampled at the server default (generation_config.json, else 1.0)", len(set(d)) >= 2, d)
     s, b = chat(messages=story, max_tokens=4, temperature=-1)
     check("negative temperature is a 400", s == 400 and b["error"]["param"] == "temperature", f"{s} {b}")
 
