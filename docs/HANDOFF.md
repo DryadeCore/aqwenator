@@ -5,11 +5,12 @@ vLLM stays as the server baseline. In order:
 
 1. **int8-weight GEMM kernel** (`gemm_i8w`, in progress): trace-golden KL against the expansion
    path, load test, full gate, then merge.
-2. **MTP draft-and-verify.** Draft with the model's MTP head, verify in one pass, keep the agreed
-   prefix. Greedy output must stay identical to plain decoding (gate it). Adaptive draft length
-   with fallback when drafts keep failing. Others report 2.4–3.2 tokens per pass with 3 drafts.
-3. **Prompt-lookup drafting.** Draft copies of earlier text of the same session through the same
-   verify path; coding-agent turns copy a lot.
+2. **Longer, adaptive MTP drafts.** Chained MTP drafts exist and are on by default
+   (`AQ_MTP_K=3`). Others adapt the draft length up to 7 and fall back to plain decoding when
+   drafts keep failing, and report 2.4–3.2 tokens per pass with 3 drafts: measure our accepted
+   tokens per pass on the traces and try the adaptive length.
+3. **Longer prompt-lookup drafts.** Lookup drafts exist (k=4 in `aq-serve`). Others verify up to
+   64 copied tokens in one pass when a request decodes alone; coding-agent turns copy a lot.
 4. **8-bit attention cache** (then 8-bit keys / 4-bit values). Decode attention is 30% of the fp8
    step and bandwidth-bound.
 5. **Session checkpoints in host RAM and on disk**: evicted sessions and restarts resume from the
