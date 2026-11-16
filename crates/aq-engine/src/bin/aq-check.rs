@@ -12,7 +12,8 @@
 //! Exit status is non-zero on any real miss.
 
 use anyhow::{Context, Result};
-use aq_engine::engine::{Engine, Request};
+use aq_engine::engine::{Control, Engine, Request};
+use aq_engine::sample::{Sampler, Sampling, by_id, distribution, uniform};
 use aq_engine::model::{Limits, Model};
 use aq_engine::weights::resolve_model;
 use std::time::Instant;
@@ -714,6 +715,118 @@ fn main() -> Result<()> {
             failed |= !ok;
             eng.eos = saved_eos;
         }
+        // ---- 6c. sampling. (1) A seeded request is reproducible, and speculation does not
+        // change it: the token at each position depends on that position's logits and the
+        // seed only, so a sequence decoded alone gives the same tokens with drafts on and off
+        // (same GEMM plan pinning as above; batched, logits move by an ulp with what shares
+        // the step, which sampling turns into a different token now and then). (2) Batched
+        // with drafts, temperature 0 through the host path follows the device's greedy tokens,
+        // so every request reads its own logits rows. (3) The first sampled token follows the
+        // reference distribution: frequencies over many seeds against
+        // softmax(reference logits / T) cut to top-k and top-p.
+        if !eng.coexec && eng.bg_prefill == 0 {
+            let sp = Sampling { temperature: 0.8, top_p: 0.95, top_k: 40, seed: 1234 };
+            // `copies` requests with seeds from `sp.seed` up; `distinct`: one prompt each.
+            let mut sample = |eng: &mut Engine, spec: usize, sp: Sampling, n: usize, copies: u64, distinct: bool| -> Result<Vec<Vec<u32>>> {
+                eng.spec_k = spec;
+                for c in 0..copies {
+                    let ctl = Control { pick: Some(Box::new(Sampler::new(Sampling { seed: sp.seed + c, ..sp }))), stop_ids: Vec::new() };
+                    let prompt = prompts[if distinct { c as usize } else { 0 }].clone();
+                    eng.add_with(Request { id: 700 + c, prompt, max_new_tokens: n, ignore_eos: true }, ctl)?;
+                }
+                let mut out = vec![Vec::new(); copies as usize];
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        out[(e.id - 700) as usize].push(e.token);
+                    }
+                }
+                Ok(out)
+            };
+            let cached = std::mem::replace(&mut eng.session_cache, false);
+            let before = eng.spec;
+            let on = sample(&mut eng, k, sp, 96, 1, false)?;
+            let st = eng.spec;
+            let again = sample(&mut eng, k, sp, 96, 1, false)?;
+            let off = sample(&mut eng, 0, sp, 96, 1, false)?;
+            let other = sample(&mut eng, k, Sampling { seed: 99, ..sp }, 96, 1, false)?;
+            // Two runs with one seed are identical while their logits are. Where rounding
+            // moves a logit (as between the plain and speculative greedy runs above), the
+            // same draw can land on the neighbouring token: accepted when the draw sits
+            // within 0.1 of a boundary of the distribution at the first difference.
+            let mut agree = |eng: &mut Engine, a: &[u32], b: &[u32]| -> Result<String> {
+                let p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+                if p == a.len() && p == b.len() {
+                    return Ok("identical".into());
+                }
+                eng.spec_k = 0;
+                let prompt: Vec<u32> = prompts[0].iter().chain(&a[..p]).copied().collect();
+                eng.add(Request { id: 399, prompt, max_new_tokens: 1, ignore_eos: true })?;
+                while eng.has_work() {
+                    eng.step()?;
+                }
+                let (u, mut cum, mut near) = (uniform(sp.seed, p as u64), 0.0, f64::MAX);
+                let mut d = distribution(&sp, &eng.model.logits()?);
+                by_id(&mut d);
+                for (_, pr) in d {
+                    cum += pr;
+                    near = near.min((u - cum).abs());
+                }
+                Ok(format!("identical for {p}/96 tokens, then a draw {near:.3} from a boundary: {}", if near < 0.1 { "ok" } else { "DIFFERS" }))
+            };
+            let (rerun, vs_plain) = (agree(&mut eng, &on[0], &again[0])?, agree(&mut eng, &on[0], &off[0])?);
+            // Temperature 0 through the host path, three prompts batched with drafts: every
+            // pick must equal the device's greedy token for its row.
+            let b0 = eng.spec;
+            sample(&mut eng, k, Sampling { temperature: 0.0, ..sp }, 96, 3, true)?;
+            let (picked, repicked) = (eng.spec.picked - b0.picked, eng.spec.repicked - b0.repicked);
+            let ok = !rerun.ends_with("DIFFERS") && !vs_plain.ends_with("DIFFERS") && on != other && picked >= 288 && repicked == 0;
+            println!(
+                "sampling (T={} top_p={} top_k={}, k={k}): same seed again {rerun}; speculative vs plain {vs_plain}; other seed {}; drafted {} accepted {} ({:.0}%); temperature 0 batched x3 with drafts: {repicked}/{picked} host picks differ from the device token",
+                sp.temperature,
+                sp.top_p,
+                sp.top_k,
+                if on != other { "differs" } else { "IDENTICAL" },
+                st.drafted - before.drafted,
+                st.accepted - before.accepted,
+                100.0 * (st.accepted - before.accepted) as f64 / (st.drafted - before.drafted).max(1) as f64
+            );
+            failed |= !ok;
+
+            // Frequencies of the first token over many seeds, against the reference logits
+            // (transformers, `logits_last`) when the golden has them, else our own.
+            let sp = Sampling { temperature: 1.5, top_p: 0.9, top_k: 12, seed: 0 };
+            let refl = as_f32("logits_last").unwrap_or_default();
+            let want = distribution(&sp, if refl.len() == vocab { &refl } else { &lg });
+            const DRAWS: u64 = 1024;
+            // (With the session cache: after the first batch a draw prefills only the prompt's
+            // last tokens, from the prompt checkpoint.)
+            eng.session_cache = true;
+            let mut got: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+            let mut seed = 0;
+            while seed < DRAWS {
+                for o in sample(&mut eng, k, Sampling { seed, ..sp }, 1, 8, false)? {
+                    *got.entry(o[0]).or_default() += 1.0 / DRAWS as f64;
+                }
+                seed += 8;
+            }
+            // Total variation distance; sampling noise alone gives about 0.04 at 1024 draws
+            // over a dozen tokens, and bf16 logits against the f32 reference add a little.
+            let tv = 0.5 * (want.iter().map(|(t, p)| (p - got.get(t).copied().unwrap_or(0.0)).abs()).sum::<f64>()
+                + got.iter().filter(|(t, _)| !want.iter().any(|w| w.0 == **t)).map(|(_, f)| f).sum::<f64>());
+            let outside = got.keys().filter(|t| !want.iter().any(|w| w.0 == **t)).count();
+            println!(
+                "sampling frequencies (T={} top_p={} top_k={}, {DRAWS} seeds): {} candidate tokens, top p {:.3}, total variation vs reference {tv:.3}, {outside} token(s) outside the reference set: {}",
+                sp.temperature,
+                sp.top_p,
+                sp.top_k,
+                want.len(),
+                want.first().map_or(0.0, |w| w.1),
+                if tv < 0.1 { "ok" } else { "FAIL" }
+            );
+            failed |= tv >= 0.1;
+            eng.clear_cache();
+            eng.session_cache = cached;
+        }
         (eng.session_cache, eng.spec_k, eng.model.gpu.gemm_min_m) = saved;
         eng.coexec = coexec_saved;
         eng.bg_prefill = bg_saved;
@@ -796,6 +909,55 @@ fn main() -> Result<()> {
             if ok { "identical to a cold run" } else { "DIFFER from a cold run" }
         );
         failed |= !ok;
+    }
+
+    // ---- 8. KV reservation (`Engine::kv_reserve`): a request that reserves only part of its
+    // token limit takes pages as it generates. With room in the pool the output is the same
+    // as with a full reservation. In a pool that cannot hold what two such requests ask for,
+    // both are admitted and run together (a full reservation would run them one after the
+    // other) until the pages run out; then one ends as if at its limit (its pages let the
+    // other go on), and nothing fails.
+    {
+        let saved = (eng.session_cache, eng.spec_k, eng.kv_reserve);
+        (eng.session_cache, eng.spec_k) = (false, 0);
+        eng.clear_cache();
+        let bs = eng.limits().block_size;
+        let mut run = |eng: &mut Engine, reserve: usize, copies: u64| -> Result<(Vec<Vec<u32>>, usize)> {
+            eng.kv_reserve = reserve;
+            for c in 0..copies {
+                eng.add(Request { id: 800 + c, prompt: ids.clone(), max_new_tokens: 96, ignore_eos: true })?;
+            }
+            let (mut out, mut together) = (vec![Vec::new(); copies as usize], 0);
+            while eng.has_work() {
+                let ev = eng.step()?;
+                together = together.max(eng.num_running());
+                for e in ev {
+                    out[(e.id - 800) as usize].push(e.token);
+                }
+            }
+            Ok((out, together))
+        };
+        let (full, _) = run(&mut eng, usize::MAX, 1)?;
+        let (lazy, _) = run(&mut eng, 16, 1)?;
+        // Room for both prompts, their 16 reserved tokens, and about 64 tokens of growth.
+        let target = 2 * (ids.len() + 16).div_ceil(bs) + 4;
+        eng.withhold_pages(eng.free_pages().saturating_sub(target));
+        let before = eng.cache.cut;
+        let (_, serial) = run(&mut eng, usize::MAX, 2)?;
+        let (cut, together) = run(&mut eng, 16, 2)?;
+        let cuts = eng.cache.cut - before;
+        // (Two together need not match the single run token for token: near-ties, see leg 6.)
+        let ok = lazy == full && serial == 1 && together == 2 && cuts >= 1 && cut.iter().all(|o| !o.is_empty()) && cut.iter().any(|o| o.len() < 96);
+        println!(
+            "kv reservation: growing {} a full reservation ({} tokens); pool of {target} pages, 2 requests of {} + 96 tokens: {serial} at a time reserved in full, {together} with 16 reserved, {cuts} ended early after {:?} tokens: {}",
+            if lazy == full { "identical to" } else { "DIFFERS from" },
+            full[0].len(),
+            ids.len(),
+            cut.iter().map(|o| o.len()).collect::<Vec<_>>(),
+            if ok { "ok" } else { "FAIL" }
+        );
+        failed |= !ok;
+        (eng.session_cache, eng.spec_k, eng.kv_reserve) = saved;
     }
 
     if failed {

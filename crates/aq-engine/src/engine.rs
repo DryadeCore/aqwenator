@@ -22,8 +22,9 @@
 
 use crate::draft::{DraftIndex, NgramModel};
 use crate::model::{Batch, GDN_TC_CHUNK, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
+use crate::sample::Picker;
 use anyhow::{Result, bail};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,17 @@ pub struct Request {
     pub ignore_eos: bool,
 }
 
+/// What a request asks for beyond greedy decoding to its token limit (`Engine::add_with`).
+#[derive(Default)]
+pub struct Control {
+    /// Picks each token from its logits row on the host (sampling, constrained decoding).
+    /// `None`: the greedy token, computed on the device.
+    pub pick: Option<Box<dyn Picker>>,
+    /// Tokens that end this request, besides the engine's end-of-sequence tokens. They apply
+    /// even with `ignore_eos`.
+    pub stop_ids: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TokenEvent {
     pub id: u64,
@@ -42,6 +54,8 @@ pub struct TokenEvent {
     pub finished: bool,
     /// The request ended on an end-of-sequence token (rather than its token limit).
     pub stop: bool,
+    /// Prompt tokens this request did not have to prefill (session cache or shared prefix).
+    pub cached: usize,
 }
 
 struct Seq {
@@ -212,6 +226,8 @@ pub struct CacheStats {
     /// Scheduler host time (admission + batch building) and steps, cumulative.
     pub host_us: u64,
     pub steps: u64,
+    /// Requests ended early because the KV pool had no page left for them (`kv_reserve`).
+    pub cut: u64,
 }
 
 /// Speculative decoding counters.
@@ -233,6 +249,10 @@ pub struct SpecStats {
     /// Requests that stopped on a token inside a fully accepted draft (the verified state
     /// then covers tokens past the stop and is discarded).
     pub stop_in_draft: u64,
+    /// Tokens picked on the host (`Control::pick`), and how many of them differ from the
+    /// device's greedy token for the same row.
+    pub picked: u64,
+    pub repicked: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -258,7 +278,10 @@ pub struct Engine {
     /// Max snapshot slots kept at once.
     pub max_snapshots: usize,
     clock: u64,
+    /// Tokens that end a request (unless it sets `ignore_eos`).
     pub eos: Vec<u32>,
+    /// Per-request controls, by request id (absent: plain greedy, engine stop tokens only).
+    controls: HashMap<u64, Control>,
     pub last: StepStats,
     pub cache: CacheStats,
     /// Keep finished sequences for prefix reuse (on by default).
@@ -339,6 +362,13 @@ pub struct Engine {
     pace: Pace,
     /// Set during an admission that may only evict sessions presumed finished.
     dead_only: bool,
+    /// Output tokens whose KV pages a request reserves at admission (default: its whole token
+    /// limit, so it can never run out). With a smaller value a request reserves
+    /// `min(limit, kv_reserve)` and takes further pages as it generates, evicting parked
+    /// sessions if needed; when the pool has none left it ends there, as if it had reached
+    /// its limit (`CacheStats::cut`). That keeps requests with a large or absent limit from
+    /// each holding a full context of pages they will mostly not use.
+    pub kv_reserve: usize,
 }
 
 /// Online step-cost model for frame pacing.
@@ -366,6 +396,7 @@ impl Engine {
             max_snapshots: 4,
             clock: 0,
             eos,
+            controls: HashMap::new(),
             last: StepStats::default(),
             cache: CacheStats::default(),
             session_cache: true,
@@ -401,6 +432,7 @@ impl Engine {
             itl_target_us: None,
             pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
             dead_only: false,
+            kv_reserve: usize::MAX,
         };
         // The MTP head keeps its own KV over the whole context, so it runs on every step of
         // every lane once it is loaded.
@@ -509,18 +541,67 @@ impl Engine {
         }
         // A request that needs more KV pages than the whole pool can never be admitted; left
         // in the queue it would block every request behind it forever.
-        let need = (req.prompt.len() + req.max_new_tokens).div_ceil(lim.block_size);
+        let need = self.reserved_tokens(&req).div_ceil(lim.block_size);
         if need > lim.num_blocks() {
             bail!(
                 "request {} needs {} KV pages ({} tokens) but the pool has {}; lower max_tokens or raise the KV budget",
                 req.id,
                 need,
-                req.prompt.len() + req.max_new_tokens,
+                self.reserved_tokens(&req),
                 lim.num_blocks()
             );
         }
         self.model.mtp_note(req.prompt.iter().copied());
         self.waiting.push_back((req, Instant::now()));
+        Ok(())
+    }
+
+    /// Tokens whose KV pages `req` holds from admission on: its prompt and the reserved part
+    /// of its output (at least one step's worth of rows).
+    fn reserved_tokens(&self, req: &Request) -> usize {
+        req.prompt.len() + req.max_new_tokens.min(self.kv_reserve.max(MAX_DECODE_ROWS_PER_SEQ))
+    }
+
+    /// Make sure running sequence `i` owns the pages its next step can write (its known tokens
+    /// plus one step of rows, within its limit). False when the pool has no page left.
+    fn grow(&mut self, i: usize) -> bool {
+        let bs = self.limits().block_size;
+        let s = &self.running[i];
+        let want = (s.known() + MAX_DECODE_ROWS_PER_SEQ).min(s.req.prompt.len() + s.req.max_new_tokens).div_ceil(bs);
+        while self.running[i].blocks.len() < want {
+            match self.take_blocks(1) {
+                Some(b) => self.running[i].blocks.extend(b),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// After a step: sequences that go on generating take the pages for their next step; one
+    /// the pool cannot serve ends at the token it just emitted (`at`: running index and the
+    /// index of that token's event).
+    fn grow_or_cut(&mut self, at: &[(usize, usize)], events: &mut [TokenEvent], done: &mut Vec<usize>) {
+        if self.kv_reserve == usize::MAX {
+            return;
+        }
+        for &(i, e) in at {
+            if !events[e].finished && !self.grow(i) {
+                events[e].finished = true;
+                self.cache.cut += 1;
+                done.push(i);
+            }
+        }
+    }
+
+    /// `add` with per-request controls. Request ids must be unique among live requests.
+    pub fn add_with(&mut self, req: Request, ctl: Control) -> Result<()> {
+        // The lanes of co-execution and background prefill sample on the device only.
+        if ctl.pick.is_some() && (self.coexec || self.bg_prefill > 0) {
+            bail!("sampling and constrained decoding are not supported with AQ_COEXEC or AQ_BG_PREFILL");
+        }
+        let id = req.id;
+        self.add(req)?;
+        self.controls.insert(id, ctl);
         Ok(())
     }
 
@@ -531,6 +612,7 @@ impl Engine {
     pub fn cancel(&mut self, id: u64) -> bool {
         if let Some(i) = self.waiting.iter().position(|(r, _)| r.id == id) {
             self.waiting.remove(i);
+            self.controls.remove(&id);
             return true;
         }
         let Some(i) = self.running.iter().position(|s| s.req.id == id) else { return false };
@@ -852,7 +934,7 @@ impl Engine {
     fn try_admit(&mut self, wi: usize, allow_evict: bool) -> Result<bool> {
         let bs = self.limits().block_size;
         let req = &self.waiting[wi].0;
-        let need = (req.prompt.len() + req.max_new_tokens).div_ceil(bs);
+        let need = self.reserved_tokens(req).div_ceil(bs);
         let best = self.find_parked(&req.prompt);
         let fork = if best.is_none() { self.find_snapshot(&req.prompt) } else { None };
         {
@@ -1110,6 +1192,7 @@ impl Engine {
     /// Append sampled tokens, emit events; returns running indices that finished.
     fn apply_sampled(&mut self, sampled: &[usize], toks: &[u32], events: &mut Vec<TokenEvent>) -> Vec<usize> {
         let mut done = Vec::new();
+        let at: Vec<(usize, usize)> = sampled.iter().enumerate().map(|(k, &i)| (i, events.len() + k)).collect();
         for (&i, &tok) in sampled.iter().zip(toks) {
             let s = &mut self.running[i];
             s.out.push(tok);
@@ -1124,13 +1207,14 @@ impl Engine {
                     s.steps
                 );
             }
-            let stop = !s.req.ignore_eos && self.eos.contains(&tok);
+            let stop = (!s.req.ignore_eos && self.eos.contains(&tok)) || self.controls.get(&s.req.id).is_some_and(|c| c.stop_ids.contains(&tok));
             let finished = stop || s.out.len() >= s.req.max_new_tokens;
-            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
+            events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop, cached: s.reused });
             if finished {
                 done.push(i);
             }
         }
+        self.grow_or_cut(&at, events, &mut done);
         done
     }
 
@@ -1141,6 +1225,7 @@ impl Engine {
         done.dedup();
         for i in done {
             let mut s = self.running.swap_remove(i);
+            self.controls.remove(&s.req.id);
             if let Some(sp) = s.spare {
                 self.free_slots.push(sp);
             }
@@ -1601,12 +1686,14 @@ impl Engine {
         let mut chain: Vec<(usize, usize)> = Vec::new();
         let eos = self.eos.clone();
         let mut st = self.spec;
+        // (running index, index of its last event) of the sequences that emitted this step.
+        let mut emitted_at: Vec<(usize, usize)> = Vec::new();
         for (k, &(i, n)) in plan.iter().enumerate() {
             let d: &[u32] = if k < decode_seqs { &drafts[k] } else { &[] };
             let (r0, nr) = samples[k];
             let mut targets = toks[r0..r0 + nr].to_vec();
             // Accept drafts while they equal the target's greedy choice at the previous row.
-            let m = d.iter().zip(&targets).take_while(|(a, b)| a == b).count();
+            let mut m = d.iter().zip(&targets).take_while(|(a, b)| a == b).count();
             if self.spec_fault > 0 && m < d.len() {
                 self.spec_rejects += 1;
                 if self.spec_rejects % self.spec_fault == 0 {
@@ -1614,10 +1701,32 @@ impl Engine {
                 }
             }
             let s = &mut self.running[i];
+            let ignore_eos = s.req.ignore_eos;
+            let stop_ids: Vec<u32> = self.controls.get(&s.req.id).map(|c| c.stop_ids.clone()).unwrap_or_default();
+            let stops = |t: &u32| (!ignore_eos && eos.contains(t)) || stop_ids.contains(t);
             // Tokens this entry emits: the accepted targets up to and including the first one
             // that ends the request (the token limit cannot fall inside a draft: see `kmax`).
-            let ends = |t: &u32| !s.req.ignore_eos && eos.contains(t);
-            let emit = if nr == 0 { 0 } else { targets[..m + 1].iter().position(ends).map_or(m + 1, |p| p + 1) };
+            let mut emit = if nr == 0 { 0 } else { targets[..m + 1].iter().position(&stops).map_or(m + 1, |p| p + 1) };
+            let mut repicked = false;
+            if let (Some(pick), true) = (self.controls.get_mut(&s.req.id).and_then(|c| c.pick.as_mut()), nr > 0) {
+                // Host-side choice, row by row and only for tokens that are emitted (the picker
+                // advances with each): the token picked at a row decides whether the draft fed
+                // at the next row stands, exactly as the greedy token does above.
+                (m, emit) = (0, 0);
+                for j in 0..nr {
+                    let mut row = self.model.logits_row(r0 + j)?;
+                    let t = pick.pick(&mut row);
+                    repicked = t != targets[j];
+                    st.picked += 1;
+                    st.repicked += repicked as u64;
+                    targets[j] = t;
+                    emit = j + 1;
+                    if stops(&t) || d.get(j) != Some(&t) {
+                        break;
+                    }
+                    m = j + 1;
+                }
+            }
             if k < decode_seqs && self.spec_trace {
                 eprintln!(
                     "[spec] id {} out {} computed {} known {} n {n} slot {} spare {:?} local {} draft {d:?} targets {targets:?} m {m}",
@@ -1668,7 +1777,8 @@ impl Engine {
                 }
             }
             // The MTP head's prediction at the row whose sample is the last token emitted.
-            let mtp_pred = if nr > 0 { self.model.last_mtp.get(r0 + m).copied() } else { None };
+            // (The head continues the device's greedy token: no use after a different pick.)
+            let mtp_pred = if nr > 0 && !repicked { self.model.last_mtp.get(r0 + m).copied() } else { None };
             let mut finished = false;
             for &tok in &targets[..emit] {
                 s.out.push(tok);
@@ -1689,9 +1799,9 @@ impl Engine {
                         s.steps
                     );
                 }
-                let stop = !s.req.ignore_eos && eos.contains(&tok);
+                let stop = stops(&tok);
                 finished = stop || s.out.len() >= s.req.max_new_tokens;
-                events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
+                events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop, cached: s.reused });
                 if k < decode_seqs {
                     st.emitted += 1;
                 }
@@ -1700,6 +1810,9 @@ impl Engine {
                 }
             }
             debug_assert!(s.computed <= s.known());
+            if emit > 0 {
+                emitted_at.push((i, events.len() - 1));
+            }
             s.mtp_next = mtp_pred.map(|t| (s.known(), vec![t]));
             if finished {
                 done.push(i);
@@ -1708,6 +1821,8 @@ impl Engine {
             }
         }
         self.spec = st;
+        self.grow_or_cut(&emitted_at, &mut events, &mut done);
+        chain.retain(|c| !done.contains(&c.0));
         // Chained MTP drafts for the sequences that keep decoding: as many as the draft
         // budget and the KV pages they already own allow (chained rows write to the head's
         // cache at the positions the next pass overwrites).
