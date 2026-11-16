@@ -915,8 +915,8 @@ fn main() -> Result<()> {
     // token limit takes pages as it generates. With room in the pool the output is the same
     // as with a full reservation. In a pool that cannot hold what two such requests ask for,
     // both are admitted and run together (a full reservation would run them one after the
-    // other) until the pages run out; then one ends as if at its limit (its pages let the
-    // other go on), and nothing fails.
+    // other) until the pages run out; then one waits, the other ends as if at its limit when
+    // it runs dry too, its pages let the first go on to its real limit, and nothing fails.
     {
         let saved = (eng.session_cache, eng.spec_k, eng.kv_reserve);
         (eng.session_cache, eng.spec_k) = (false, 0);
@@ -947,7 +947,7 @@ fn main() -> Result<()> {
         let (cut, together) = run(&mut eng, 16, 2)?;
         let cuts = eng.cache.cut - before;
         // (Two together need not match the single run token for token: near-ties, see leg 6.)
-        let ok = lazy == full && serial == 1 && together == 2 && cuts >= 1 && cut.iter().all(|o| !o.is_empty()) && cut.iter().any(|o| o.len() < 96);
+        let ok = lazy == full && serial == 1 && together == 2 && cuts == 1 && cut.iter().all(|o| !o.is_empty()) && cut.iter().any(|o| o.len() < 96) && cut.iter().any(|o| o.len() == 96);
         println!(
             "kv reservation: growing {} a full reservation ({} tokens); pool of {target} pages, 2 requests of {} + 96 tokens: {serial} at a time reserved in full, {together} with 16 reserved, {cuts} ended early after {:?} tokens: {}",
             if lazy == full { "identical to" } else { "DIFFERS from" },

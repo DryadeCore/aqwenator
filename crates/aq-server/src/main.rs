@@ -42,8 +42,10 @@
 //! caps how many run at once.
 //!
 //! `--kv-reserve N` (default 4096, 0 = the whole token limit): output tokens whose KV pages
-//! a request holds from admission on. Beyond that it takes pages as it generates; if the pool
-//! runs dry it ends there with `finish_reason` "length" (`aq_requests_cut_total`). Without
+//! a request holds from admission on. Beyond that it takes pages as it generates. If the pool
+//! runs dry it waits for the pages of the next request to end (new requests queue behind
+//! it); only when every running request is out of pages does one end there, with
+//! `finish_reason` "length" (`aq_requests_cut_total`), which hands its pages on. Without
 //! this, every request with no `max_tokens` would hold a full context of pages, and a pool
 //! smaller than `max-running` full contexts would run that many fewer requests at once.
 
@@ -83,6 +85,8 @@ enum Msg {
     Refused(String),
     /// The engine failed while the request was running.
     Failed(String),
+    /// The request ended while it waited for KV pages (`--kv-reserve`): finish "length".
+    Cut,
 }
 
 struct Submit {
@@ -371,6 +375,11 @@ impl Output {
             let e = match self.rx.recv().await {
                 Some(Msg::Token(e)) => e,
                 Some(Msg::Accepted) => continue,
+                Some(Msg::Cut) => {
+                    self.done = true;
+                    self.rx.close();
+                    return Ok(Piece { text: self.stops.flush(), ids: Vec::new(), finish: Some(Finish { reason: "length", stop_reason: Value::Null }) });
+                }
                 Some(Msg::Refused(m)) => return Err(Fail::Refused(m)),
                 Some(Msg::Failed(m)) => return Err(Fail::Engine(m)),
                 // The channel closed before the request finished: the engine thread is gone.
@@ -744,9 +753,9 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, me
         if last_report.elapsed().as_secs() >= 10 {
             let c = eng.cache;
             eprintln!(
-                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} checkpoints {} evictions {} (snapshot {}) deferred {} cut {} host {:.0}us/step | spec drafted {} accepted {} (cross-session {} / {}, mtp {} / {}) tok/step {:.2}",
+                "[stats] running {} parked {} | admitted {} hits {} (forks {}) reused {} prefilled {} snapshots {} checkpoints {} evictions {} (snapshot {}) deferred {} cut {} stalled {} host {:.0}us/step | spec drafted {} accepted {} (cross-session {} / {}, mtp {} / {}) tok/step {:.2}",
                 eng.num_running(), eng.num_parked(), c.admitted, c.hits, c.forks, c.reused_tokens, c.prefilled_tokens, c.snapshots, c.checkpoints, c.evictions,
-                c.snapshot_evictions, c.deferred, c.cut, c.host_us as f64 / c.steps.max(1) as f64,
+                c.snapshot_evictions, c.deferred, c.cut, c.stalled, c.host_us as f64 / c.steps.max(1) as f64,
                 eng.spec.drafted, eng.spec.accepted, eng.spec.global_accepted, eng.spec.global_drafted, eng.spec.mtp_accepted, eng.spec.mtp_drafted, eng.spec.emitted as f64 / eng.spec.decode_entries.max(1) as f64
             );
             last_report = Instant::now();
@@ -781,6 +790,12 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, me
                 for id in closed {
                     eng.cancel(id);
                     sinks.remove(&id);
+                }
+                // Ended while waiting for KV pages: no token event carries that.
+                for id in eng.take_cut() {
+                    if let Some(tx) = sinks.remove(&id) {
+                        let _ = tx.send(Msg::Cut);
+                    }
                 }
                 metrics.running.store(eng.num_running(), Ordering::Relaxed);
                 metrics.cut.store(eng.cache.cut, Ordering::Relaxed);

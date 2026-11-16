@@ -92,6 +92,8 @@ struct Seq {
     t_admit: Instant,
     steps: u32,
     reused: usize,
+    /// Out of KV pages (`kv_reserve`): decoding waits until another sequence frees some.
+    stalled: bool,
     /// Pause prefill here and take the prompt checkpoint (page aligned, a few tokens before
     /// the prompt's end); `None` once taken, or when there is nothing to checkpoint.
     ckpt_at: Option<usize>,
@@ -226,8 +228,10 @@ pub struct CacheStats {
     /// Scheduler host time (admission + batch building) and steps, cumulative.
     pub host_us: u64,
     pub steps: u64,
-    /// Requests ended early because the KV pool had no page left for them (`kv_reserve`).
+    /// Requests ended early because the KV pool had no page left for them (`kv_reserve`),
+    /// and times a request waited for pages instead.
     pub cut: u64,
+    pub stalled: u64,
 }
 
 /// Speculative decoding counters.
@@ -362,11 +366,14 @@ pub struct Engine {
     pace: Pace,
     /// Set during an admission that may only evict sessions presumed finished.
     dead_only: bool,
+    cut_ids: Vec<u64>,
     /// Output tokens whose KV pages a request reserves at admission (default: its whole token
     /// limit, so it can never run out). With a smaller value a request reserves
     /// `min(limit, kv_reserve)` and takes further pages as it generates, evicting parked
-    /// sessions if needed; when the pool has none left it ends there, as if it had reached
-    /// its limit (`CacheStats::cut`). That keeps requests with a large or absent limit from
+    /// sessions if needed. When the pool has none left it waits for the pages another running
+    /// sequence frees when it ends (`CacheStats::stalled`; nothing new is admitted meanwhile);
+    /// if no other sequence can run either, it ends there, as if it had reached its limit
+    /// (`CacheStats::cut`). That keeps requests with a large or absent limit from
     /// each holding a full context of pages they will mostly not use.
     pub kv_reserve: usize,
 }
@@ -394,6 +401,7 @@ impl Engine {
             snapshots: Vec::new(),
             refcnt: vec![0; lim.num_blocks()],
             max_snapshots: 4,
+            cut_ids: Vec::new(),
             clock: 0,
             eos,
             controls: HashMap::new(),
@@ -577,20 +585,50 @@ impl Engine {
         true
     }
 
-    /// After a step: sequences that go on generating take the pages for their next step; one
-    /// the pool cannot serve ends at the token it just emitted (`at`: running index and the
-    /// index of that token's event).
+    /// After a step: sequences that go on generating take the pages for their next step (`at`:
+    /// running index and the index of the event of the token it just emitted). One the pool
+    /// cannot serve waits, as long as another sequence still runs and will free pages when it
+    /// ends; when none does, it ends at the token it just emitted, as if at its limit, and
+    /// its pages let the waiting ones go on.
     fn grow_or_cut(&mut self, at: &[(usize, usize)], events: &mut [TokenEvent], done: &mut Vec<usize>) {
         if self.kv_reserve == usize::MAX {
             return;
         }
         for &(i, e) in at {
-            if !events[e].finished && !self.grow(i) {
+            if events[e].finished || self.grow(i) {
+                continue;
+            }
+            if self.running.iter().enumerate().any(|(k, s)| k != i && !s.stalled && !done.contains(&k)) {
+                self.running[i].stalled = true;
+                self.cache.stalled += 1;
+            } else {
                 events[e].finished = true;
                 self.cache.cut += 1;
                 done.push(i);
             }
         }
+    }
+
+    /// Start of a step: sequences waiting for KV pages take them if some came back. If every
+    /// running sequence waits (the one that ran was cancelled and its pages are still shared),
+    /// the first ends there; `take_cut` reports it, since it has no token to carry the news.
+    fn unstall(&mut self) {
+        for i in 0..self.running.len() {
+            if self.running[i].stalled && self.grow(i) {
+                self.running[i].stalled = false;
+            }
+        }
+        if !self.running.is_empty() && self.running.iter().all(|s| s.stalled) {
+            self.cut_ids.push(self.running[0].req.id);
+            self.cache.cut += 1;
+            self.retire(vec![0]);
+        }
+    }
+
+    /// Requests ended since the last call without a final token event: they waited for KV
+    /// pages that never came. To the client they finished at their token limit.
+    pub fn take_cut(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.cut_ids)
     }
 
     /// `add` with per-request controls. Request ids must be unique among live requests.
@@ -881,6 +919,10 @@ impl Engine {
 
     /// Admit waiting requests while there is room, per the policy.
     fn admit(&mut self) -> Result<()> {
+        // A running sequence waits for KV pages: the pages that come back are its own first.
+        if self.running.iter().any(|s| s.stalled) {
+            return Ok(());
+        }
         let cap = self.max_running.min(self.limits().max_seqs);
         let pol = self.policy;
         if !pol.load_control && !pol.srpt {
@@ -1108,7 +1150,7 @@ impl Engine {
             self.cache.reused_tokens += computed as u64;
         }
         self.cache.prefilled_tokens += (req.prompt.len() - computed) as u64;
-        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed, k_cur: 0, mtp_next: None });
+        self.running.push(Seq { req, out: Vec::new(), slot, blocks, computed, snapshot_at, spare: None, in_prefill: false, cancelled: false, draft: None, turns: resident_turns, sid, ckpt_at, t_add, t_admit: Instant::now(), steps: 0, reused: computed, k_cur: 0, mtp_next: None, stalled: false });
         Ok(true)
     }
 
@@ -1265,6 +1307,7 @@ impl Engine {
         let lim = self.limits();
         self.model.set_lane(0);
         self.clock += 1;
+        self.unstall();
         self.admit()?;
         let mut events = Vec::new();
 
@@ -1310,7 +1353,7 @@ impl Engine {
             .running
             .iter()
             .enumerate()
-            .filter(|(_, s)| !s.in_prefill && s.computed >= s.req.prompt.len() && s.known() > s.computed)
+            .filter(|(_, s)| !s.in_prefill && !s.stalled && s.computed >= s.req.prompt.len() && s.known() > s.computed)
             // Normally one pending token; more after a rejected speculative step (spec_k
             // switched off since), which the decode path also handles.
             .map(|(i, s)| (i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ)))
@@ -1417,6 +1460,7 @@ impl Engine {
 
         // Admit waiting requests while there is room to run them.
         self.clock += 1;
+        self.unstall();
         self.admit()?;
 
         // Background prefill: collect a finished batch, start the next long prompt.
@@ -1443,7 +1487,7 @@ impl Engine {
         let mut draft_mtp: Vec<bool> = Vec::new(); // first token backed by the MTP head
         for i in 0..self.running.len() {
             let s = &self.running[i];
-            if s.computed < s.req.prompt.len() || budget == 0 {
+            if s.computed < s.req.prompt.len() || budget == 0 || s.stalled {
                 continue;
             }
             let pending = s.known() - s.computed;
@@ -1822,7 +1866,7 @@ impl Engine {
         }
         self.spec = st;
         self.grow_or_cut(&emitted_at, &mut events, &mut done);
-        chain.retain(|c| !done.contains(&c.0));
+        chain.retain(|c| !done.contains(&c.0) && !self.running[c.0].stalled);
         // Chained MTP drafts for the sequences that keep decoding: as many as the draft
         // budget and the KV pages they already own allow (chained rows write to the head's
         // cache at the positions the next pass overwrites).
