@@ -6,7 +6,7 @@
 
 use crate::config::{LayerKind, TextConfig};
 use crate::cublaslt::CUDA_R_16BF;
-use crate::gpu::{Gpu, Prof, cfg, cfg_smem, de};
+use crate::gpu::{Gpu, Prof, Weight, cfg, cfg_smem, de};
 use cuda_core::LaunchConfig;
 use crate::weights::Checkpoint;
 use anyhow::Result;
@@ -21,20 +21,20 @@ pub struct Layer {
     in_norm: u64,
     post_norm: u64,
     // gated delta net
-    gdn_proj: u64,
+    gdn_proj: Weight,
     conv_w: u64,
     a_log: u64,
     dt_bias: u64,
     gnorm: u64,
-    out_proj: u64,
+    out_proj: Weight,
     // full attention
-    qkv: u64,
+    qkv: Weight,
     q_norm: u64,
     k_norm: u64,
-    o_proj: u64,
+    o_proj: Weight,
     // mlp
-    gate_up: u64,
-    down: u64,
+    gate_up: Weight,
+    down: Weight,
     // per-slot state pools
     delta_state: u64,
     conv_state: u64,
@@ -246,7 +246,9 @@ pub struct Model {
     pub gpu: Gpu,
     embed: u64,
     final_norm: u64,
-    lm_head: u64,
+    lm_head: Weight,
+    /// The output head's bf16 rows (the MTP shortlist gathers from it).
+    head_table: u64,
     pub layers: Vec<Layer>,
     /// MTP draft head (when the checkpoint has one, unless AQ_MTP=0).
     mtp: Option<Mtp>,
@@ -429,6 +431,22 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
     Ok(p)
 }
 
+/// A GEMM weight `[n, k]`: the named matrices concatenated along rows, then `pad_bytes` of
+/// zero rows. With `fp8` it is quantized as soon as its upload has landed and the bf16 copy
+/// freed, so the load never holds much more than the final footprint.
+fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fp8: bool) -> Result<Weight> {
+    let p = concat_bf16_padded(gpu, ck, names, pad_bytes)?;
+    if !fp8 {
+        return Ok(Weight::bf16(p));
+    }
+    let mut bytes = pad_bytes;
+    for n in names {
+        bytes += ck.bf16(n)?.bytes.len();
+    }
+    gpu.drain_uploads()?;
+    gpu.quantize_weight(p, bytes / 2 / k, k, false)
+}
+
 impl Model {
     pub fn load(dir: &Path, limits: Limits) -> Result<Self> {
         // The tensor-core attention kernels fetch K/V in 16-key tiles that must not straddle pages.
@@ -443,11 +461,19 @@ impl Model {
 
         let embed = concat_bf16(&mut gpu, &ck, &one("embed_tokens.weight"))?;
         let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
-        let lm_head = if cfg.tied() || !ck.has("lm_head.weight") {
+        let head_table = if cfg.tied() || !ck.has("lm_head.weight") {
             embed
         } else {
             concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?
         };
+        // AQ_FP8 (experimental, not exact: outputs differ from the bf16 reference): 1 runs
+        // the layers' GEMMs on FP8 (E4M3) weights and activations, 2 the output head too.
+        let fp8: u32 = std::env::var("AQ_FP8").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // AQ_FP8_SET: which layer GEMMs (default all): g = GDN input projection, o = GDN output
+        // projection, q = attention q/k/v, a = attention output, u = MLP gate/up, d = MLP down.
+        let set = std::env::var("AQ_FP8_SET").unwrap_or_else(|_| "goqaud".into());
+        let q = |c: char| fp8 > 0 && set.contains(c);
+        let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
 
         let hv = cfg.linear_num_value_heads;
         let mut lim = limits;
@@ -470,18 +496,18 @@ impl Model {
                 kind,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
                 post_norm: concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])?,
-                gdn_proj: 0,
+                gdn_proj: Weight::default(),
                 conv_w: 0,
                 a_log: 0,
                 dt_bias: 0,
                 gnorm: 0,
-                out_proj: 0,
-                qkv: 0,
+                out_proj: Weight::default(),
+                qkv: Weight::default(),
                 q_norm: 0,
                 k_norm: 0,
-                o_proj: 0,
-                gate_up: concat_bf16(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
-                down: concat_bf16(&mut gpu, &ck, &[n("mlp.down_proj.weight")])?,
+                o_proj: Weight::default(),
+                gate_up: gemm_weight(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], 0, h, q('u'))?,
+                down: gemm_weight(&mut gpu, &ck, &[n("mlp.down_proj.weight")], 0, inter, q('d'))?,
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: 0,
@@ -491,17 +517,19 @@ impl Model {
                 LayerKind::Linear => {
                     let la = |s: &str| n(&format!("linear_attn.{s}"));
                     let pad = (cfg.gdn_proj_ld() - cfg.gdn_proj_dim()) * cfg.hidden_size * 2;
-                    layer.gdn_proj = concat_bf16_padded(
+                    layer.gdn_proj = gemm_weight(
                         &mut gpu,
                         &ck,
                         &[la("in_proj_qkv.weight"), la("in_proj_z.weight"), la("in_proj_b.weight"), la("in_proj_a.weight")],
                         pad,
+                        h,
+                        q('g'),
                     )?;
                     layer.conv_w = concat_bf16(&mut gpu, &ck, &[la("conv1d.weight")])?;
                     layer.a_log = gpu.alloc_upload(&ck.f32_vec(&la("A_log"))?)?;
                     layer.dt_bias = gpu.alloc_upload(&ck.f32_vec(&la("dt_bias"))?)?;
                     layer.gnorm = gpu.alloc_upload(&ck.f32_vec(&la("norm.weight"))?)?;
-                    layer.out_proj = concat_bf16(&mut gpu, &ck, &[la("out_proj.weight")])?;
+                    layer.out_proj = gemm_weight(&mut gpu, &ck, &[la("out_proj.weight")], 0, cfg.value_dim(), q('o'))?;
                     let t = Instant::now();
                     layer.delta_state = gpu.alloc((lim.max_seqs + 1) * hv * 128 * 128 * 4)?;
                     layer.conv_state = gpu.alloc((lim.max_seqs + 1) * cfg.conv_dim() * 3 * 2)?;
@@ -510,14 +538,10 @@ impl Model {
                 }
                 LayerKind::Full => {
                     let sa = |s: &str| n(&format!("self_attn.{s}"));
-                    layer.qkv = concat_bf16(
-                        &mut gpu,
-                        &ck,
-                        &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")],
-                    )?;
+                    layer.qkv = gemm_weight(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")], 0, h, q('q'))?;
                     layer.q_norm = gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?;
                     layer.k_norm = gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?;
-                    layer.o_proj = concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?;
+                    layer.o_proj = gemm_weight(&mut gpu, &ck, &[sa("o_proj.weight")], 0, cfg.num_attention_heads * cfg.head_dim, q('a'))?;
                     let t = Instant::now();
                     layer.k_cache = gpu.alloc(kv_bytes)?;
                     layer.v_cache = gpu.alloc(kv_bytes)?;
@@ -534,18 +558,18 @@ impl Model {
                 kind: LayerKind::Full,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
                 post_norm: concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])?,
-                gdn_proj: 0,
+                gdn_proj: Weight::default(),
                 conv_w: 0,
                 a_log: 0,
                 dt_bias: 0,
                 gnorm: 0,
-                out_proj: 0,
-                qkv: concat_bf16(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")])?,
+                out_proj: Weight::default(),
+                qkv: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")])?),
                 q_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?,
                 k_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?,
-                o_proj: concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?,
-                gate_up: concat_bf16(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
-                down: concat_bf16(&mut gpu, &ck, &[n("mlp.down_proj.weight")])?,
+                o_proj: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?),
+                gate_up: Weight::bf16(concat_bf16(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?),
+                down: Weight::bf16(concat_bf16(&mut gpu, &ck, &[n("mlp.down_proj.weight")])?),
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: gpu.alloc(kv_bytes)?,
@@ -584,28 +608,15 @@ impl Model {
         }
         gpu.sync()?;
         gpu.flush_uploads()?;
-        // AQ_FP8=1 (experimental): the layers' GEMMs run on FP8 (E4M3) weights and
-        // activations. Not exact: outputs differ from the bf16 reference.
-        let fp8: u32 = std::env::var("AQ_FP8").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut lm_head = Weight::bf16(head_table);
         if fp8 > 0 {
-            let t = Instant::now();
-            let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
             let rows = lim.max_tokens.max(lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ) + 512;
-            let k_max = inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim);
-            for l in &layers {
-                let ws = match l.kind {
-                    LayerKind::Linear => [(l.gdn_proj, cfg.gdn_proj_ld(), h), (l.out_proj, h, cfg.value_dim())],
-                    LayerKind::Full => [(l.qkv, cfg.attn_proj_dim(), h), (l.o_proj, h, cfg.num_attention_heads * cfg.head_dim)],
-                };
-                for (w, n, k) in ws.into_iter().chain([(l.gate_up, 2 * inter, h), (l.down, h, inter)]) {
-                    gpu.quantize_weight(w, n, k, rows, k_max)?;
-                }
-            }
-            // AQ_FP8=2: the output head too (the embedding lookup keeps reading bf16).
+            gpu.enable_fp8(rows, inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
+            // The bf16 head stays: the embedding lookup (tied weights) and the MTP shortlist read it.
             if fp8 >= 2 && cfg.vocab_size % 8 == 0 {
-                gpu.quantize_weight(lm_head, cfg.vocab_size, h, rows, k_max)?;
+                lm_head = gpu.quantize_weight(head_table, cfg.vocab_size, h, true)?;
             }
-            eprintln!("FP8 weights (level {fp8}): quantized in {:.2}s", t.elapsed().as_secs_f64());
+            eprintln!("FP8 weights (AQ_FP8={fp8}, set {set}): not exact");
         }
         let weight_bytes = gpu.allocated_bytes;
         let layers_s = t1.elapsed().as_secs_f64();
@@ -660,6 +671,7 @@ impl Model {
             embed,
             final_norm,
             lm_head,
+            head_table,
             layers,
             mtp,
             mtp_on: false,
@@ -1299,7 +1311,7 @@ impl Model {
                 g.k.gather_rows(
                     &st,
                     cfg((m.short_dirty.len() as u32, 1, 1), 256),
-                    self.lm_head as *const u16,
+                    self.head_table as *const u16,
                     m.g_short_ids as *const u32,
                     m.g_short_slots as *const u32,
                     m.short_w as *mut u16,
@@ -1429,7 +1441,7 @@ impl Model {
                     )
                 }
                 .map_err(de)?;
-                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, m.fc, s.x, CUDA_R_16BF)?;
+                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, Weight::bf16(m.fc), s.x, CUDA_R_16BF)?;
             } else if li == nl {
                 // The backbone is done: sample, then start the MTP head's residual stream.
                 let m = mtp.unwrap();
@@ -1455,7 +1467,7 @@ impl Model {
                     )
                 }
                 .map_err(de)?;
-                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, m.fc, s.x, CUDA_R_16BF)?;
+                g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, Weight::bf16(m.fc), s.x, CUDA_R_16BF)?;
                 mark!("mtp_in");
             }
             unsafe {
@@ -1942,7 +1954,7 @@ impl Model {
         }
         match mtp {
             Some(m) if m.short_n > 0 => {
-                head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok, m.short_w, m.short_n);
+                head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok, Weight::bf16(m.short_w), m.short_n);
                 unsafe { g.k.remap_ids(&st, cfg(((ns as u32).div_ceil(256), 1, 1), 256), s.mtp_tok as *mut u32, m.g_short_ids as *const u32, ns as u32) }.map_err(de)?;
             }
             Some(m) => head!(m.norm, s.mtp_hfinal, s.mtp_logits, s.mtp_tok, self.lm_head, c.vocab_size),

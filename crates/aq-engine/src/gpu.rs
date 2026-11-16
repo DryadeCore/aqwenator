@@ -12,6 +12,21 @@ pub fn de<E: Debug>(e: E) -> anyhow::Error {
     anyhow!("{e:?}")
 }
 
+/// A GEMM weight matrix `[n, k]`: bf16 at `p`, or FP8 (E4M3) at `p` with one power-of-two
+/// f32 scale per row at `scale`.
+#[derive(Clone, Copy, Default)]
+pub struct Weight {
+    pub p: u64,
+    /// 0 for bf16.
+    pub scale: u64,
+}
+
+impl Weight {
+    pub fn bf16(p: u64) -> Self {
+        Self { p, scale: 0 }
+    }
+}
+
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     /// The active lane's stream; everything enqueued by this struct goes here.
@@ -23,14 +38,13 @@ pub struct Gpu {
     pub lane: usize,
     pub k: LoadedModule,
     pub lt: CublasLt,
-    allocs: Vec<u64>,
+    /// (pointer, bytes) of every live allocation.
+    allocs: Vec<(u64, usize)>,
     pub allocated_bytes: usize,
     /// The weight loader, between the first `queue_upload` and `flush_uploads`.
     loader: Option<Loader>,
     /// True between `begin_capture` and `end_capture`.
     pub capturing: std::cell::Cell<bool>,
-    /// FP8 weights: bf16 weight pointer handed to `gemm` -> (E4M3 weights, per-row scales).
-    w8: std::collections::HashMap<u64, (u64, u64)>,
     /// Per lane: E4M3 activations and their per-row scales for the GEMM being issued.
     x8: Vec<(u64, u64)>,
     /// Rows and columns the `x8` buffers hold.
@@ -165,11 +179,10 @@ impl Gpu {
             lane: 0,
             k,
             lt,
-            allocs: vec![ws],
+            allocs: vec![(ws, WORKSPACE_BYTES)],
             loader: None,
             allocated_bytes: WORKSPACE_BYTES,
             capturing: Default::default(),
-            w8: Default::default(),
             x8: Vec::new(),
             x8_dims: (0, 0),
             // AQ_GEMM_MIN_M: debugging aid, pins small GEMMs to one plan size.
@@ -186,7 +199,7 @@ impl Gpu {
     pub fn add_lane(&mut self, priority: i32) -> Result<usize> {
         let stream = self.ctx.new_stream_with_priority(priority).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
-        self.allocs.push(ws);
+        self.allocs.push((ws, WORKSPACE_BYTES));
         self.allocated_bytes += WORKSPACE_BYTES;
         self.streams.push(stream);
         self.workspaces.push(ws);
@@ -196,28 +209,6 @@ impl Gpu {
             self.x8.push(x8);
         }
         Ok(self.streams.len() - 1)
-    }
-
-    /// Give the bf16 weight matrix `w` (`[n, k]`, fully uploaded) an FP8 (E4M3) copy with one
-    /// power-of-two scale per row; `gemm` calls that name `w` then run in FP8, with the
-    /// activations quantized per row on the fly. `rows` and `k_max` bound the activations of
-    /// any such GEMM (the first call sizes the buffers).
-    ///
-    /// Experimental (AQ_FP8=1): the bf16 copy stays allocated, as the weight's name.
-    pub fn quantize_weight(&mut self, w: u64, n: usize, k: usize, rows: usize, k_max: usize) -> Result<()> {
-        if self.x8.is_empty() {
-            self.x8_dims = (rows, k_max);
-            for _ in 0..self.streams.len() {
-                let x8 = (self.alloc(rows * k_max)?, self.alloc(rows * 4)?);
-                self.x8.push(x8);
-            }
-        }
-        let q = self.alloc_uninit(n * k)?;
-        let sc = self.alloc_uninit(n * 4)?;
-        unsafe { self.k.quant_e4m3(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, sc as *mut f32, k as u32) }.map_err(de)?;
-        self.sync()?;
-        self.w8.insert(w, (q, sc));
-        Ok(())
     }
 
     /// Highest scheduling priority this device supports (numerically smallest).
@@ -248,7 +239,7 @@ impl Gpu {
         let bytes = bytes.max(1).next_multiple_of(256);
         let p = unsafe { memory::malloc_sync(bytes) }.map_err(de)?;
         unsafe { memory::memset_d8_async(p, 0, bytes, self.stream.cu_stream()) }.map_err(de)?;
-        self.allocs.push(p);
+        self.allocs.push((p, bytes));
         self.allocated_bytes += bytes;
         Ok(p)
     }
@@ -258,9 +249,40 @@ impl Gpu {
     pub fn alloc_uninit(&mut self, bytes: usize) -> Result<u64> {
         let bytes = bytes.max(1).next_multiple_of(256);
         let p = unsafe { memory::malloc_sync(bytes) }.map_err(de)?;
-        self.allocs.push(p);
+        self.allocs.push((p, bytes));
         self.allocated_bytes += bytes;
         Ok(p)
+    }
+
+    /// Free an allocation made by `alloc` or `alloc_uninit`. Nothing queued may still use it.
+    pub fn free(&mut self, p: u64) -> Result<()> {
+        let i = self.allocs.iter().position(|a| a.0 == p).ok_or_else(|| anyhow!("free of an unknown allocation"))?;
+        self.sync()?;
+        let (_, bytes) = self.allocs.swap_remove(i);
+        self.allocated_bytes -= bytes;
+        unsafe { memory::free_sync(p) }.map_err(de)
+    }
+
+    /// Size the per-lane buffers for FP8 GEMMs: activations of up to `rows` rows of `k_max`.
+    pub fn enable_fp8(&mut self, rows: usize, k_max: usize) -> Result<()> {
+        self.x8_dims = (rows, k_max);
+        for _ in self.x8.len()..self.streams.len() {
+            let x8 = (self.alloc(rows * k_max)?, self.alloc(rows * 4)?);
+            self.x8.push(x8);
+        }
+        Ok(())
+    }
+
+    /// Replace the bf16 weight matrix at `w` (`[n, k]`, fully uploaded) by its FP8 (E4M3)
+    /// form with one power-of-two scale per row, and free the bf16 copy unless `keep`.
+    pub fn quantize_weight(&mut self, w: u64, n: usize, k: usize, keep: bool) -> Result<Weight> {
+        let q = self.alloc_uninit(n * k)?;
+        let scale = self.alloc_uninit(n * 4)?;
+        unsafe { self.k.quant_e4m3(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut f32, k as u32) }.map_err(de)?;
+        if !keep {
+            self.free(w)?;
+        }
+        Ok(Weight { p: q, scale })
     }
 
     /// Start a host-to-device copy of checkpoint bytes on the weight loader; `flush_uploads`
@@ -291,6 +313,16 @@ impl Gpu {
             l.pending += 1;
         }
         while let Ok(filled) = l.done.try_recv() {
+            l.copy_out(filled)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for every checkpoint copy queued so far; the weight loader stays up.
+    pub fn drain_uploads(&mut self) -> Result<()> {
+        let Some(l) = self.loader.as_mut() else { return Ok(()) };
+        while l.pending > 0 {
+            let filled = l.done.recv().map_err(de)?;
             l.copy_out(filled)?;
         }
         Ok(())
@@ -339,12 +371,13 @@ impl Gpu {
         self.stream.synchronize().map_err(de)
     }
 
-    /// `y[m, n] = x[m, k] . w[n, k]^T` (bf16 in, `out_ty` out).
+    /// `y[m, n] = x[m, k] . w[n, k]^T` (bf16 `x`, `out_ty` out). With FP8 weights, `x` is
+    /// quantized per row first and `y` (bf16 only) rescaled after: not exact.
     ///
     /// M is rounded up to a bucket (capped at `cap`, the row capacity of `x` and `y`) so a
     /// handful of tuned plans cover every batch size; the extra rows compute on scratch.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm(&mut self, m: usize, cap: usize, n: usize, k: usize, x: u64, w: u64, y: u64, out_ty: i32) -> Result<()> {
+    pub fn gemm(&mut self, m: usize, cap: usize, n: usize, k: usize, x: u64, w: Weight, y: u64, out_ty: i32) -> Result<()> {
         let mb = if m <= 256 {
             m.next_multiple_of(16)
         } else if m <= 2048 {
@@ -356,9 +389,10 @@ impl Gpu {
         .min(cap)
         .max(m);
         let s = self.raw_stream();
-        let Some(&(w8, w_scale)) = self.w8.get(&w) else {
-            return self.lt.gemm(s, mb, n, k, x, w, y, out_ty);
-        };
+        if w.scale == 0 {
+            return self.lt.gemm(s, mb, n, k, x, w.p, y, out_ty);
+        }
+        let (w8, w_scale) = (w.p, w.scale);
         let (x8, x_scale) = self.x8[self.lane];
         unsafe { self.k.quant_e4m3(&self.stream, cfg((mb as u32, 1, 1), 256), x as *const u16, x8 as *mut u8, x_scale as *mut f32, k as u32) }.map_err(de)?;
         anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "FP8 GEMMs write bf16");
@@ -492,7 +526,7 @@ pub fn cfg_smem(grid: (u32, u32, u32), block: u32, smem: u32) -> LaunchConfig {
 impl Drop for Gpu {
     fn drop(&mut self) {
         let _ = self.sync();
-        for p in self.allocs.drain(..) {
+        for (p, _) in self.allocs.drain(..) {
             let _ = unsafe { memory::free_sync(p) };
         }
     }
