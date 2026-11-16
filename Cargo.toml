@@ -5,7 +5,7 @@ members = ["crates/aq-kernels", "crates/aq-engine", "crates/aq-server"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # NVIDIA cuda-rust: cuda-oxide (Rust -> PTX kernels) + shared host runtime. Pinned to a full commit id.

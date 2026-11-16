@@ -82,3 +82,7 @@ bandwidth, GEMM rate, and what they allow per step).
 
 Pushing a tag `vX.Y.Z` builds amd64 and arm64 images, publishes
 `ghcr.io/<owner>/aqwenator:X.Y.Z` and `:latest`, and attaches the binaries to a GitHub release.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).
