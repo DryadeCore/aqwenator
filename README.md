@@ -54,10 +54,27 @@ curl localhost:8000/v1/completions -H 'content-type: application/json' \
   -d '{"prompt": "The capital of France is", "max_tokens": 16}'
 ```
 
-Endpoints: `/v1/completions` (text or token-id prompts, `stream`), `/v1/models`, `/health`.
-`aq-serve <model> --help`-style options are listed in `crates/aq-server/src/main.rs`; the ones
-that matter are `--max-seqs`, `--max-ctx`, `--max-tokens` (prefill tokens per step) and
-`--kv-gb` (attention cache pool).
+```sh
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Name the capital of France."}]}'
+```
+
+Endpoints: `/v1/completions` (text or token-id prompts), `/v1/chat/completions` (the model's
+chat template; reasoning in `reasoning_content`; `tools` with `tool_choice` auto, none,
+required or a named function), `/v1/models`, `/health` (503 once the engine has stopped; the
+process then exits non-zero), `/metrics` (Prometheus; `--vllm-metrics true` adds vLLM's names
+for the request gauges and token counters).
+
+Both endpoints take `max_tokens` (default: the rest of the context), `temperature` (default 0,
+greedy), `top_p`, `top_k`, `seed`, `stop`, `stop_token_ids`, `stream`,
+`stream_options.include_usage` and `response_format` (`json_object`, `json_schema`). A field
+the server does not know or cannot honour is a 400 that names it. `scripts/serve_check.py`
+checks all of this against a running server.
+
+The server listens on 127.0.0.1 unless `--host` (or `AQ_HOST`) says otherwise; the image sets
+`AQ_HOST=0.0.0.0`. Options are listed in `crates/aq-server/src/main.rs`; the ones that matter
+are `--max-seqs`, `--max-ctx`, `--max-tokens` (prefill tokens per step), `--kv-gb` (attention
+cache pool) and `--kv-reserve` (output tokens a request reserves in that pool up front).
 
 ## Build
 
