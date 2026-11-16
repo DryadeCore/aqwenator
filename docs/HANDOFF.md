@@ -294,6 +294,7 @@ KL(ref||ours)). Mean KL in nats over the three, and top-1 agreement out of 768:
 | bf16 GEMMs, weights int8 per output row (`w:i`) | 0.009 | 749 |
 | bf16 GEMMs, activations int8 per row (`a:i`) | 0.141 | 710 |
 | bf16 GEMMs, weights int8 with a scale per 32 (`w:b`) | 0.003 | 763 |
+| bf16 GEMMs, weights int8 with row x column power-of-two scales (one pass; code not kept) | 0.059 | 739 |
 
 So: E4M3's ~4 significant bits are the limit (weights and activations cost the same, no GEMM
 is the culprit); linear int8 activations are unusable; block-scaled int8 weights with bf16
@@ -303,7 +304,8 @@ top-1 tokens, some at reference margins of 2-5 logits (often message / tool-call
 **Open design question** (the user's call): how to multiply 8-bit weights by 16-bit
 activations. Candidates: (a) int8 GEMM with each activation row split into two int8 digit
 rows: decode ~50-58 ms of GEMM vs 78, but the i32 output pass makes it a loss for prefill, and
-a per-32 scale along K cannot be factored out (needs row x column scaling, quality unmeasured);
+a per-32 scale along K cannot be factored out, which leaves per-row scales (0.009) since
+one-pass row x column scaling measured worse (0.059);
 (b) dequantize each weight to a bf16 scratch buffer and use the bf16 GEMM: clean quality and
 half the memory, but ~2.3x the decode weight traffic; (c) our own tensor-core GEMM reading
 int8 weights. `AQ_QSIM` and the `qsim` kernel are diagnostics to delete once this is settled.
