@@ -21,6 +21,8 @@ pub struct Grammars {
     /// Tokens a reasoning block may not contain: `<tool_call>` (and end-of-sequence).
     no_think: Vec<u32>,
     think_end: Option<u32>,
+    /// The bytes of every token, by id (empty if the tokenizer is not byte-level BPE).
+    pub words: Arc<Vec<Vec<u8>>>,
 }
 
 /// The bytes of every token of a byte-level BPE tokenizer.json, by id; special tokens carry
@@ -58,9 +60,11 @@ fn token_bytes(dir: &Path) -> Result<(Vec<Vec<u8>>, Vec<(String, u32)>), String>
 
 impl Grammars {
     pub fn new(dir: &Path, eos: &[u32]) -> Self {
-        let mut me = Self { factory: Err("no end-of-sequence token".into()), eos: eos.to_vec(), no_think: eos.to_vec(), think_end: None };
+        let mut me = Self { factory: Err("no end-of-sequence token".into()), eos: eos.to_vec(), no_think: eos.to_vec(), think_end: None, words: Arc::default() };
         me.factory = token_bytes(dir).and_then(|(words, names)| {
             let id = |n: &str| names.iter().find(|x| x.0 == n).map(|x| x.1);
+            // For `logprobs`: the text of a special token without the grammar engine's marker.
+            me.words = Arc::new(words.iter().map(|w| w.strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER]).unwrap_or(w).to_vec()).collect());
             me.think_end = id("</think>");
             me.no_think.extend(id("<tool_call>"));
             // The grammar ends the output with the last end-of-sequence id (the chat one).

@@ -332,17 +332,24 @@ pub async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         Err(r) => return r,
     };
     let one_call = body.parallel_tool_calls == Some(false);
+    let with_probs = body.logprobs_asked();
     let mut parser = Parser { acc: String::new(), thinking, mode, tools, one_call, sent: (0, 0, 0) };
     let (created, rid, model) = (now(), format!("chatcmpl-{}", out.id), app.model.clone());
 
     if body.stream.unwrap_or(false) {
         let usage = body.include_usage();
         let mut first = true;
+        // Log-probabilities of the tokens since the last chunk (a token may yield no delta).
+        let mut lp: Vec<Value> = Vec::new();
         return sse(out, move |out, piece: Result<Piece, Fail>| {
             let base = json!({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model});
-            let chunk = |delta: Value, finish: Value, stop: Value| {
+            if let Ok(p) = &piece {
+                lp.extend(out.chat_logprobs(p));
+            }
+            let mut chunk = |delta: Value, finish: Value, stop: Value| {
                 let mut c = base.clone();
-                c["choices"] = json!([{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish, "stop_reason": stop}]);
+                let probs = if with_probs && !delta.as_object().is_some_and(|d| d.contains_key("role")) { json!({"content": std::mem::take(&mut lp)}) } else { Value::Null };
+                c["choices"] = json!([{"index": 0, "delta": delta, "logprobs": probs, "finish_reason": finish, "stop_reason": stop}]);
                 c.to_string()
             };
             let mut v = Vec::new();
@@ -352,7 +359,9 @@ pub async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
             match piece {
                 Err(f) => v.push(f.event()),
                 Ok(p) => {
-                    v.extend(parser.deltas(&p.text, p.finish.is_some(), out.id).into_iter().map(|d| chunk(d, Value::Null, Value::Null)));
+                    for d in parser.deltas(&p.text, p.finish.is_some(), out.id) {
+                        v.push(chunk(d, Value::Null, Value::Null));
+                    }
                     if let Some(f) = p.finish {
                         v.push(chunk(json!({}), json!(parser.finish_reason(f.reason, parser.sent.2)), f.stop_reason));
                         if usage {
@@ -368,10 +377,12 @@ pub async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         });
     }
 
+    let mut lp: Vec<Value> = Vec::new();
     loop {
         match out.next().await {
             Err(f) => return f.response(),
             Ok(p) => {
+                lp.extend(out.chat_logprobs(&p));
                 parser.acc.push_str(&p.text);
                 let Some(f) = p.finish else { continue };
                 let v = parser.view(true);
@@ -381,7 +392,7 @@ pub async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
                     message["tool_calls"] = json!(calls);
                 }
                 return Json(json!({"id": rid, "object": "chat.completion", "created": created, "model": model,
-                    "choices": [{"index": 0, "message": message, "logprobs": null, "finish_reason": parser.finish_reason(f.reason, v.calls.len()), "stop_reason": f.stop_reason}],
+                    "choices": [{"index": 0, "message": message, "logprobs": if with_probs { json!({"content": lp}) } else { Value::Null }, "finish_reason": parser.finish_reason(f.reason, v.calls.len()), "stop_reason": f.stop_reason}],
                     "usage": out.usage()}))
                 .into_response();
             }

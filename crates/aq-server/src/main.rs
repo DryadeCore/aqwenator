@@ -13,8 +13,10 @@
 //! `temperature`, `top_p`, `top_k` (defaults: see `default_sampling`), `seed`, `stop`, `stop_token_ids`,
 //! `ignore_eos`, `skip_special_tokens`, `stream`, `stream_options.include_usage`,
 //! `response_format` (`json_object`, `json_schema`: constrained decoding, see `grammar.rs`).
-//! A field the server does not know, or knows and cannot honour (`n` > 1, `logprobs`,
-//! penalties, ...), is a 400 that names it. The OpenAI fields that change nothing on a
+//! `logprobs` / `top_logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`,
+//! `repetition_penalty`, `min_tokens` (see `shape.rs`).
+//! A field the server does not know, or knows and cannot honour (`n` > 1, `best_of`, `echo`,
+//! `suffix`, `min_p`, ...), is a 400 that names it. The OpenAI fields that change nothing on a
 //! server like this one (`user`, `store`, `metadata`, `service_tier`, `prompt_cache_key`,
 //! `safety_identifier`) are accepted and ignored, and `reasoning_effort` only switches the
 //! template's thinking ("none": off, any other level: on); `--strict-requests true` makes
@@ -51,6 +53,7 @@
 
 mod chat;
 mod grammar;
+mod shape;
 mod text;
 
 use anyhow::{Context, Result};
@@ -179,6 +182,17 @@ pub struct Body {
     stream_options: Option<StreamOptions>,
     ignore_eos: Option<bool>,
     pub skip_special_tokens: Option<bool>,
+    // Logit shaping and log-probabilities (see `shape.rs`).
+    /// Chat: true or false, with `top_logprobs` (0 to 20). Completions: the number of most
+    /// likely tokens to report per position (0 to 20).
+    logprobs: Option<Value>,
+    top_logprobs: Option<u64>,
+    /// Token id (as a string, the OpenAI way) to a bias in [-100, 100].
+    logit_bias: Option<HashMap<String, f32>>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+    min_tokens: Option<usize>,
     // OpenAI fields that change nothing here (bookkeeping on the provider's side): accepted
     // and ignored, or refused under `--strict-requests` (see `ignored`).
     user: Option<Value>,
@@ -194,13 +208,6 @@ pub struct Body {
     // that asks for nothing (see `refusal`).
     n: Option<Value>,
     best_of: Option<Value>,
-    logprobs: Option<Value>,
-    top_logprobs: Option<Value>,
-    logit_bias: Option<Value>,
-    presence_penalty: Option<Value>,
-    frequency_penalty: Option<Value>,
-    repetition_penalty: Option<Value>,
-    min_tokens: Option<Value>,
     min_p: Option<Value>,
     echo: Option<Value>,
     suffix: Option<Value>,
@@ -215,16 +222,9 @@ impl Body {
     /// Why this request cannot be served as asked: (field, message).
     fn refusal(&self, chat: bool) -> Option<(&'static str, String)> {
         // (field, value, the values that ask for nothing, besides null).
-        let neutral: [(&'static str, &Option<Value>, &[Value]); 17] = [
+        let neutral: [(&'static str, &Option<Value>, &[Value]); 10] = [
             ("n", &self.n, &[json!(1)]),
             ("best_of", &self.best_of, &[json!(1)]),
-            ("logprobs", &self.logprobs, &[json!(false), json!(0)]),
-            ("top_logprobs", &self.top_logprobs, &[json!(0)]),
-            ("logit_bias", &self.logit_bias, &[json!({})]),
-            ("presence_penalty", &self.presence_penalty, &[json!(0)]),
-            ("frequency_penalty", &self.frequency_penalty, &[json!(0)]),
-            ("repetition_penalty", &self.repetition_penalty, &[json!(1)]),
-            ("min_tokens", &self.min_tokens, &[json!(0)]),
             ("min_p", &self.min_p, &[json!(0)]),
             ("echo", &self.echo, &[json!(false)]),
             ("suffix", &self.suffix, &[]),
@@ -277,7 +277,48 @@ impl Body {
         if self.max_tokens.or(self.max_completion_tokens) == Some(0) {
             return Some(("max_tokens", "`max_tokens` must be at least 1".into()));
         }
+        for (name, v) in [("presence_penalty", self.presence_penalty), ("frequency_penalty", self.frequency_penalty)] {
+            if v.is_some_and(|x| !(-2.0..=2.0).contains(&x)) {
+                return Some((name, format!("`{name}` must be in [-2, 2]")));
+            }
+        }
+        if self.repetition_penalty.is_some_and(|x| !(x > 0.0 && x.is_finite())) {
+            return Some(("repetition_penalty", "`repetition_penalty` must be positive".into()));
+        }
+        if self.logit_bias.iter().flatten().any(|(k, b)| k.parse::<u32>().is_err() || !(-100.0..=100.0).contains(b)) {
+            return Some(("logit_bias", "`logit_bias` maps token ids to a bias in [-100, 100]".into()));
+        }
+        if self.min_tokens.unwrap_or(0) > self.max_tokens.or(self.max_completion_tokens).unwrap_or(usize::MAX) {
+            return Some(("min_tokens", "`min_tokens` is more than `max_tokens`".into()));
+        }
+        let shown = match (&self.logprobs, chat) {
+            (None | Some(Value::Null), _) => Ok(None),
+            (Some(Value::Bool(b)), true) => Ok(b.then_some(self.top_logprobs.unwrap_or(0))),
+            (Some(Value::Bool(false)), false) => Ok(None),
+            (Some(Value::Number(n)), false) => n.as_u64().ok_or(()).map(Some),
+            _ => Err(()),
+        };
+        if !matches!(shown, Ok(None | Some(0..=20))) {
+            let how = if chat { "true or false, with `top_logprobs` from 0 to 20" } else { "a number from 0 to 20" };
+            return Some(("logprobs", format!("`logprobs` must be {how}")));
+        }
+        if self.top_logprobs.is_some_and(|k| k > 0) && (!chat || shown == Ok(None)) {
+            return Some(("top_logprobs", "`top_logprobs` needs `logprobs`: true (chat completions)".into()));
+        }
         None
+    }
+
+    pub fn logprobs_asked(&self) -> bool {
+        self.top_logprobs().is_some()
+    }
+
+    /// How many most likely tokens to report per position, if log-probabilities are asked for.
+    fn top_logprobs(&self) -> Option<usize> {
+        match &self.logprobs {
+            Some(Value::Bool(true)) => Some(self.top_logprobs.unwrap_or(0) as usize),
+            Some(Value::Number(n)) => n.as_u64().map(|n| n as usize),
+            _ => None,
+        }
     }
 
     /// The first field present that this server accepts and ignores.
@@ -348,6 +389,8 @@ pub struct Finish {
 pub struct Piece {
     pub text: String,
     pub ids: Vec<u32>,
+    /// One per id, when the request asked for log-probabilities.
+    pub logprobs: Vec<shape::LogProb>,
     pub finish: Option<Finish>,
 }
 
@@ -365,9 +408,44 @@ pub struct Output {
     pub cached_tokens: usize,
     pub completion_tokens: usize,
     done: bool,
+    /// Log-probabilities of the tokens picked so far, in output order (`shape::Shaper`).
+    probs: Option<shape::Queue>,
+    words: Arc<Vec<Vec<u8>>>,
 }
 
 impl Output {
+    /// A token as `logprobs` shows it: its text (lossy if it is part of a character) and bytes.
+    fn word(&self, id: u32) -> (String, &[u8]) {
+        let b = self.words.get(id as usize).map_or(&[][..], |w| &w[..]);
+        (String::from_utf8_lossy(b).into_owned(), b)
+    }
+
+    /// `logprobs.content` entries of a chat completion for the tokens of `p`.
+    pub fn chat_logprobs(&self, p: &Piece) -> Vec<Value> {
+        let entry = |id: u32, lp: f32| {
+            let (token, bytes) = self.word(id);
+            json!({"token": token, "logprob": lp, "bytes": bytes})
+        };
+        p.ids.iter().zip(&p.logprobs).map(|(&id, l)| {
+            let mut e = entry(id, l.logprob);
+            e["top_logprobs"] = l.top.iter().map(|&(t, lp)| entry(t, lp)).collect();
+            e
+        }).collect()
+    }
+
+    /// Adds the tokens of `p` to the `logprobs` object of a text completion.
+    fn text_logprobs(&self, p: &Piece, into: &mut Value, offset: &mut usize) {
+        for (&id, l) in p.ids.iter().zip(&p.logprobs) {
+            let (token, _) = self.word(id);
+            let top: serde_json::Map<String, Value> = l.top.iter().map(|&(t, lp)| (self.word(t).0, json!(lp))).collect();
+            let len = token.len();
+            for (key, v) in [("tokens", json!(token)), ("token_logprobs", json!(l.logprob)), ("top_logprobs", json!(top)), ("text_offset", json!(*offset))] {
+                into[key].as_array_mut().unwrap().push(v);
+            }
+            *offset += len;
+        }
+    }
+
     /// The next piece, or the error that ended the generation. Not to be called after a
     /// piece with a finish.
     pub async fn next(&mut self) -> Result<Piece, Fail> {
@@ -378,7 +456,7 @@ impl Output {
                 Some(Msg::Cut) => {
                     self.done = true;
                     self.rx.close();
-                    return Ok(Piece { text: self.stops.flush(), ids: Vec::new(), finish: Some(Finish { reason: "length", stop_reason: Value::Null }) });
+                    return Ok(Piece { text: self.stops.flush(), ids: Vec::new(), logprobs: Vec::new(), finish: Some(Finish { reason: "length", stop_reason: Value::Null }) });
                 }
                 Some(Msg::Refused(m)) => return Err(Fail::Refused(m)),
                 Some(Msg::Failed(m)) => return Err(Fail::Engine(m)),
@@ -387,7 +465,8 @@ impl Output {
             };
             self.completion_tokens += 1;
             self.cached_tokens = e.cached;
-            let mut piece = Piece { text: String::new(), ids: vec![e.token], finish: None };
+            let logprobs = self.probs.as_ref().and_then(|q| q.lock().unwrap().pop_front()).into_iter().collect();
+            let mut piece = Piece { text: String::new(), ids: vec![e.token], logprobs, finish: None };
             if e.stop {
                 // An end-of-sequence or stop token is not text.
                 piece.text = self.stops.flush();
@@ -487,12 +566,33 @@ impl App {
             seed,
         };
         // Greedy and unconstrained: no picker, the device decides (the engine's own path).
-        let pick: Option<Box<dyn Picker>> = match constraint {
+        let mut pick: Option<Box<dyn Picker>> = match constraint {
             Some((schema, thinking, field)) => Some(self.grammar.constrain(&schema, thinking, Sampler::new(sampling)).map_err(|e| bad(Some(field), format!("`{field}`: {e}")))?),
             None if sampling.temperature > 0.0 => Some(Box::new(Sampler::new(sampling))),
             None => None,
         };
-        let ctl = Control { pick, stop_ids: body.stop_token_ids.clone().unwrap_or_default() };
+        let stop_ids = body.stop_token_ids.clone().unwrap_or_default();
+        let probs = body.top_logprobs().map(|k| (k, shape::Queue::default()));
+        if probs.is_some() && self.grammar.words.is_empty() {
+            return Err(bad(Some("logprobs"), "`logprobs` needs a byte-level BPE tokenizer"));
+        }
+        let repetition = body.repetition_penalty.unwrap_or(1.0);
+        let shape = shape::Shape {
+            bias: body.logit_bias.iter().flatten().map(|(k, &b)| (k.parse().unwrap_or(u32::MAX), b)).collect(),
+            presence: body.presence_penalty.unwrap_or(0.0),
+            frequency: body.frequency_penalty.unwrap_or(0.0),
+            repetition,
+            prompt: if repetition != 1.0 { prompt.iter().copied().collect() } else { Default::default() },
+            min_tokens: body.min_tokens.unwrap_or(0),
+            hold: self.eos.iter().chain(&stop_ids).copied().collect(),
+            top: probs.clone(),
+        };
+        // Any of these needs the logits row on the host, also for a greedy request.
+        if !shape.bias.is_empty() || shape.presence != 0.0 || shape.frequency != 0.0 || repetition != 1.0 || shape.min_tokens > 0 || probs.is_some() {
+            let inner = pick.unwrap_or_else(|| Box::new(Sampler::new(sampling)));
+            pick = Some(Box::new(shape::Shaper::new(shape, inner)));
+        }
+        let ctl = Control { pick, stop_ids };
         let stops = match &body.stop {
             None => Vec::new(),
             Some(Stop::One(s)) => vec![s.clone()],
@@ -517,6 +617,8 @@ impl App {
             cached_tokens: 0,
             completion_tokens: 0,
             done: false,
+            probs: probs.map(|p| p.1),
+            words: self.grammar.words.clone(),
         };
         match out.rx.recv().await {
             Some(Msg::Accepted) => Ok(out),
@@ -577,8 +679,10 @@ async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
     };
     let with_ids = body.return_token_ids.unwrap_or(false);
     let (created, rid, model) = (now(), format!("cmpl-{}", out.id), app.model.clone());
-    let choice = move |text: &str, ids: &[u32], finish: Option<&Finish>| {
-        let mut c = json!({"index": 0, "text": text, "logprobs": null, "finish_reason": finish.map(|f| f.reason), "stop_reason": finish.map(|f| f.stop_reason.clone())});
+    let with_probs = body.top_logprobs().is_some();
+    let probs = move || if with_probs { json!({"tokens": [], "token_logprobs": [], "top_logprobs": [], "text_offset": []}) } else { Value::Null };
+    let choice = move |text: &str, ids: &[u32], logprobs: Value, finish: Option<&Finish>| {
+        let mut c = json!({"index": 0, "text": text, "logprobs": logprobs, "finish_reason": finish.map(|f| f.reason), "stop_reason": finish.map(|f| f.stop_reason.clone())});
         if with_ids {
             c["token_ids"] = json!(ids);
         }
@@ -587,12 +691,17 @@ async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
 
     if body.stream.unwrap_or(false) {
         let usage = body.include_usage();
+        let mut offset = 0;
         return sse(out, move |out, piece| match piece {
             Err(f) => vec![f.event()],
             Ok(p) => {
                 let base = json!({"id": rid, "object": "text_completion", "created": created, "model": model});
                 let mut c = base.clone();
-                c["choices"] = json!([choice(&p.text, &p.ids, p.finish.as_ref())]);
+                let mut lp = probs();
+                if with_probs {
+                    out.text_logprobs(&p, &mut lp, &mut offset);
+                }
+                c["choices"] = json!([choice(&p.text, &p.ids, lp, p.finish.as_ref())]);
                 let mut v = vec![c.to_string()];
                 if p.finish.is_some() && usage {
                     let mut u = base;
@@ -605,16 +714,19 @@ async fn completions(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         });
     }
 
-    let (mut text, mut ids) = (String::new(), Vec::new());
+    let (mut text, mut ids, mut lp, mut offset) = (String::new(), Vec::new(), probs(), 0);
     loop {
         match out.next().await {
             Err(f) => return f.response(),
             Ok(p) => {
+                if with_probs {
+                    out.text_logprobs(&p, &mut lp, &mut offset);
+                }
                 text.push_str(&p.text);
                 ids.extend(p.ids);
                 if let Some(f) = p.finish {
                     return Json(json!({"id": rid, "object": "text_completion", "created": created, "model": model,
-                        "choices": [choice(&text, &ids, Some(&f))], "usage": out.usage()}))
+                        "choices": [choice(&text, &ids, lp, Some(&f))], "usage": out.usage()}))
                     .into_response();
                 }
             }

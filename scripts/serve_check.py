@@ -184,6 +184,45 @@ with section('Sampling'):
     s, b = chat(messages=story, max_tokens=4, temperature=-1)
     check("negative temperature is a 400", s == 400 and b["error"]["param"] == "temperature", f"{s} {b}")
 
+with section('Logit shaping and log-probabilities'):
+    base = {"prompt": "1, 1, 1, 1, 1, 1,", "max_tokens": 16, "return_token_ids": True}
+    s, b = call("/v1/completions", base)
+    g = b["choices"][0]["token_ids"]
+    s, b = call("/v1/completions", {**base, "logit_bias": {str(g[0]): -100}})
+    check("logit_bias -100 bans a token", s == 200 and g[0] not in b["choices"][0]["token_ids"], (g, b["choices"][0] if s == 200 else b))
+    other = next(t for t in range(1000, 1100) if t not in g)
+    s, b = call("/v1/completions", {**base, "max_tokens": 3, "logit_bias": {str(other): 100}})
+    check("logit_bias +100 forces a token", s == 200 and b["choices"][0]["token_ids"] == [other] * 3, b["choices"][0] if s == 200 else b)
+    most = lambda ids: max(ids.count(t) for t in ids)
+    sea = [chat(messages=msg("Write three sentences about the sea."), max_tokens=60, **kw)[1]["choices"][0]["message"]["content"] for kw in ({}, {"presence_penalty": 2})]
+    check("presence_penalty changes a text that repeats words", sea[0] != sea[1] and len(sea[1]) > 20, sea)
+    for field, v in (("frequency_penalty", 2), ("repetition_penalty", 1.8)):
+        s, b = call("/v1/completions", {**base, field: v})
+        ids = b["choices"][0]["token_ids"] if s == 200 else []
+        check(f"{field}: the output repeats less than the greedy one", s == 200 and ids != g and len(set(ids)) > len(set(g)), (g, ids or b))
+    s, b = call("/v1/completions", {**base, "repetition_penalty": 0})
+    check("repetition_penalty 0 is a 400 naming it", s == 400 and b["error"]["param"] == "repetition_penalty", f"{s} {b}")
+    s, b = chat(messages=msg("Say hi."), max_tokens=60)
+    short = b["usage"]["completion_tokens"]
+    s, b = chat(messages=msg("Say hi."), max_tokens=60, min_tokens=40)
+    check("min_tokens holds the end of the turn back", s == 200 and short < 40 <= b["usage"]["completion_tokens"], (short, b["usage"] if s == 200 else b))
+    s, b = chat(messages=msg("Name three colours."), max_tokens=8, logprobs=True, top_logprobs=3)
+    lp = b["choices"][0]["logprobs"]["content"] if s == 200 else []
+    ok = len(lp) == b["usage"]["completion_tokens"] and all(e["logprob"] <= 0 and len(e["top_logprobs"]) == 3 and e["top_logprobs"][0]["token"] == e["token"]
+                                                               and e["top_logprobs"][0]["logprob"] >= e["top_logprobs"][2]["logprob"] and bytes(e["bytes"]).decode(errors="replace") == e["token"] for e in lp)
+    check("chat logprobs: one entry per token, the greedy token is the most likely, top 3 in order", ok and "".join(e["token"] for e in lp) == b["choices"][0]["message"]["content"], lp[:2] or b)
+    s, ev = chat(messages=msg("Name three colours."), max_tokens=8, logprobs=True, top_logprobs=3, stream=True)
+    got = [e for x in ev[:-1] for c in json.loads(x).get("choices", []) for e in (c.get("logprobs") or {}).get("content", [])] if s == 200 else []
+    check("chat logprobs, streamed: the same entries", [e["token"] for e in got] == [e["token"] for e in lp] and len(lp) > 0, [e["token"] for e in got])
+    s, b = call("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 6, "logprobs": 2})
+    lp = b["choices"][0]["logprobs"] if s == 200 else {}
+    check("completions logprobs: tokens, token_logprobs, top_logprobs, text_offset", s == 200 and "".join(lp["tokens"]) == b["choices"][0]["text"] and len(lp["token_logprobs"]) == 6
+          and all(len(t) == 2 for t in lp["top_logprobs"]) and lp["text_offset"][0] == 0 and lp["text_offset"] == sorted(lp["text_offset"]), lp or b)
+    s, b = chat(messages=msg("Hi"), max_tokens=4, top_logprobs=3)
+    check("top_logprobs without logprobs is a 400", s == 400 and b["error"]["param"] == "top_logprobs", f"{s} {b}")
+    s, b = chat(messages=msg("Hi"), max_tokens=4, logprobs=True, top_logprobs=30)
+    check("top_logprobs over 20 is a 400", s == 400 and b["error"]["param"] == "logprobs", f"{s} {b}")
+
 with section('Reasoning split'):
     s, b = chat(messages=msg("What is 17 + 4?"), max_tokens=600, chat_template_kwargs={"enable_thinking": True})
     m = b["choices"][0]["message"] if s == 200 else {}
