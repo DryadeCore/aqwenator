@@ -30,6 +30,9 @@ Cold start, 9B on the Spark: first token 3.2 s after launch, page cache warm or 
 | `fp8` (E4M3 weights and activations) | 113.7 | 295 | 374 / 3374 | 11.7 GiB | 0.028 |
 | `int8` (block-scaled weights, bf16 activations) | 71.6 | 182 | 619 / 3946 | 12.2 GiB | 0.003 |
 
+vLLM 0.33 serving a published FP8 checkpoint of the same model (MTP speculation) does 51.9
+turns/min and 131 tok/s on this replay (TTFT 1052 / 3739 ms).
+
 `fp8` is the fast one and changes about 3% of greedy tokens; `int8` is near the bf16 noise
 floor and trades speed for memory.
 

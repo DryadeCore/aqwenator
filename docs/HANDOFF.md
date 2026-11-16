@@ -303,6 +303,50 @@ bf16 copy freed (`gpu::Weight`); activations quantized per row before each GEMM
 fp8 is +24% (16 agents) and +31% (8) turns/min over bf16 with better latency everywhere; int8
 is -22% and -21% (chunked expansion took its tok/s from 150 to 182 at 16 agents).
 
+**vLLM on the same 8-bit scheme** (vLLM 0.33, `RedHatAI/Qwen3.5-9B-FP8-dynamic`, MTP
+speculation 3 tokens, same replay, 10 min each, 05:16-05:40, 0 errors):
+
+| Agents | Engine | Turns/min | Tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
+|---|---|---|---|---|---|
+| 16 | vLLM FP8 | 51.9 | 131 | 1052 / 3739 | 101.2 / 135.8 |
+| 16 | aqwenator fp8 | 113.7 | 295 | 374 / 3374 | 38.1 / 80.3 |
+| 8 | vLLM FP8 | 47.4 | 132 | 480 / 1719 | 45.1 / 60.4 |
+| 8 | aqwenator fp8 | 79.3 | 209 | 256 / 2075 | 23.4 / 49.9 |
+
+2.2x (16 agents) and 1.7x (8) turns/min. vLLM keeps the better TTFT p99 at 8 agents (1719 vs
+2075 ms). vLLM gained little from FP8 at 16 agents (bf16 earlier: 57.4 turns/min, 122 tok/s).
+
+**Extra tier points** (16 agents, 5 min each, 04:31-05:13; short runs, turns/min moves a few
+percent with the sessions drawn):
+
+| Variant | Turns/min | Tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
+|---|---|---|---|---|
+| fp8 + FP8 output head (`AQ_QUANT_HEAD=1`) | 108.6 | 293 | 422 / 4546 | 39.1 / 87.4 |
+| fp8, MLP only (`AQ_QUANT_SET=ud`) | 103.4 | 273 | 450 / 4286 | 43.1 / 93.8 |
+| int8, MLP only | 81.0 | 193 | 580 / 5415 | 61.1 / 125.1 |
+
+The FP8 head buys nothing measurable (293 vs 295 tok/s) and is not worth its quality cost.
+fp8 on the MLP alone keeps about two thirds of the tok/s gain at 0.018 nats. int8 on the MLP
+alone is a little faster than int8 everywhere (193 vs 182 tok/s); its memory was not measured.
+
+**Where the step goes** (`AQ_PROFILE=1`, 16 agents, last report window, us per call):
+
+| Op | bf16 | fp8 | int8 |
+|---|---|---|---|
+| `gemm_gate_up` | 1244 | 870 | 1892 |
+| `gemm_down` | 645 | 461 | 1190 |
+| `gemm_gdn_in` | 645 | 451 | 1029 |
+| `gemm_qkv` | 520 | 403 | 732 |
+| `gemm_lm_head` (bf16 in all three) | 3308 | 3408 | 3401 |
+| `attn_dec` | 4774 | 4573 | 4918 |
+
+Decode-only step fits from the 10-minute runs: base 77 ms (bf16), 62 (fp8), 127 (int8); the
+per-key attention term is unchanged (138-163 ms per million keys). With fp8, decode attention
+is the largest single op (30% of step time) and the bf16 head is 8%: those two, not the layer
+GEMMs, are the next targets. The profiled GEMM gain (~30%) is well under the 2x the bare
+cuBLASLt timing shows, because the quantize and rescale passes sit around each small GEMM
+(fusing them is open).
+
 **Quality** is measured teacher-forced against transformers on three real trace turns (8k,
 16k, 26k prompt tokens, 256 greedy tokens each; `scripts/golden.py --ids-file`, goldens
 `~/aq/golden/qwen35-9b-trace-{a,b,c}.safetensors` on the Spark; `aq-check` prints
