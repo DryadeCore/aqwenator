@@ -59,22 +59,52 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "Name the capital of France."}]}'
 ```
 
+See "OpenAI-compatible serving" below for the fields, the flags and the limits.
+
+## OpenAI-compatible serving
+
+`aq-serve` speaks the part of the OpenAI HTTP API that clients written for vLLM or for
+OpenAI use. `scripts/serve_check.py` checks everything in this section against a running
+server.
+
 Endpoints: `/v1/completions` (text or token-id prompts), `/v1/chat/completions` (the model's
-chat template; reasoning in `reasoning_content`; `tools` with `tool_choice` auto, none,
-required or a named function), `/v1/models`, `/health` (503 once the engine has stopped; the
-process then exits non-zero), `/metrics` (Prometheus; `--vllm-metrics true` adds vLLM's names
-for the request gauges and token counters).
+chat template), `/v1/models`, `/health` (503 once the engine has stopped; the process then
+exits non-zero for a supervisor to restart it), `/metrics` (Prometheus, `aq_*` names;
+`--vllm-metrics true` adds vLLM's names for the request gauges and token counters).
 
-Both endpoints take `max_tokens` (default: the rest of the context), `temperature` (default 0,
-greedy), `top_p`, `top_k`, `seed`, `stop`, `stop_token_ids`, `stream`,
-`stream_options.include_usage` and `response_format` (`json_object`, `json_schema`). A field
-the server does not know or cannot honour is a 400 that names it. `scripts/serve_check.py`
-checks all of this against a running server.
+Request fields, both endpoints unless noted:
 
-The server listens on 127.0.0.1 unless `--host` (or `AQ_HOST`) says otherwise; the image sets
-`AQ_HOST=0.0.0.0`. Options are listed in `crates/aq-server/src/main.rs`; the ones that matter
-are `--max-seqs`, `--max-ctx`, `--max-tokens` (prefill tokens per step), `--kv-gb` (attention
-cache pool) and `--kv-reserve` (output tokens a request reserves in that pool up front).
+| Field | Behaviour |
+|---|---|
+| `max_tokens`, `max_completion_tokens` (chat) | Default: the rest of the context. |
+| `temperature`, `top_p`, `top_k`, `seed` | Default: the model's `generation_config.json` values, else temperature 1 (`--default-temperature T` overrides; 0 = greedy). Temperature 0 is the engine's greedy path. A seeded request repeats as far as its logits do (they can move by a rounding step with what else shares the batch). |
+| `stop`, `stop_token_ids`, `ignore_eos`, `min_tokens` | The stop string or token is not part of the output; `stop_reason` names it. |
+| `logit_bias`, `presence_penalty`, `frequency_penalty`, `repetition_penalty` | Applied to the logits before sampling. |
+| `logprobs` + `top_logprobs` (chat), `logprobs` N (completions) | Up to 20 alternatives. Log-probabilities of the model after bias and penalties, before temperature, `top_k`, `top_p` and grammar masks. |
+| `stream`, `stream_options.include_usage` | Server-sent events, `[DONE]` last. |
+| `response_format` | `json_object` and `json_schema`: the output is constrained to the schema (after the reasoning block, if the request thinks). |
+| `tools`, `tool_choice`, `parallel_tool_calls` (chat) | `auto`: calls the model writes are parsed into `tool_calls`. `required` or a named function: the output is constrained to a valid call. Either way the wire shape is vLLM's: `tool_calls[].function.arguments` is a JSON string, `finish_reason` is `tool_calls` (`stop` for a named function, as in vLLM). `none`: the output is content as written. |
+| `chat_template_kwargs` (chat) | Passed to the template (`enable_thinking`). Reasoning comes back in `reasoning_content` (and `reasoning`). |
+| `reasoning_effort` (chat) | `none` turns the template's thinking off, any other level on, unless `chat_template_kwargs.enable_thinking` says. |
+| `user`, `store`, `metadata`, `service_tier`, `prompt_cache_key`, `safety_identifier` | Accepted and ignored: they change nothing on a server like this one. `--strict-requests true` makes them (and `reasoning_effort`) a 400. |
+| `n` > 1, `best_of` > 1, `echo`, `suffix`, `min_p`, `truncate_prompt_tokens`, `continue_final_message`, `add_generation_prompt` false, image or audio content | 400 that names the field. So is any field the server does not know, and a `model` other than the served one is a 404. Nothing is dropped unseen. |
+
+`usage.prompt_tokens_details.cached_tokens` reports, on both endpoints and in the final
+streamed usage chunk, how many prompt tokens the request did not have to compute.
+
+Flags that matter (the full list is at the top of `crates/aq-server/src/main.rs`):
+
+| Flag | Meaning |
+|---|---|
+| `--host`, `--port`, `--served-model-name` | Listens on 127.0.0.1 unless `--host` (or `AQ_HOST`) says otherwise; the image sets `AQ_HOST=0.0.0.0`. |
+| `--max-seqs N`, `--max-running N` | Sequences in one step (sizes the step buffers), and how many requests run at once. |
+| `--max-ctx N`, `--max-tokens N` | Context per sequence; prefill tokens per step. |
+| `--kv-gb X`, `--kv-reserve N` | Attention-cache pool, and the output tokens a request reserves in it up front (default 4096; 0 = its whole limit). Past its reservation a request takes pages as it generates; if the pool is dry it waits for the next request to end (new requests queue behind it), and only when every running request is out of pages does one end early with `finish_reason` `length` (`aq_requests_cut_total`). |
+| `--default-temperature T`, `--strict-requests true` | See the table above. |
+
+Limits: with `AQ_COEXEC` or `AQ_BG_PREFILL` (study modes, off by default) tokens are picked
+on the device, so only greedy, unconstrained requests are served, and a request without
+`temperature` is greedy there.
 
 ## Build
 
