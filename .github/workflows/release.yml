@@ -1,17 +1,20 @@
 name: release
 
 # A tag `vX.Y.Z` publishes ghcr.io/<owner>/<repo>:X.Y.Z (and :latest) for amd64 and arm64,
-# and a GitHub release with the binaries of both.
+# with provenance and an SBOM attached to the image, and a GitHub release with the binaries
+# of both and their SHA-256 sums.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -19,7 +22,9 @@ jobs:
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       # The CUDA devel image and the Rust toolchain need more disk than a runner has free.
       - name: Free disk space
         run: |
@@ -27,33 +32,35 @@ jobs:
           sudo docker image prune -af > /dev/null
           df -h /
       - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # No build cache here: a release is built from the pinned inputs only.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          provenance: mode=max
+          sbom: true
       - name: Binaries
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           target: binaries
           outputs: type=local,dest=bin
-          cache-from: type=gha,scope=${{ matrix.arch }}
+          provenance: false
       - run: |
           mkdir -p out/digests
           touch "out/digests/${DIGEST#sha256:}"
-          tar -czf "out/aqwenator-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz" -C bin .
+          tar -czf "out/aqwenator-${GITHUB_REF_NAME}-linux-${ARCH}.tar.gz" -C bin .
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v4
+          ARCH: ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: out-${{ matrix.arch }}
           path: out
@@ -61,16 +68,19 @@ jobs:
 
   publish:
     needs: build
+    permissions:
+      contents: write
+      packages: write
     runs-on: ubuntu-24.04
     steps:
       - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: out
           pattern: out-*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -81,6 +91,9 @@ jobs:
           docker buildx imagetools create -t "$IMAGE:${GITHUB_REF_NAME#v}" -t "$IMAGE:latest" \
             $(printf "$IMAGE@sha256:%s " *)
       - name: GitHub release
-        run: gh release create "$GITHUB_REF_NAME" out/*.tar.gz --repo "$GITHUB_REPOSITORY" --generate-notes
+        working-directory: out
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" *.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

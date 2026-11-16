@@ -29,7 +29,7 @@ directory. Needs the NVIDIA container toolkit and a driver for CUDA 13.
 
 ```sh
 docker run --gpus all -p 8000:8000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/huggingface:/home/aq/.cache/huggingface:ro \
   ghcr.io/<owner>/aqwenator Qwen/Qwen3.5-9B --kv-gb 24
 ```
 

@@ -8,10 +8,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# NVIDIA cuda-rust: cuda-oxide (Rust -> PTX kernels) + shared host runtime. Pinned rev.
-cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6" }
-cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6" }
-cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6" }
+# NVIDIA cuda-rust: cuda-oxide (Rust -> PTX kernels) + shared host runtime. Pinned to a full commit id.
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c9a5d16a75036fbcc639f751b68d537" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c9a5d16a75036fbcc639f751b68d537" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c9a5d16a75036fbcc639f751b68d537" }
 # Header parsing + zero-copy views only; the fast GPU loader is ours (see docs/DESIGN.md).
 safetensors = "0.8"
 tokenizers = "=1.0.0-rc.4"
