@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use aq_engine::config::{LayerKind, TextConfig};
-use aq_engine::cublaslt::{CUDA_R_8F_E4M3, CUDA_R_16BF};
+use aq_engine::cublaslt::{CUDA_R_8F_E4M3, CUDA_R_8I, CUDA_R_16BF, CUDA_R_32I};
 use aq_engine::gpu::{Gpu, cfg, de};
 use aq_engine::weights::resolve_model;
 use serde_json::json;
@@ -176,7 +176,7 @@ fn main() -> Result<()> {
         const MS: [usize; 11] = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
         let kmax = gemms.iter().map(|x| x.k).max().unwrap();
         let x = g.alloc(4096 * kmax * 2)?;
-        let ymax = gemms.iter().map(|x| x.n * x.max_m.min(4096) * 2).max().unwrap();
+        let ymax = gemms.iter().map(|x| x.n * x.max_m.min(4096) * 4).max().unwrap();
         let y = g.alloc(ymax)?;
         g.zero(x, 4096 * kmax * 2)?;
         g.zero(w, wmax)?;
@@ -209,9 +209,9 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             })?;
-            // The same step with 8-bit (E4M3) operands: weights and activations, and weights only.
+            // The same step with 8-bit operands: E4M3 -> bf16, and int8 -> i32.
             let mut alt = String::new();
-            for (label, tys) in [("w8a8", (CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF)), ("w8a16", (CUDA_R_8F_E4M3, CUDA_R_16BF, CUDA_R_16BF))] {
+            for (label, tys) in [("fp8", (CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF)), ("int8", (CUDA_R_8I, CUDA_R_8I, CUDA_R_32I))] {
                 let ok = gemms.iter().all(|q| g.lt.gemm_ty(stream, m.min(q.max_m), q.n, q.k, x, w, y, tys).is_ok());
                 g.sync()?;
                 if !ok {

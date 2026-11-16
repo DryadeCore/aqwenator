@@ -1,4 +1,4 @@
-# Update 2026-11-15: branch `mythos-review` (not merged to main)
+# Update 2026-11-16: branch `mythos-review` (main has everything up to the Docker/CI commits; FP8 is branch-only)
 
 Everything below this section describes main as of 2026-11-13. Since then all work has gone to
 `mythos-review` (worktree `.claude/worktrees/mythos-review`), which contains main, the
@@ -244,6 +244,69 @@ Dead ends on the K/V traffic:
 What is left on the Spark with exact bf16 is a handful of items worth <= 3% each (base step
 78 -> 67 ms, wasted draft rows, non-GEMM prefill ops). The step change is fewer bytes per
 weight (8-bit weights would halve the 40% share), which gives up exact outputs.
+
+### Release and 8-bit weights (2026-11-16)
+
+**Release.** `Dockerfile` (CUDA 13.0.3 devel ->
+base + `libcublas-13-0`, 1.23 GB), `ci.yml` (image build on amd64 and arm64), `release.yml`
+(tag `vX.Y.Z` -> `ghcr.io/<owner>/aqwenator` + binaries on a GitHub release; no tag pushed
+yet). One build per CPU type: kernels target `sm_80` and the driver compiles them for the
+device (Spark: checks pass, 19.9 vs 19.5 tok/s for the `sm_121a` build). The arm64 image's
+`aq-check` passes on the Spark; the amd64 image has not run on a GPU yet.
+
+**8-bit weights: what the hardware offers** (`aq-ceiling` now times the 9B step's GEMMs with
+8-bit operands; Spark, ms per step):
+
+| Rows M | bf16 | FP8 E4M3 x E4M3 -> bf16 | int8 x int8 -> i32 |
+|---|---|---|---|
+| <= 128 | 75-82 | 38-42 | 38-46 |
+| 512 | 107 | 55 | 81 |
+| 4096 | 648-666 | 304-310 | 407 |
+
+cuBLASLt 13.1 has no 8-bit weights x bf16 activations, and its per-row scale modes
+(`OUTER_VEC_32F`) are rejected for this problem (heuristic status 7).
+
+**`AQ_FP8=1|2`** (experimental, opt-in, not exact; `AQ_FP8_SET` picks the GEMMs): E4M3
+weights with a power-of-two scale per output channel, quantized as each weight lands and the
+bf16 copy freed (`gpu::Weight`); activations quantized per row before each GEMM
+(`quant_e4m3`), output rescaled after (`scale_outer`). 2 = output head too.
+- Speed, Spark, real traces, 16 agents, 5 min: bf16 83.6 turns/min 204 tok/s (a low run; 92-93
+  is usual); FP8 layers 103.6 / 278; layers + head 106.8 / 286. Synthetic 16 x 16k: 25.1 vs
+  20.0 out tok/s.
+- Memory, 9B with a 4096-token KV pool: 11.70 GiB (layers) vs 18.05 GiB. Weights resident at
+  4.4 s vs 2.9 s (uploads drained per weight; a pre-quantized checkpoint would fix it).
+- Exact gate: 9B golden passes; resume-vs-cold identity checks fail on 0.8B and 9B-long
+  (the decode and prefill paths now differ by quantization noise, not ulps).
+
+**Quality** is measured teacher-forced against transformers on three real trace turns (8k,
+16k, 26k prompt tokens, 256 greedy tokens each; `tools/golden.py --ids-file`, goldens
+`~/aq/golden/qwen35-9b-trace-{a,b,c}.safetensors` on the Spark; `aq-check` prints
+KL(ref||ours)). Mean KL in nats over the three, and top-1 agreement out of 768:
+
+| Variant | Mean KL | Top-1 |
+|---|---|---|
+| bf16 | 0.002 | 764 |
+| FP8, every layer GEMM | 0.028 | 739 |
+| FP8, MLP only | 0.018 | 750 |
+| FP8, one GEMM kind only (down / GDN in / qkv / gate-up) | 0.007 / 0.010 / 0.011 / 0.015 | |
+| bf16 GEMMs, weights rounded through E4M3 (`AQ_QSIM=w:f`) | 0.022 | 751 |
+| bf16 GEMMs, activations rounded through E4M3 (`a:f`) | 0.022 | 740 |
+| bf16 GEMMs, weights int8 per output row (`w:i`) | 0.009 | 749 |
+| bf16 GEMMs, activations int8 per row (`a:i`) | 0.141 | 710 |
+| bf16 GEMMs, weights int8 with a scale per 32 (`w:b`) | 0.003 | 763 |
+
+So: E4M3's ~4 significant bits are the limit (weights and activations cost the same, no GEMM
+is the culprit); linear int8 activations are unusable; block-scaled int8 weights with bf16
+activations are at the noise floor. The fast FP8 path therefore costs ~0.03 nats and ~3% of
+top-1 tokens, some at reference margins of 2-5 logits (often message / tool-call terminators).
+
+**Open design question** (the user's call): how to multiply 8-bit weights by 16-bit
+activations. Candidates: (a) int8 GEMM with each activation row split into two int8 digit
+rows: decode ~50-58 ms of GEMM vs 78, but the i32 output pass makes it a loss for prefill, and
+a per-32 scale along K cannot be factored out (needs row x column scaling, quality unmeasured);
+(b) dequantize each weight to a bf16 scratch buffer and use the bf16 GEMM: clean quality and
+half the memory, but ~2.3x the decode weight traffic; (c) our own tensor-core GEMM reading
+int8 weights. `AQ_QSIM` and the `qsim` kernel are diagnostics to delete once this is settled.
 
 # Handoff: aqwenator state as of 2026-11-13
 

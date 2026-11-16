@@ -436,12 +436,17 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 /// freed, so the load never holds much more than the final footprint.
 fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fp8: bool) -> Result<Weight> {
     let p = concat_bf16_padded(gpu, ck, names, pad_bytes)?;
-    if !fp8 {
-        return Ok(Weight::bf16(p));
-    }
     let mut bytes = pad_bytes;
     for n in names {
         bytes += ck.bf16(n)?.bytes.len();
+    }
+    if gpu.qsim.0 > 0 {
+        gpu.drain_uploads()?;
+        let mode = if gpu.qsim.0 == 3 && k % 2048 != 0 { 2 } else { gpu.qsim.0 };
+        unsafe { gpu.k.qsim(&gpu.stream, cfg(((bytes / 2 / k) as u32, 1, 1), 256), p as *mut u16, k as u32, mode) }.map_err(de)?;
+    }
+    if !fp8 {
+        return Ok(Weight::bf16(p));
     }
     gpu.drain_uploads()?;
     gpu.quantize_weight(p, bytes / 2 / k, k, false)

@@ -49,6 +49,9 @@ pub struct Gpu {
     x8: Vec<(u64, u64)>,
     /// Rows and columns the `x8` buffers hold.
     x8_dims: (usize, usize),
+    /// AQ_QSIM diagnostic: 8-bit round trip of (weights, activations); 0 = off, 1 = E4M3,
+    /// 2 = int8. Everything still runs as bf16 GEMMs.
+    pub qsim: (u32, u32),
     /// Smallest GEMM M bucket (0 = none). Pinning every GEMM below this size to one plan makes
     /// a row's result independent of how many other rows share the GEMM (used by tests).
     pub gemm_min_m: usize,
@@ -185,6 +188,13 @@ impl Gpu {
             capturing: Default::default(),
             x8: Vec::new(),
             x8_dims: (0, 0),
+            qsim: {
+                // e.g. AQ_QSIM=w:f, a:i, wa:i (f = E4M3, i = int8 per row, b = int8 per block of 32)
+                let v = std::env::var("AQ_QSIM").unwrap_or_default();
+                let mode = if v.ends_with(":f") { 1 } else if v.ends_with(":i") { 2 } else if v.ends_with(":b") { 3 } else { 0 };
+                let who = v.split(':').next().unwrap_or("");
+                (if who.contains('w') { mode } else { 0 }, if who.contains('a') { mode } else { 0 })
+            },
             // AQ_GEMM_MIN_M: debugging aid, pins small GEMMs to one plan size.
             gemm_min_m: std::env::var("AQ_GEMM_MIN_M").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         };
@@ -390,6 +400,9 @@ impl Gpu {
         .max(m);
         let s = self.raw_stream();
         if w.scale == 0 {
+            if self.qsim.1 > 0 {
+                unsafe { self.k.qsim(&self.stream, cfg((mb as u32, 1, 1), 256), x as *mut u16, k as u32, self.qsim.1) }.map_err(de)?;
+            }
             return self.lt.gemm(s, mb, n, k, x, w.p, y, out_ty);
         }
         let (w8, w_scale) = (w.p, w.scale);

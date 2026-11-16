@@ -19,7 +19,10 @@ type Status = i32;
 pub const CUDA_R_32F: i32 = 0;
 pub const CUDA_R_16BF: i32 = 14;
 pub const CUDA_R_8F_E4M3: i32 = 28;
+pub const CUDA_R_8I: i32 = 3;
+pub const CUDA_R_32I: i32 = 10;
 const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_COMPUTE_32I: i32 = 72;
 const DESC_TRANSA: i32 = 3;
 const DESC_TRANSB: i32 = 4;
 const OP_N: i32 = 0;
@@ -95,6 +98,7 @@ struct Plan {
     b: Layout,
     c: Layout,
     algo: Algo,
+    int: bool,
 }
 
 pub struct CublasLt {
@@ -128,7 +132,9 @@ impl CublasLt {
         if !self.plans.contains_key(&key) {
             unsafe {
                 let mut desc = std::ptr::null_mut();
-                check(cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc")?;
+                // int8 operands accumulate in i32 (and take i32 alpha and beta).
+                let (compute, scale) = if w_ty == CUDA_R_8I { (CUBLAS_COMPUTE_32I, CUDA_R_32I) } else { (CUBLAS_COMPUTE_32F, CUDA_R_32F) };
+                check(cublasLtMatmulDescCreate(&mut desc, compute, scale), "desc")?;
                 let (ta, tb) = (OP_T, OP_N);
                 check(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSA, (&ta as *const i32).cast(), 4), "transa")?;
                 check(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSB, (&tb as *const i32).cast(), 4), "transb")?;
@@ -165,7 +171,7 @@ impl CublasLt {
                     let h = (seed ^ (m as u64) << 40 ^ (n as u64) << 20 ^ k as u64 ^ (out_ty as u64) << 60).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
                     for o in 0..got as usize {
                         let r = &res[(h as usize + o) % got as usize];
-                        let plan = Plan { desc, a, b, c, algo: r.algo };
+                        let plan = Plan { desc, a, b, c, algo: r.algo, int: w_ty == CUDA_R_8I };
                         if self.run(stream, &plan, x, w, y).is_ok() {
                             sync(stream)?;
                             algo = r.algo;
@@ -173,24 +179,24 @@ impl CublasLt {
                         }
                     }
                 }
-                self.plans.insert(key, Plan { desc, a, b, c, algo });
+                self.plans.insert(key, Plan { desc, a, b, c, algo, int: w_ty == CUDA_R_8I });
             }
         }
         Ok(&self.plans[&key])
     }
 
     fn run(&self, stream: *mut c_void, p: &Plan, x: u64, w: u64, y: u64) -> Result<()> {
-        let (alpha, beta) = (1.0f32, 0.0f32);
+        let (alpha, beta) = if p.int { (1i32.to_ne_bytes(), 0i32.to_ne_bytes()) } else { (1.0f32.to_ne_bytes(), 0.0f32.to_ne_bytes()) };
         let s = unsafe {
             cublasLtMatmul(
                 self.handle,
                 p.desc,
-                (&alpha as *const f32).cast(),
+                alpha.as_ptr().cast(),
                 w as *const c_void,
                 p.a,
                 x as *const c_void,
                 p.b,
-                (&beta as *const f32).cast(),
+                beta.as_ptr().cast(),
                 y as *const c_void,
                 p.c,
                 y as *mut c_void,

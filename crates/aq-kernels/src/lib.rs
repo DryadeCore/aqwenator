@@ -410,6 +410,75 @@ pub mod kernels {
         }
     }
 
+    /// Diagnostic (AQ_QSIM): round every row of a bf16 matrix through an 8-bit format in
+    /// place, to measure what that format costs with everything else unchanged. `mode` 1 is
+    /// E4M3 with the row's power-of-two scale (as `quant_e4m3`), 2 is linear int8 scaled to
+    /// the row's largest magnitude, 3 is int8 scaled per block of 32 elements. Requires
+    /// k % 8 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn qsim(x: *mut u16, k: u32, mode: u32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let tid = thread::threadIdx_x() as usize;
+        let nv = k as usize / 8;
+        let xv = unsafe { x.cast::<U32x4>().add(thread::blockIdx_x() as usize * nv) };
+        let mut top = 0u32;
+        let mut v = tid;
+        while v < nv {
+            let w = unsafe { *xv.add(v) }.to_array();
+            #[unroll]
+            for e in 0..4 {
+                top = top.max(w[e] & 0x7fff).max((w[e] >> 16) & 0x7fff);
+            }
+            v += 256;
+        }
+        let top = unsafe { block_max(top as f32, red) } as u32;
+        let ex = top >> 7;
+        let (s, inv) = if ex >= 8 { (f32::from_bits((ex - 7) << 23), f32::from_bits((261 - ex) << 23)) } else { (1.0, 1.0) };
+        let amax = bf16_to_f32(top as u16);
+        let mut v = tid;
+        while v < nv {
+            let w = unsafe { *xv.add(v) }.to_array();
+            let mut packed = [0u32; 4];
+            #[unroll]
+            for e in 0..4 {
+                let (a0, a1) = cvt_f32x2_bf16x2(w[e]);
+                let mut r = [a0, a1];
+                #[unroll]
+                for i in 0..2 {
+                    if mode == 1 {
+                        let c = e4m3(r[i] * inv);
+                        let (ef, m) = ((c >> 3) & 15, c & 7);
+                        let mag = if ef == 0 { m as f32 * (1.0 / 512.0) } else { f32::from_bits(((ef + 120) << 23) | (m << 20)) };
+                        r[i] = if c & 0x80 != 0 { -mag * s } else { mag * s };
+                    } else if mode == 2 && amax > 0.0 {
+                        r[i] = libm::rintf(r[i] / amax * 127.0) * amax / 127.0;
+                    }
+                }
+                if mode == 3 {
+                    // int8 with one scale per 32 elements: the 4 lanes that hold a block
+                    // (8 elements each) agree on its largest magnitude. Needs k % 2048 == 0.
+                    let mut bm = (w[0] & 0x7fff).max((w[0] >> 16) & 0x7fff);
+                    #[unroll]
+                    for j in 1..4 {
+                        bm = bm.max(w[j] & 0x7fff).max((w[j] >> 16) & 0x7fff);
+                    }
+                    let mut bf = bm as f32;
+                    bf = bf.max(warp::shuffle_xor_f32_sync(FULL, bf, 1));
+                    bf = bf.max(warp::shuffle_xor_f32_sync(FULL, bf, 2));
+                    let bmax = bf16_to_f32(bf as u32 as u16);
+                    if bmax > 0.0 {
+                        r[0] = libm::rintf(a0 / bmax * 127.0) * bmax / 127.0;
+                        r[1] = libm::rintf(a1 / bmax * 127.0) * bmax / 127.0;
+                    }
+                }
+                packed[e] = pk(r[0], r[1]);
+            }
+            unsafe { *xv.add(v) = U32x4::new(packed) };
+            v += 256;
+        }
+    }
+
     /// `y[r, c] *= rs[r] * cs[c]` in place on a bf16 matrix.
     /// Requires n % 8 == 0. grid = (rows), block = (256).
     #[kernel]
