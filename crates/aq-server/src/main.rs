@@ -31,8 +31,12 @@
 //!     aq-serve <model> [--host 127.0.0.1] [--port 8000] [--served-model-name NAME]
 //!              [--max-seqs 64] [--max-ctx 32768] [--max-tokens 8192] [--mixed-prefill N]
 //!              [--max-running N] [--session-cache true|false] [--kv-gb X] [--kv-reserve N]
-//!              [--spec-k N] [--vllm-metrics true|false]
+//!              [--spec-k N] [--vllm-metrics true|false] [--cache-slots N]
 //!              [--default-temperature T] [--strict-requests true|false]
+//!
+//! `--cache-slots`: state slots for the session cache beyond `--max-seqs` (parked
+//! conversations, prompt checkpoints, shared-prefix snapshots); each costs the recurrent state
+//! only, no KV pages.
 //!
 //! `--host`: address to listen on (default 127.0.0.1, or `AQ_HOST`; 0.0.0.0 for every
 //! interface).
@@ -973,6 +977,7 @@ async fn main() -> Result<()> {
     // the same throughput (Spark, 16 agents: TTFT p90 2633 -> 1506 ms).
     opts.policy.srpt = true;
     let mut kv_gb = 0f64;
+    let mut cache_slots = 0usize;
     let mut default_temperature = None;
     let mut strict = false;
     while let Some(k) = args.next() {
@@ -1018,6 +1023,7 @@ async fn main() -> Result<()> {
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
             "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
+            "--cache-slots" => cache_slots = v.parse()?,
             "--strict-requests" => strict = v.parse()?,
             "--default-temperature" => default_temperature = Some(v.parse::<f32>()?).filter(|t| *t >= 0.0),
             _ => anyhow::bail!("unknown option {k}"),
@@ -1038,7 +1044,7 @@ async fn main() -> Result<()> {
         defaults.temperature = 0.0;
     }
     eprintln!("default sampling: temperature {} top_p {} top_k {}", defaults.temperature, defaults.top_p, defaults.top_k);
-    let limits = Limits { max_tokens, max_seqs, max_ctx, block_size: 16, kv_budget_bytes: (kv_gb * (1u64 << 30) as f64) as usize, kv_blocks: 0 };
+    let limits = Limits { max_tokens, max_seqs, max_ctx, block_size: 16, kv_budget_bytes: (kv_gb * (1u64 << 30) as f64) as usize, kv_blocks: 0, cache_slots };
     let metrics = Arc::new(Metrics::default());
     let (tx, rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();

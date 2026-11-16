@@ -125,7 +125,9 @@ fn main() -> Result<()> {
         .min(std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192));
     let t0 = Instant::now();
     let budget: usize = std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 8, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
+    // AQ_CHECK_CACHE_SLOTS: run every leg with extra cache-only state slots.
+    let cache_slots: usize = std::env::var("AQ_CHECK_CACHE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 8, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0, cache_slots })?;
     println!(
         "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
         t0.elapsed().as_secs_f64(),
@@ -433,6 +435,84 @@ fn main() -> Result<()> {
             failed |= !ok;
         }
         eng.session_cache = true;
+    }
+
+    // ---- 4c. steady state: every state slot is held by a parked session, as on a server that
+    // has been up for a while. A new conversation must still get its prompt checkpoint, and a
+    // prefix shared between conversations its snapshot (each evicts a parked entry), also when
+    // a snapshot of a shorter common prefix exists already; the resumed turns must match a
+    // cold engine.
+    {
+        // (What this leg checks does not grow with the prompt: 2304 tokens are enough for a
+        // second snapshot behind the 1040-token one.)
+        let ids = &ids[..ids.len().min(2304)];
+        let slots = (eng.limits().max_seqs + eng.limits().cache_slots) as u64;
+        let ckpt = ids.len().saturating_sub(aq_engine::engine::CKPT_BACKOFF) / 16 * 16;
+        let turn2: Vec<u32> = ids[..ids.len() - 1].iter().copied().chain(ids[..ids.len().min(41)].iter().map(|&t| t ^ 6)).collect();
+        let pre = (ids.len().saturating_sub(64)) / 16 * 16;
+        let tail = |k: u32| -> Vec<u32> { ids[..pre].iter().copied().chain(ids[pre..].iter().map(|&t| t ^ k)).collect() };
+        let shared = ids.len() > 1100;
+        let mut run = |eng: &mut Engine, cached: bool| -> Result<(Vec<Vec<u32>>, Vec<usize>)> {
+            eng.session_cache = cached;
+            eng.clear_cache();
+            let mut reqs: Vec<(Vec<u32>, usize)> =
+                (0..slots as u32).map(|k| (ids[..ids.len().min(40)].iter().map(|&t| t ^ (k + 9)).collect(), 2)).collect();
+            if shared {
+                // Two short prompts that share 1040 tokens with each other and with the long
+                // ones: the second snapshots that much. The first long prompt forks it, the
+                // second forks it too and snapshots the long prefix, the third forks that.
+                let short = |k: u32| -> Vec<u32> { ids[..1040].iter().copied().chain(ids[..200].iter().map(|&t| t ^ k)).collect() };
+                reqs.extend([(short(7), 2), (short(8), 2), (tail(1), 4), (tail(2), 4), (tail(3), 12)]);
+            }
+            reqs.extend([(ids.to_vec(), 8), (turn2.clone(), 12)]);
+            let (mut out, mut reused) = (Vec::new(), Vec::new());
+            let last = reqs.len() - 1;
+            for (k, (prompt, n)) in reqs.into_iter().enumerate() {
+                // The cold engine only runs the two requests it is compared on.
+                if !cached && k != last && k != last - 2 {
+                    out.push(Vec::new());
+                    reused.push(0);
+                    continue;
+                }
+                eng.add(Request { id: 300 + k as u64, prompt, max_new_tokens: n, ignore_eos: true })?;
+                let (mut toks, mut hit) = (Vec::new(), 0);
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        toks.push(e.token);
+                        hit = e.cached;
+                    }
+                }
+                out.push(toks);
+                reused.push(hit);
+            }
+            Ok((out, reused))
+        };
+        let (warm, reused) = run(&mut eng, true)?;
+        let (cold, _) = run(&mut eng, false)?;
+        let s = warm.len() - 2;
+        let same = |k: usize| warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
+        let mut ok = (ckpt == 0 || reused[s + 1] > 0) && same(s + 1) == cold[s + 1].len();
+        println!(
+            "steady state (all {slots} slots parked): turn 2 resumed from {} of {} shared prompt tokens; {}/{} tokens identical to a cold engine",
+            reused[s + 1],
+            ids.len() - 1,
+            same(s + 1),
+            cold[s + 1].len()
+        );
+        if shared {
+            // (A second snapshot is taken only where it saves `SNAPSHOT_MIN_TOKENS` more.)
+            let want = if pre >= 1040 + aq_engine::engine::SNAPSHOT_MIN_TOKENS { pre } else { 1024 };
+            ok &= reused[s - 1] >= want && same(s - 1) == cold[s - 1].len();
+            println!(
+                "steady state shared prefix ({pre} tokens, behind a 1040-token snapshot): conversations reused {:?}; {}/{} tokens identical to a cold engine",
+                &reused[s - 3..s],
+                same(s - 1),
+                cold[s - 1].len()
+            );
+        }
+        failed |= !ok;
+        eng.session_cache = true;
+        eng.clear_cache();
     }
 
     // ---- 5. shared-prefix snapshots: three prompts share a long prefix with different tails.

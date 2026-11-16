@@ -65,7 +65,7 @@ See "OpenAI-compatible serving" below for the fields, the flags and the limits.
 
 `aq-serve` speaks the part of the OpenAI HTTP API that clients written for vLLM or for
 OpenAI use. `scripts/serve_check.py` checks everything in this section against a running
-server.
+server; `scripts/cache_replay.py` measures the prompt cache.
 
 Endpoints: `/v1/completions` (text or token-id prompts), `/v1/chat/completions` (the model's
 chat template), `/v1/models`, `/health` (503 once the engine has stopped; the process then
@@ -100,11 +100,53 @@ Flags that matter (the full list is at the top of `crates/aq-server/src/main.rs`
 | `--max-seqs N`, `--max-running N` | Sequences in one step (sizes the step buffers), and how many requests run at once. |
 | `--max-ctx N`, `--max-tokens N` | Context per sequence; prefill tokens per step. |
 | `--kv-gb X`, `--kv-reserve N` | Attention-cache pool, and the output tokens a request reserves in it up front (default 4096; 0 = its whole limit). Past its reservation a request takes pages as it generates; if the pool is dry it waits for the next request to end (new requests queue behind it), and only when every running request is out of pages does one end early with `finish_reason` `length` (`aq_requests_cut_total`). |
+| `--cache-slots N` | State slots for the prompt cache beyond `--max-seqs` (see below). One slot is the recurrent state only: 49 MiB on Qwen3.5-9B, 19 MiB on 0.8B. |
+| `--pin-snapshots`, `--max-snapshots N`, `--evict lru\|mru\|idle`, `--session-cache false` | Cache policy; the defaults are described below. |
 | `--default-temperature T`, `--strict-requests true` | See the table above. |
 
-Limits: with `AQ_COEXEC` or `AQ_BG_PREFILL` (study modes, off by default) tokens are picked
-on the device, so only greedy, unconstrained requests are served, and a request without
-`temperature` is greedy there.
+### Prompt cache
+
+The model carries a recurrent state next to its attention cache, and that state exists only
+at the positions where it was saved. A request can therefore resume from a saved position
+that is a prefix of its prompt, never from the middle of one. Three kinds of entries are
+kept, each in one state slot, sharing attention-cache pages:
+
+- the end of a turn: reused by a client that sends back exactly the tokens it received;
+- a prompt checkpoint, a few tokens before the end of each prompt: reused by a chat client,
+  whose next request renders the conversation again (the previous prompt, then the assistant
+  turn as the template writes it);
+- a shared-prefix snapshot: when a new prompt shares at least 1024 tokens with another
+  sequence (and 1024 more than any snapshot it could fork), the engine saves the state at the
+  end of the shared part. Every later request with that prefix forks it. The system prompt
+  and tool schemas of an agent fleet are computed twice (the second sighting takes the
+  snapshot), then never again; a group of agents that also share a longer prefix gets a
+  second, deeper snapshot.
+
+Slots: `--max-seqs` plus `--cache-slots`. A running request holds one, and a second while it
+decodes with drafts; what is left holds the cache. When none is free, a new checkpoint or
+snapshot takes the slot of a parked entry: first the kind clients have not been coming back
+to (turn ends, for chat clients), in a conversation that holds both, then the least recently
+used conversation. Snapshots are never evicted for a conversation entry; at most
+`--max-snapshots` (4) exist, the least recently forked one is replaced, and
+`--pin-snapshots true` keeps them from being evicted when running requests need slots.
+
+What to expect: with fewer cache slots than conversations, every request still reuses the
+shared prefix, and the conversations beyond the slots recompute their own turns. With a slot
+per conversation, a turn computes only what is new. Measured on Qwen3.5-0.8B (16
+conversations of 10 turns over 5.8k shared tokens, 4 at a time, `--max-seqs 8
+--max-running 4`, after 8 unrelated requests, `scripts/cache_replay.py --warm 8`):
+
+| | cached share of prompt tokens | time to first token p50 / p99 | wall |
+|---|---|---|---|
+| before these changes | 38 % | 829 / 1931 ms | 53.0 s |
+| now | 87 % | 225 / 653 ms | 15.8 s |
+| now, `--cache-slots 24` | 96 % | 109 / 591 ms | 7.2 s |
+
+Limits: a near-duplicate request (same history, another last turn) is computed in full the
+first two times and forks a snapshot from the third on; a prefix shorter than 1024 tokens is
+never snapshotted; with `AQ_COEXEC` or `AQ_BG_PREFILL` (study modes, off by default) tokens
+are picked on the device, so only greedy, unconstrained requests are served, and a request
+without `temperature` is greedy there.
 
 ## Build
 

@@ -211,6 +211,8 @@ struct Parked {
     parked_at: Instant,
     turns: u32,
     sid: u64,
+    /// A prompt checkpoint (state before the end of a prompt) rather than the end of a turn.
+    ckpt: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -366,6 +368,9 @@ pub struct Engine {
     pace: Pace,
     /// Set during an admission that may only evict sessions presumed finished.
     dead_only: bool,
+    /// Resumes from a turn's end [0] and from a prompt checkpoint [1]: which of a session's
+    /// two parked entries clients come back to (see `evict_redundant`).
+    kind_hits: [u64; 2],
     cut_ids: Vec<u64>,
     /// Output tokens whose KV pages a request reserves at admission (default: its whole token
     /// limit, so it can never run out). With a smaller value a request reserves
@@ -395,12 +400,14 @@ impl Engine {
             model,
             waiting: VecDeque::new(),
             running: Vec::new(),
-            free_slots: (0..lim.max_seqs as u32).rev().collect(),
+            // Slot `max_seqs` is the model's dummy slot; the cache-only slots come after it.
+            free_slots: (0..(lim.max_seqs + 1 + lim.cache_slots) as u32).filter(|&s| s != lim.max_seqs as u32).rev().collect(),
             free_blocks: (0..lim.num_blocks() as u32).rev().collect(),
             parked: Vec::new(),
             snapshots: Vec::new(),
             refcnt: vec![0; lim.num_blocks()],
             max_snapshots: 4,
+            kind_hits: [0; 2],
             cut_ids: Vec::new(),
             clock: 0,
             eos,
@@ -490,10 +497,9 @@ impl Engine {
         let mut tap = None;
         if let Some(cp) = s.ckpt_at.filter(|&at| at > start) {
             let c = start + (s.req.prompt.len() - CKPT_BACKOFF - start) / GDN_TC_CHUNK * GDN_TC_CHUNK;
-            if self.model.supports_tap() && n == rem && c > start && !self.free_slots.is_empty() {
-                tap = Some((c, self.free_slots.pop().unwrap()));
-            } else {
-                n = n.min(cp - start);
+            match if self.model.supports_tap() && n == rem && c > start { self.cache_slot() } else { None } {
+                Some(slot) => tap = Some((c, slot)),
+                None => n = n.min(cp - start),
             }
         }
         let (mut b, sampled) = self.build_batch(&[(i, n)])?;
@@ -534,7 +540,7 @@ impl Engine {
         for &b in &blocks {
             self.refcnt[b as usize] += 1;
         }
-        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
+        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid, ckpt: true });
         self.cache.checkpoints += 1;
     }
 
@@ -693,8 +699,48 @@ impl Engine {
         }
     }
 
+    /// A parked session holds up to two entries, its prompt checkpoint and its turn's end, and
+    /// a client comes back to one kind only: the end if it sends back the tokens this engine
+    /// generated, the checkpoint if it renders the conversation again (chat templates). Drop
+    /// the least-recently-used entry of the kind that has been resumed less, among sessions
+    /// that hold both, so that an idle conversation costs one state slot rather than two.
+    fn evict_redundant(&mut self) -> bool {
+        let [end, ckpt] = self.kind_hits;
+        if end == ckpt {
+            return false;
+        }
+        let loser = ckpt < end;
+        let Some(i) = (0..self.parked.len())
+            .filter(|&i| self.parked[i].ckpt == loser && self.parked.iter().any(|q| q.sid == self.parked[i].sid && q.ckpt != loser))
+            .min_by_key(|&i| self.parked[i].last_used)
+        else {
+            return false;
+        };
+        let p = self.parked.swap_remove(i);
+        self.free_slots.push(p.slot);
+        self.release(p.blocks);
+        self.cache.evictions += 1;
+        true
+    }
+
+    /// A state slot for a checkpoint or a snapshot: a free one, else a parked entry's (a
+    /// redundant one first, then the least recently used; never a snapshot's). On a server
+    /// that has been up for a while every slot is parked, and a checkpoint that only took
+    /// free slots would never be made: the newest prompt is worth more than the oldest.
+    /// Under load control only redundant entries go (parked sessions are protected there).
+    fn cache_slot(&mut self) -> Option<u32> {
+        // AQ_NO_CACHE_EVICT=1 (debug): free slots only, the behavior before this function.
+        if self.free_slots.is_empty() && std::env::var_os("AQ_NO_CACHE_EVICT").is_none() && !self.evict_redundant() && !self.policy.load_control {
+            self.evict_lru_parked();
+        }
+        self.free_slots.pop()
+    }
+
     /// Drop the least-recently-used parked session only (never a snapshot).
     fn evict_lru_parked(&mut self) -> bool {
+        if self.evict_redundant() {
+            return true;
+        }
         let Some(i) = (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used) else { return false };
         let p = self.parked.swap_remove(i);
         self.free_slots.push(p.slot);
@@ -732,6 +778,9 @@ impl Engine {
             self.free_slots.push(p.slot);
             self.release(p.blocks);
             self.cache.evictions += 1;
+            return true;
+        }
+        if self.evict_redundant() {
             return true;
         }
         let victim = match self.policy.evict {
@@ -817,7 +866,7 @@ impl Engine {
     /// parked entry with a copy of the state and shared references to the KV pages below it.
     /// Skipped when no state slot is free.
     fn checkpoint(&mut self, i: usize) -> Result<()> {
-        let Some(slot) = self.free_slots.pop() else { return Ok(()) };
+        let Some(slot) = self.cache_slot() else { return Ok(()) };
         let bs = self.limits().block_size;
         let s = &self.running[i];
         let n = s.computed;
@@ -828,7 +877,7 @@ impl Engine {
         for &b in &blocks {
             self.refcnt[b as usize] += 1;
         }
-        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid });
+        self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns, sid, ckpt: true });
         self.cache.checkpoints += 1;
         Ok(())
     }
@@ -879,7 +928,7 @@ impl Engine {
                 self.release(sn.blocks);
             }
         }
-        let Some(slot) = self.free_slots.pop() else { return Ok(()) };
+        let Some(slot) = self.cache_slot() else { return Ok(()) };
         let bs = self.limits().block_size;
         let s = &self.running[i];
         let n = s.computed;
@@ -1025,19 +1074,30 @@ impl Engine {
                 return Ok(false);
             }
         }
-        if best.is_none() && fork.is_none() && self.session_cache {
-            // A running sequence is about to snapshot the prefix this request shares with it:
-            // wait for that snapshot and fork it, rather than prefill the same prefix again
-            // (agents that start together would otherwise each compute the system prompt).
-            let shared = self.shared_prefix(&self.waiting[wi].0.prompt);
-            if shared >= SNAPSHOT_MIN_TOKENS && self.running.iter().any(|s| s.snapshot_at == Some(shared)) {
-                return Ok(false);
-            }
+        // The prefix this request shares with another sequence, when it is worth a snapshot:
+        // at least `SNAPSHOT_MIN_TOKENS` beyond the snapshot it can fork. (A snapshot of a
+        // short common prefix, say the tool schemas alone, must not keep a longer one, the
+        // system prompt after them, from ever being taken.)
+        let deeper = if best.is_none() && self.session_cache {
+            let have = fork.map_or(0, |i| self.snapshots[i].tokens.len());
+            Some(self.shared_prefix(&self.waiting[wi].0.prompt)).filter(|&s| s >= have + SNAPSHOT_MIN_TOKENS)
+        } else {
+            None
+        };
+        // A running sequence is about to snapshot that prefix: wait for the snapshot and fork
+        // it, rather than prefill the same prefix again (agents that start together would
+        // otherwise each compute the system prompt).
+        if deeper.is_some() && self.running.iter().any(|s| s.snapshot_at == deeper) {
+            return Ok(false);
         }
         let mut snapshot_at = None;
         let mut forked = false;
         let mut resident_turns = 0;
         let mut sid = self.waiting[wi].0.id;
+        let best_ckpt = best.is_some_and(|i| self.parked[i].ckpt);
+        if best.is_some() {
+            self.kind_hits[best_ckpt as usize] += 1;
+        }
         let (slot, mut blocks, computed) = if let Some(i) = best {
             resident_turns = self.parked[i].turns;
             sid = self.parked[i].sid;
@@ -1095,15 +1155,11 @@ impl Engine {
                     self.refcnt[b as usize] += 1;
                 }
                 forked = true;
+                snapshot_at = deeper;
                 (slot, blocks, n)
             } else {
                 self.model.reset_slot(slot as usize)?;
-                if self.session_cache {
-                    let shared = self.shared_prefix(&self.waiting[wi].0.prompt);
-                    if shared >= SNAPSHOT_MIN_TOKENS {
-                        snapshot_at = Some(shared);
-                    }
-                }
+                snapshot_at = deeper;
                 (slot, Vec::new(), 0)
             }
         };
@@ -1130,7 +1186,7 @@ impl Engine {
                 // back (or release the fresh slot) and wait for running sequences to finish.
                 if best.is_some() {
                     let tokens = self.waiting[wi].0.prompt[..computed].to_vec();
-                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns, sid });
+                    self.parked.push(Parked { tokens, slot, blocks, last_used: self.clock, parked_at: Instant::now(), turns: resident_turns, sid, ckpt: best_ckpt });
                 } else {
                     self.free_slots.push(slot);
                     self.release(blocks);
@@ -1283,7 +1339,7 @@ impl Engine {
                 let keep = s.computed.div_ceil(bs).min(s.blocks.len());
                 let extra = s.blocks.split_off(keep);
                 self.release(extra);
-                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now(), turns: s.turns + 1, sid: s.sid });
+                self.parked.push(Parked { tokens, slot: s.slot, blocks: s.blocks, last_used: self.clock, parked_at: Instant::now(), turns: s.turns + 1, sid: s.sid, ckpt: false });
             } else {
                 self.free_slots.push(s.slot);
                 self.release(s.blocks);
@@ -1624,10 +1680,9 @@ impl Engine {
                 // the state at the last 64-token chunk boundary before the backoff. Otherwise
                 // stop at the page-aligned checkpoint position and take it between steps.
                 let c = start + (s.req.prompt.len() - CKPT_BACKOFF - start) / GDN_TC_CHUNK * GDN_TC_CHUNK;
-                if can_tap && n == rem && c > start && !self.free_slots.is_empty() {
-                    taps.push((plan.len(), c, self.free_slots.pop().unwrap()));
-                } else {
-                    n = n.min(cp - start);
+                match if can_tap && n == rem && c > start { self.cache_slot() } else { None } {
+                    Some(slot) => taps.push((plan.len(), c, slot)),
+                    None => n = n.min(cp - start),
                 }
             }
             plan.push((i, n));

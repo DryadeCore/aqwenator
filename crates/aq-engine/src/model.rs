@@ -185,6 +185,9 @@ pub struct Limits {
     pub kv_budget_bytes: usize,
     /// Pages in the pool, resolved at load time from the budget.
     pub kv_blocks: usize,
+    /// Recurrent-state slots beyond `max_seqs`, for the session cache only (parked sessions,
+    /// prompt checkpoints, shared-prefix snapshots). A slot costs the state alone, no KV pages.
+    pub cache_slots: usize,
 }
 
 impl Limits {
@@ -549,8 +552,8 @@ impl Model {
                     layer.gnorm = gpu.alloc_upload(&ck.f32_vec(&la("norm.weight"))?)?;
                     layer.out_proj = gemm_weight(&mut gpu, &ck, &[la("out_proj.weight")], 0, cfg.value_dim(), q('o'))?;
                     let t = Instant::now();
-                    layer.delta_state = gpu.alloc((lim.max_seqs + 1) * hv * 128 * 128 * 4)?;
-                    layer.conv_state = gpu.alloc((lim.max_seqs + 1) * cfg.conv_dim() * 3 * 2)?;
+                    layer.delta_state = gpu.alloc((lim.max_seqs + 1 + lim.cache_slots) * hv * 128 * 128 * 4)?;
+                    layer.conv_state = gpu.alloc((lim.max_seqs + 1 + lim.cache_slots) * cfg.conv_dim() * 3 * 2)?;
                     gpu.sync()?;
                     state_s += t.elapsed().as_secs_f64();
                 }
@@ -655,7 +658,7 @@ impl Model {
             weight_bytes as f64 / (1u64 << 30) as f64,
             lim.num_blocks(),
             lim.num_blocks() * lim.block_size,
-            lim.max_seqs,
+            lim.max_seqs + lim.cache_slots,
             cfg.state_bytes_per_seq() as f64 / (1 << 20) as f64
         );
 
