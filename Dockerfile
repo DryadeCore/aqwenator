@@ -57,6 +57,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # libcublasLt.so.13 and the NVIDIA driver on the host.
 FROM scratch AS binaries
 COPY --from=build /out/ /
+COPY LICENSE /
 
 FROM ${CUDA_BASE}
 # cuBLASLt is the only toolkit library the engine links; libcuda comes from the host driver.
@@ -64,6 +65,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libcublas-13-0 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/bin/
+COPY LICENSE /usr/share/doc/aqwenator/LICENSE
 # Not root: the server only reads the model cache and listens on a high port.
 RUN useradd --create-home --uid 10001 aq
 USER aq
