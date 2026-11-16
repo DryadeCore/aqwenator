@@ -278,6 +278,16 @@ bf16 copy freed (`gpu::Weight`); activations quantized per row before each GEMM
 - Exact gate: 9B golden passes; resume-vs-cold identity checks fail on 0.8B and 9B-long
   (the decode and prefill paths now differ by quantization noise, not ulps).
 
+**Tiers on real traces** (Spark, 16 agents, 5 min each, same binary, 2026-11-16 02:10-02:36;
+`AQ_QUANT=fp8|int8` replaced `AQ_FP8`):
+
+| Tier | Turns/min | Tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
+|---|---|---|---|---|
+| bf16 | 92.6 | 224 | 450 / 6040 | 50.9 / 126.2 |
+| bf16 (second run) | 93.2 | 231 | 478 / 5146 | 50.5 / 110.4 |
+| fp8 (layers) | 106.2 | 293 | 397 / 3748 | 40.7 / 98.0 |
+| int8 (layers, whole-weight expansion) | 70.6 | 150 | 709 / 5371 | 84.5 / 181.3 |
+
 **Quality** is measured teacher-forced against transformers on three real trace turns (8k,
 16k, 26k prompt tokens, 256 greedy tokens each; `scripts/golden.py --ids-file`, goldens
 `~/aq/golden/qwen35-9b-trace-{a,b,c}.safetensors` on the Spark; `aq-check` prints

@@ -24,7 +24,7 @@ for env in "AQ_GATE=1" "AQ_SRPT=1 AQ_BURST_PREFILL=2048 AQ_BURST_EVERY=2" "AQ_CH
   for g in "$GOLDEN"/*.safetensors; do
     case $(basename "$g") in *trace*) continue ;; esac
     # qwen35-9b-long.safetensors -> Qwen/Qwen3.5-9B, looked up among the cached models
-    stem=$(basename "$g" .safetensors | sed -E 's/-(long|16k)$//')
+    stem=$(basename "$g" .safetensors | sed -E 's/-(long|16k)$//; s/\.//g')
     model=$(ls -d "${HF_HOME:-$HOME/.cache/huggingface}"/hub/models--"$ORG"--* 2>/dev/null | sed 's/.*models--//; s/--/\//' | awk -v s="$stem" '{ m = tolower($0); sub(/.*\//, "", m); gsub(/\./, "", m); if (m == s) print }' | head -1)
     [ -n "$model" ] || { echo "no cached model for $g"; fail=$((fail + 1)); continue; }
     run "$env" "$g" "$model" pass
