@@ -15,7 +15,7 @@ model's chat template and tools), per full-attention layer and query head:
                (below fp32 accumulation error), and tau_bf16 = ln(n_keys) + 12 ln 2 (below
                bf16 output precision; not exact).
 
-    python tools/attn_sparsity.py --model Qwen/Qwen3.5-0.8B --trace rows.json --len 16384 --out out.json
+    python scripts/study/attn_sparsity.py --model Qwen/Qwen3.5-0.8B --trace rows.json --len 16384 --out out.json
 
 `rows.json` is a page of nebius/SWE-rebench-openhands-trajectories from the datasets server:
     https://datasets-server.huggingface.co/rows?dataset=nebius/SWE-rebench-openhands-trajectories&config=default&split=train&offset=0&length=3

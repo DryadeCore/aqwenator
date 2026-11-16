@@ -4,7 +4,7 @@ Each prompt is a chat-templated user turn (thinking disabled) that shows a sourc
 for it back with a small edit, so most of the answer repeats the context. Writes a JSON list of
 token-id lists for `aq-bench --prompts-file`.
 
-    python -I tools/make_quote_prompts.py --model Qwen/Qwen3.5-9B --out ~/aq/prompts/quote.json \\
+    python -I scripts/study/make_quote_prompts.py --model Qwen/Qwen3.5-9B --out ~/aq/prompts/quote.json \\
         --files crates/aq-engine/src/engine.rs crates/aq-engine/src/gpu.rs --max-lines 80
 """
 

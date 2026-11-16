@@ -4,7 +4,7 @@ Everything below this section describes main as of 2026-11-13. Since then all wo
 `mythos-review` (worktree `.claude/worktrees/mythos-review`), which contains main, the
 memory-policy lane, and:
 
-- **Real-trace benchmark** (`tools/trace_bench.py`, `tools/trace_sweep.sh`): replay of recorded
+- **Real-trace benchmark** (`scripts/trace_bench.py`, `scripts/trace_sweep.sh`): replay of recorded
   OpenHands trajectories. This replaced the synthetic agentic sweep as the benchmark that
   matters. Traces: `~/aq/traces-9b-40.json` on the Spark and the B200.
 - **Serving**: prompt checkpoints, in-kernel state tap, wider prefill attention tiles,
@@ -56,7 +56,7 @@ So the MTP head is on by default when the checkpoint has one (`AQ_MTP=0` disable
 background prefill lane (`AQ_BG_PREFILL=4096`) stays opt-in: on the B200 it cuts the 16-agent
 TTFT p99 from 1236 ms to 351-378 ms (the tail there is head-of-line blocking behind 20-30k-token
 first turns), but on the Spark, which has no spare GPU capacity for a second stream, it costs
-throughput and does not help the tail. `tools/trace_tail.py` dissects the tail from AQ_TRACE logs.
+throughput and does not help the tail. `scripts/trace_tail.py` dissects the tail from AQ_TRACE logs.
 
 Same-window head-to-head on the Spark (both with MTP speculation, 5 min per leg, 2026-11-15):
 
@@ -279,7 +279,7 @@ bf16 copy freed (`gpu::Weight`); activations quantized per row before each GEMM
   (the decode and prefill paths now differ by quantization noise, not ulps).
 
 **Quality** is measured teacher-forced against transformers on three real trace turns (8k,
-16k, 26k prompt tokens, 256 greedy tokens each; `tools/golden.py --ids-file`, goldens
+16k, 26k prompt tokens, 256 greedy tokens each; `scripts/golden.py --ids-file`, goldens
 `~/aq/golden/qwen35-9b-trace-{a,b,c}.safetensors` on the Spark; `aq-check` prints
 KL(ref||ours)). Mean KL in nats over the three, and top-1 agreement out of 768:
 
@@ -330,7 +330,7 @@ ITL p99.9 spikes) should become defaults; idle-aware eviction, load control with
 25 ms frame pacing are not worth it. Best variants still trail vLLM at 16/32 agents (163 vs 189,
 92 vs 188 turns/min); the remaining gap is long-context decode attention (~1 TB/s effective, ITL p50
 11.5 vs 5.8 ms at 16 agents / 18k ctx) and re-prefill throughput. Its gate auto-runs on the B200 when
-the driver recovers: `~/aq/logs/mem_gate.log`; sweeps: `tools/agentic_sweep_mem.sh`.
+the driver recovers: `~/aq/logs/mem_gate.log`; sweeps: `a local sweep script`.
 
 ## What exists (main @ 7771327, all gated)
 - Rust workspace: `aq-kernels` (cuda-oxide `#[cuda_module]` kernels), `aq-engine` (model, scheduler,
@@ -349,7 +349,7 @@ the driver recovers: `~/aq/logs/mem_gate.log`; sweeps: `tools/agentic_sweep_mem.
 
 ## Correctness (the #1 rule)
 `aq-check <model> <golden>` compares against transformers references in `~/aq/golden/*.safetensors`
-(made by `tools/golden.py`): teacher-forced logits at every generated position, free-running and
+(made by `scripts/golden.py`): teacher-forced logits at every generated position, free-running and
 batched greedy, session resume, shared-prefix fork. Divergences are classified by top-2 margin
 (near-tie < 0.25). Always run the full suite: 6 goldens × {default, `AQ_CHECK_BUDGET=1000
 AQ_CHECK_CHUNK=777`} (the odd budget found a real upload/compute stream race), plus `AQ_SPEC_K=4`.
@@ -358,7 +358,7 @@ AQ_CHECK_CHUNK=777`} (the odd budget found a real upload/compute stream race), p
 ## Open branches (not merged)
 - `worktree-agent-ae9e174bba1af161f` @ d7e410c — lossless KV compression (400 B rows, 1.28× tokens,
   logits byte-identical to raw). Rebased on 7771327, opt-in (`AQ_KV_COMPRESS=1`). **Gate not yet run**
-  (B200 driver hang): run `tools/kvc_gate.sh` before merging. Decode attention is ~2.3× slower than
+  (B200 driver hang): run `scripts/kvc_gate.sh` before merging. Decode attention is ~2.3× slower than
   raw, so it only pays when capacity avoids evictions (memory-tight agentic runs, the Spark).
 - `worktree-agent-ada1630c33961379c` — memory policy / scheduler lane; **contains the stale-fork-index correctness fix** (see top). Eviction policies, snapshot
   pinning, load control, SRPT). See its final report / commit messages; results in
@@ -371,24 +371,26 @@ AQ_CHECK_CHUNK=777`} (the odd budget found a real upload/compute stream race), p
   mixed steps are ~30% cheaper on GB10 (profile Spark prefill next). Cold start 6 s vs vLLM 163 s.
 - Agentic (B200, 9B, 32 GB budget): we win at 4 agents, lose at 8–32 (memory policy; 32 agents
   collapses). Spark agentic head-to-head was running at handoff: results in
-  `~/aq/results/agentic/spark-*` on the Spark (`scripts/spark.sh`), log `~/aq/logs/run_spark_queue.log`.
+  `~/aq/results/agentic/spark-*` on the Spark, log `~/aq/logs/run_spark_queue.log`.
   It uses a pre-speculation build (`aq-serve-current` = session cache only).
 - Progress page: https://claude.ai/artifact/MNkgXru1gcTGbZz3Zw3zwN (data files under `docs/progress/`,
-  regenerate `bench.json`/`agentic.json` with `tools/collect.py`, `AQ_GPU_LABEL=GB10` on the Spark).
+  regenerate `bench.json`/`agentic.json` with `scripts/collect.py`, `AQ_GPU_LABEL=GB10` on the Spark).
 
 ## Machines and gotchas
-- B200 (shared, `scripts/b200.sh`, `scripts/sync.sh` with `AQ_REMOTE_DIR` for a separate checkout):
-  no sudo/docker; toolchain in `~/aq/env`; `source ~/aq/src/scripts/remote/env.sh`; build
-  `cargo oxide build --arch sm_100a -- --release -p aq-engine -p aq-server --bins`. GPU driver was
-  hung at handoff (nvidia-smi in D state). Never `pkill`/`pgrep -f` (self-matches, shared users);
-  kill only your own PIDs; use `grep "[p]attern"` in wait loops.
-- DGX Spark (`ssh $AQ_REMOTE`, `scripts/spark.sh`, `scripts/spark_sync.sh`):
-  also runs other services; build with
-  `--arch sm_121a`; `source ~/aq/src/scripts/spark/env.sh`.
-- Nsight Compute counters are blocked on the B200 (`ERR_NVGPUCTRPERM`); use `AQ_PROFILE=1|decode|prefill`
+- Two machines were used: a B200 box (x86_64, `sm_100`, shared with other users) and a DGX Spark
+  (aarch64, `sm_121`, unified memory). How to reach them is not in this repo; ssh wrappers and
+  sync scripts live in an untracked `.local/` directory.
+- Both use the user-space toolchain from `scripts/setup.sh` under `~/aq`; `source scripts/env.sh`,
+  then `cargo oxide build --arch sm_80 -- --release -p aq-engine -p aq-server --bins` (the
+  numbers in this file were measured with `--arch sm_100a` / `sm_121a` builds; `sm_80` runs at
+  the same speed).
+- On a shared machine: never `pkill`/`pgrep -f` (self-matches, other users); kill only your own
+  PIDs; use `grep "[p]attern"` in wait loops; pick an idle GPU first.
+- Nsight Compute counters may be blocked (`ERR_NVGPUCTRPERM`); use `AQ_PROFILE=1|decode|prefill`
   (CUDA events, works inside graphs) and `AQ_KINFO=1` (registers/spills per kernel).
-- vLLM baselines: `tools/baseline_vllm.sh` (readiness wait 900 s, `--temperature 0`),
-  `tools/agentic_sweep.sh`, `tools/agentic_bench.py`.
+- vLLM baselines: `scripts/baseline_vllm.sh` (readiness wait 900 s, `--temperature 0`),
+  `scripts/agentic_sweep.sh`, `scripts/agentic_bench.py`.
+- Correctness gate: `scripts/gate.sh <aq-check> <reference dir>`.
 
 ## Research
 `docs/research/sota-survey.md`, `docs/research/moonshots.md`, `docs/research/compression-and-skinny-gemm.md`.

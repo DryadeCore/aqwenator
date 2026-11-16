@@ -14,7 +14,7 @@ seconds:
   inter-token latency and time per output token (p50/p90/p99/p99.9)
   turns/min, generated tokens/s, new prompt tokens/s, context length reached
 
-    python tools/agentic_bench.py --url http://localhost:8000 --model Qwen/Qwen3.5-9B \\
+    python scripts/agentic_bench.py --url http://localhost:8000 --model Qwen/Qwen3.5-9B \\
         --agents 16 --system-len 4096 --task-len 1024 --tool-len 512:4096 --gen-len 256 \\
         --think-ms 500:3000 --max-ctx 32768 --warmup 60 --duration 300 --out results.json
 """

@@ -3,7 +3,7 @@ target/
 .claude/
 .github/
 docs/
-tools/
+scripts/
 bench-results/
 *.safetensors
 *.oxart

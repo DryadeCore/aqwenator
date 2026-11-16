@@ -8,8 +8,8 @@ Writes one safetensors file holding:
   tf_logits          teacher-forced logits at every generated position: row k is the
                      distribution for greedy_ids[k] given prompt + greedy_ids[:k]  (fp32)
 
-    python -I tools/golden.py --model Qwen/Qwen3.5-0.8B --out ~/aq/golden/qwen35-0.8b.safetensors
-    python -I tools/golden.py --model Qwen/Qwen3.5-9B --len 16384 --no-hidden --attn sdpa --out ...
+    python -I scripts/golden.py --model Qwen/Qwen3.5-0.8B --out ~/aq/golden/qwen35-0.8b.safetensors
+    python -I scripts/golden.py --model Qwen/Qwen3.5-9B --len 16384 --no-hidden --attn sdpa --out ...
 """
 
 import argparse

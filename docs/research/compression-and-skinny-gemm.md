@@ -1,6 +1,6 @@
 # Lossless compression and skinny decode GEMMs: results
 
-B200 (GPU 7), Qwen3.5-9B, 2026-11-13. Tools: `tools/compress_study.py`, `AQ_SKINNY`.
+B200 (GPU 7), Qwen3.5-9B, 2026-11-13. Tools: `scripts/study/compress_study.py`, `AQ_SKINNY`.
 
 ## 1. Compressibility (12-bit PFOR-style bf16 format)
 

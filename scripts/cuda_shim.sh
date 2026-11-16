@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Build ~/aq/cuda-shim: a CUDA_HOME layout (bin, include, lib64 with unversioned .so names,
+# Build $AQ_HOME/cuda-shim (default ~/aq): a CUDA_HOME layout (bin, include, lib64 with unversioned .so names,
 # nvvm) made of symlinks into the CUDA 13 toolkit that ships with torch's pip wheels, so
 # vLLM/FlashInfer JIT builds compile and link against exactly what torch was built with.
+# Only needed for the vLLM baselines on a machine without a system CUDA 13 toolkit.
 set -euo pipefail
-SRC=$HOME/aq/venv-ref/lib/python3.12/site-packages/nvidia/cu13
-DST=$HOME/aq/cuda-shim
+AQ_HOME=${AQ_HOME:-$HOME/aq}
+SRC=$(echo "${AQ_VENV:-$AQ_HOME/venv-ref}"/lib/python3.*/site-packages/nvidia/cu13)
+DST=$AQ_HOME/cuda-shim
 rm -rf "$DST"
 mkdir -p "$DST/lib64"
 ln -s "$SRC/bin" "$DST/bin"

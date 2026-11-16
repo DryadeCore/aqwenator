@@ -1,4 +1,4 @@
-//! Correctness check against transformers reference data (tools/golden.py).
+//! Correctness check against transformers reference data (scripts/golden.py).
 //!
 //!     aq-check <model id or dir> <golden.safetensors>
 //!

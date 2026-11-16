@@ -1,7 +1,7 @@
 """Collect benchmark JSONs from ~/aq/results into flat files for the progress page.
 
-    python -I tools/collect.py ~/aq/results > bench.json
-    python -I tools/collect.py ~/aq/results agentic > agentic.json
+    python -I scripts/collect.py ~/aq/results > bench.json
+    python -I scripts/collect.py ~/aq/results agentic > agentic.json
 
 Rows: engine, model, input_len, output_len, concurrency, output_tok_s, ttft_p50_ms,
 ttft_p99_ms, tpot_p50_ms, itl_p99_ms, run (file stem), gpu, date (file mtime, UTC).

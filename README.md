@@ -51,14 +51,15 @@ docker build --target binaries --output type=local,dest=bin .       # binaries o
 ```
 
 Without Docker: CUDA 13 toolkit, clang 21, Rust 1.99.1 and `cargo-oxide` (see
-`scripts/spark/setup.sh`), then
+`scripts/setup.sh`), then
 
 ```sh
+source scripts/env.sh
 cargo oxide build --arch sm_80 -- --release -p aq-engine -p aq-server --bins
 ```
 
 Binaries: `aq-serve` (server), `aq-check` (correctness against reference data from
-`tools/golden.py`), `aq-bench` (synthetic load), `aq-ceiling` (hardware limits: memory
+`scripts/golden.py`), `aq-bench` (synthetic load), `aq-ceiling` (hardware limits: memory
 bandwidth, GEMM rate, and what they allow per step).
 
 ## Release

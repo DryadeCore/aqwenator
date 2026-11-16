@@ -1,6 +1,6 @@
 """Which requests make up the time-to-first-token tail of an aq-serve run.
 
-Usage: python tools/trace_tail.py <server.log>   (server started with AQ_TRACE=1)
+Usage: python scripts/trace_tail.py <server.log>   (server started with AQ_TRACE=1)
 Reads the `[req]` lines: prompt and reused tokens, queue wait, time to first token and the
 steps the request took part in; prints the slowest requests and the tail by new-token bucket.
 """

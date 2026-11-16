@@ -15,9 +15,9 @@ recorded assistant turn had. So the benchmark has
     A server that can only resume from "prompt + my own output" misses on every turn.
 
 Step 1, once (downloads and tokenizes; needs `transformers`):
-    python tools/trace_bench.py prepare --model Qwen/Qwen3.5-9B --trajectories 40 --max-ctx 32768 --out traces-9b.json
+    python scripts/trace_bench.py prepare --model Qwen/Qwen3.5-9B --trajectories 40 --max-ctx 32768 --out traces-9b.json
 Step 2:
-    python tools/trace_bench.py run --traces traces-9b.json --url http://localhost:8000 --model Qwen/Qwen3.5-9B \\
+    python scripts/trace_bench.py run --traces traces-9b.json --url http://localhost:8000 --model Qwen/Qwen3.5-9B \\
         --agents 16 --think-ms 500:3000 --warmup 60 --duration 300 --out result.json
 """
 

@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
-# vLLM baseline sweep on one GPU of the shared B200 box.
-# Usage: tools/baseline_vllm.sh <model> <tag> [gpu]
+# vLLM baseline sweep (synthetic prompts) on one GPU.
+# Usage: scripts/baseline_vllm.sh <model> <tag> [gpu]
 #   CONC="1 4 8 16 32 64"      concurrency levels
 #   SHAPES="1024:256 8192:512" input:output token lengths
-# Writes vllm bench JSON results to ~/aq/results/baseline/<tag>/.
+#   AQ_HOME=~/aq  AQ_VENV=$AQ_HOME/venv-ref (see scripts/setup_ref.sh)
+# Writes vllm bench JSON results to $AQ_HOME/results/baseline/<tag>/.
 set -euo pipefail
 MODEL=$1
 TAG=$2
 GPU=${3:-0}
 CONC=${CONC:-"1 4 8 16 32 64"}
 SHAPES=${SHAPES:-"1024:256 8192:512"}
-OUT=$HOME/aq/results/baseline/$TAG
+AQ_HOME=${AQ_HOME:-$HOME/aq}
+OUT=$AQ_HOME/results/baseline/$TAG
 PORT=$((18000 + GPU))
 mkdir -p "$OUT"
-source ~/aq/venv-ref/bin/activate
+source "${AQ_VENV:-$AQ_HOME/venv-ref}/bin/activate"
 # vLLM JIT-compiles some kernels (flashinfer); use the CUDA 13 toolkit that ships with torch's
 # pip wheels so headers and libs match the torch build.
-if [ -d /usr/local/cuda-13.0 ] && [ ! -d "$HOME/aq/cuda-shim" ]; then
-  export CUDA_HOME=/usr/local/cuda-13.0   # e.g. the DGX Spark: a system toolkit exists
+if [ -d /usr/local/cuda/include ] && [ ! -d "$AQ_HOME/cuda-shim" ]; then
+  export CUDA_HOME=/usr/local/cuda        # a system toolkit exists
 else
-  export CUDA_HOME=$HOME/aq/cuda-shim     # B200: built by scripts/remote/make_cuda_shim.sh
+  export CUDA_HOME=$AQ_HOME/cuda-shim     # built by scripts/cuda_shim.sh
   # conda's GCC 15 headers are too new for CUDA 13.0's front end; use the system GCC 13.
   export NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-13"
 fi

@@ -8,8 +8,8 @@ Format (per group of G values, bf16 = sign:1 | exponent:8 | mantissa:7):
   patches  per escape   : 16-bit in-group index + 8-bit exponent (24 bits, upper bound)
 Bits/value = 8 + b + 8/G + 24 * escape_rate. Roundtrip is checked bit-exactly.
 
-    python -I tools/compress_study.py weights <model dir>           # all bf16 tensors
-    python -I tools/compress_study.py kv <model id> <golden.safetensors> [layers]
+    python -I scripts/study/compress_study.py weights <model dir>           # all bf16 tensors
+    python -I scripts/study/compress_study.py kv <model id> <golden.safetensors> [layers]
 """
 
 import glob
