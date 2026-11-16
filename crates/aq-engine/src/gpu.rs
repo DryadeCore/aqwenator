@@ -62,6 +62,8 @@ pub struct Gpu {
     /// Per lane: bf16 buffer an int8 weight is expanded into for its GEMM, and its size.
     wtmp: Vec<u64>,
     wtmp_bytes: usize,
+    /// AQ_I8_CHUNK: rows of an int8 weight expanded and multiplied at a time (0 = `i8_rows`).
+    i8_chunk: usize,
     /// AQ_QSIM diagnostic: 8-bit round trip of (weights, activations); 0 = off, 1 = E4M3,
     /// 2 = int8. Everything still runs as bf16 GEMMs.
     pub qsim: (u32, u32),
@@ -203,6 +205,7 @@ impl Gpu {
             x8_dims: (0, 0),
             wtmp: Vec::new(),
             wtmp_bytes: 0,
+            i8_chunk: std::env::var("AQ_I8_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             qsim: {
                 // e.g. AQ_QSIM=w:f, a:i, wa:i (f = E4M3, i = int8 per row, b = int8 per block of 32)
                 let v = std::env::var("AQ_QSIM").unwrap_or_default();
@@ -302,9 +305,18 @@ impl Gpu {
         Ok(())
     }
 
-    /// Size the per-lane buffer int8 weights are expanded into: the largest such weight.
-    pub fn enable_int8(&mut self, max_weight_elems: usize) -> Result<()> {
-        self.wtmp_bytes = max_weight_elems * 2;
+    /// Rows of an int8 weight expanded and multiplied at a time. Expanding a chunk and
+    /// multiplying it right away keeps the bf16 copy within the cache's reach: on the DGX
+    /// Spark (9B, 16 x 16k) 1024 rows gave 192 ms between tokens, the whole weight 234 ms,
+    /// 512 and 2048 rows less throughput, and uneven chunk sizes 243 ms.
+    fn i8_rows(&self) -> usize {
+        if self.i8_chunk > 0 { self.i8_chunk } else { 1024 }
+    }
+
+    /// Size the per-lane buffer that chunks of int8 weights (of at most `k_max` columns) are
+    /// expanded into.
+    pub fn enable_int8(&mut self, k_max: usize) -> Result<()> {
+        self.wtmp_bytes = self.i8_rows() * k_max * 2;
         for _ in self.wtmp.len()..self.streams.len() {
             let w = self.alloc(self.wtmp_bytes)?;
             self.wtmp.push(w);
@@ -441,11 +453,22 @@ impl Gpu {
         .max(m);
         let s = self.raw_stream();
         if w.fmt == Fmt::Int8 {
-            // Expand to bf16 (exactly what the weight stands for), then the bf16 GEMM.
+            // Expand to bf16 (exactly what the weight stands for), then the bf16 GEMM, in
+            // chunks of rows small enough for the expansion to stay in cache.
+            anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "int8 weights write bf16");
             let tmp = self.wtmp[self.lane];
-            anyhow::ensure!(n * k * 2 <= self.wtmp_bytes, "int8 weight larger than its expansion buffer");
-            unsafe { self.k.dequant_i8b(&self.stream, cfg((n as u32, 1, 1), 256), w.p as *const u8, w.scale as *const u16, tmp as *mut u16, k as u32) }.map_err(de)?;
-            return self.lt.gemm(s, mb, n, k, x, tmp, y, out_ty);
+            let nc = self.i8_rows().min(n);
+            anyhow::ensure!(nc * k * 2 <= self.wtmp_bytes, "int8 weight chunk larger than its expansion buffer");
+            for c in (0..n).step_by(nc) {
+                let rows = nc.min(n - c);
+                unsafe {
+                    let blocks = (rows * k / 32) as u32;
+                    self.k.dequant_i8b(&self.stream, cfg((blocks.div_ceil(256), 1, 1), 256), (w.p + (c * k) as u64) as *const u8, (w.scale + (c * k / 32 * 2) as u64) as *const u16, tmp as *mut u16, blocks)
+                }
+                .map_err(de)?;
+                self.lt.gemm_rows(s, mb, rows, k, x, tmp, y + (c * 2) as u64, n)?;
+            }
+            return Ok(());
         }
         if w.fmt == Fmt::Bf16 {
             if self.qsim.1 > 0 {

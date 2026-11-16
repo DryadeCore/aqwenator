@@ -518,29 +518,29 @@ pub mod kernels {
         }
     }
 
-    /// Inverse of `quant_i8b`: `out = bf16(q * bmax / 127)`. grid = (rows), block = (256).
+    /// Inverse of `quant_i8b` over `blocks` blocks of 32 elements (rows are contiguous, so a
+    /// matrix is just `n * k / 32` blocks): `out = bf16(q * bmax / 127)`, one block per thread.
+    /// grid = (ceil(blocks / 256)), block = (256).
     #[kernel]
-    pub unsafe fn dequant_i8b(q: *const u8, bmax: *const u16, out: *mut u16, k: u32) {
-        let nb = k as usize / 32;
-        let r = thread::blockIdx_x() as usize;
-        let mut b = thread::threadIdx_x() as usize;
-        while b < nb {
-            let s = bf16_to_f32(unsafe { *bmax.add(r * nb + b) }) * (1.0 / 127.0);
-            let qv = unsafe { q.add((r * nb + b) * 32) }.cast::<u64>();
-            let ov = unsafe { out.cast::<U32x4>().add((r * nb + b) * 4) };
+    pub unsafe fn dequant_i8b(q: *const u8, bmax: *const u16, out: *mut u16, blocks: u32) {
+        let b = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if b >= blocks as usize {
+            return;
+        }
+        let s = bf16_to_f32(unsafe { *bmax.add(b) }) * (1.0 / 127.0);
+        let qv = unsafe { q.add(b * 32) }.cast::<u64>();
+        let ov = unsafe { out.cast::<U32x4>().add(b * 4) };
+        #[unroll]
+        for j in 0..4 {
+            let v = unsafe { *qv.add(j) };
+            let mut packed = [0u32; 4];
             #[unroll]
-            for j in 0..4 {
-                let v = unsafe { *qv.add(j) };
-                let mut packed = [0u32; 4];
-                #[unroll]
-                for e in 0..4 {
-                    let q0 = (v >> (16 * e)) as u8 as i8 as f32;
-                    let q1 = (v >> (16 * e + 8)) as u8 as i8 as f32;
-                    packed[e] = pk(q0 * s, q1 * s);
-                }
-                unsafe { *ov.add(j) = U32x4::new(packed) };
+            for e in 0..4 {
+                let q0 = (v >> (16 * e)) as u8 as i8 as f32;
+                let q1 = (v >> (16 * e + 8)) as u8 as i8 as f32;
+                packed[e] = pk(q0 * s, q1 * s);
             }
-            b += 256;
+            unsafe { *ov.add(j) = U32x4::new(packed) };
         }
     }
 

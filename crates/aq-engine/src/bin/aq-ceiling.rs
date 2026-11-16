@@ -52,9 +52,11 @@ fn main() -> Result<()> {
     let mut gb = 2usize;
     let mut out = None;
     let mut distinct = false;
+    let mut i8chunk = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--distinct" => distinct = true,
+            "--i8chunk" => i8chunk = true,
             "--gb" => gb = it.next().context("--gb N")?.parse()?,
             "--out" => out = it.next(),
             _ => model = Some(a),
@@ -124,6 +126,56 @@ fn main() -> Result<()> {
         sq_rows.push(json!({"n": n, "ms": t * 1e3, "tflops": tf}));
         if t > 0.05 {
             break;
+        }
+    }
+
+    // ---- int8 weights expanded to bf16 in chunks of rows, each chunk multiplied right away
+    // (`--i8chunk`): which chunk size is fastest?
+    if i8chunk {
+        use aq_engine::gpu::Fmt;
+        let (n, k) = (24576usize, 4096usize);
+        let wb = g.alloc(n * k * 2)?;
+        g.sync()?;
+        let w8 = g.quantize_weight(wb, n, k, Fmt::Int8, true)?;
+        let tmp = g.alloc(n * k * 2)?;
+        let x = g.alloc(512 * k * 2)?;
+        let y = g.alloc(512 * n * 2)?;
+        g.sync()?;
+        let stream = g.raw_stream();
+        let st = g.stream.clone();
+        for m in [16usize, 64, 128] {
+            g.lt.gemm(stream, m, n, k, x, wb, y, CUDA_R_16BF)?;
+            let t16 = best(&mut g, 5, |g| g.lt.gemm(stream, m, n, k, x, wb, y, CUDA_R_16BF))?;
+            println!("i8chunk M={m}: bf16 GEMM {:.3} ms ({:.0} GB/s of weights)", t16 * 1e3, (n * k * 2) as f64 / t16 / 1e9);
+            for nc in [n, 8192, 4096, 2048, 1024, 512, 256, 128] {
+                g.lt.gemm(stream, m, nc, k, x, tmp, y, CUDA_R_16BF)?;
+                let t = best(&mut g, 5, |g| {
+                    for c in (0..n).step_by(nc) {
+                        unsafe {
+                            g.k.dequant_i8b(&st, cfg((((nc * k / 32) as u32).div_ceil(256), 1, 1), 256), (w8.p + (c * k) as u64) as *const u8, (w8.scale + (c * k / 32 * 2) as u64) as *const u16, tmp as *mut u16, (nc * k / 32) as u32)
+                        }
+                        .map_err(de)?;
+                        g.lt.gemm(stream, m, nc, k, x, tmp, y, CUDA_R_16BF)?;
+                    }
+                    Ok(())
+                })?;
+                let td = best(&mut g, 5, |g| {
+                    for c in (0..n).step_by(nc) {
+                        unsafe {
+                            g.k.dequant_i8b(&st, cfg((((nc * k / 32) as u32).div_ceil(256), 1, 1), 256), (w8.p + (c * k) as u64) as *const u8, (w8.scale + (c * k / 32 * 2) as u64) as *const u16, tmp as *mut u16, (nc * k / 32) as u32)
+                        }
+                        .map_err(de)?;
+                    }
+                    Ok(())
+                })?;
+                println!(
+                    "  chunk {nc:>5} rows ({:>6.1} MiB bf16): expand + GEMM {:.3} ms, expand alone {:.3} ms, {:.2}x the bf16 GEMM",
+                    (nc * k * 2) as f64 / (1 << 20) as f64,
+                    t * 1e3,
+                    td * 1e3,
+                    t / t16
+                );
+            }
         }
     }
 

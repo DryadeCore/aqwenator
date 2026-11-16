@@ -632,8 +632,7 @@ impl Model {
                     gpu.enable_fp8(rows, inter.max(2 * h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
                 }
                 _ => {
-                    let layer_max = (2 * inter * h).max(cfg.gdn_proj_ld() * h).max(cfg.attn_proj_dim() * h);
-                    gpu.enable_int8(if head { layer_max.max(cfg.vocab_size * h) } else { layer_max })?;
+                    gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
                 }
             }
             // The bf16 head stays: the embedding lookup (tied weights) and the MTP shortlist read it.

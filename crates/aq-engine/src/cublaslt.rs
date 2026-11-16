@@ -105,8 +105,8 @@ pub struct CublasLt {
     handle: Handle,
     workspace: u64,
     workspace_size: usize,
-    /// Keyed by (m, n, k, weight type, activation type, output type).
-    plans: HashMap<(usize, usize, usize, i32, i32, i32), Plan>,
+    /// Keyed by (m, n, k, weight type, activation type, output type, row stride of the output).
+    plans: HashMap<(usize, usize, usize, i32, i32, i32, usize), Plan>,
 }
 
 // The handle is only used from the engine thread.
@@ -126,9 +126,9 @@ impl CublasLt {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn plan(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32)) -> Result<&Plan> {
+    fn plan(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32), ldc: usize) -> Result<&Plan> {
         let (w_ty, x_ty, out_ty) = tys;
-        let key = (m, n, k, w_ty, x_ty, out_ty);
+        let key = (m, n, k, w_ty, x_ty, out_ty, ldc);
         if !self.plans.contains_key(&key) {
             unsafe {
                 let mut desc = std::ptr::null_mut();
@@ -142,7 +142,7 @@ impl CublasLt {
                 // A = W stored as K x N col-major (ld K); B = X as K x M (ld K); C = N x M (ld N).
                 check(cublasLtMatrixLayoutCreate(&mut a, w_ty, k as u64, n as u64, k as i64), "layout a")?;
                 check(cublasLtMatrixLayoutCreate(&mut b, x_ty, k as u64, m as u64, k as i64), "layout b")?;
-                check(cublasLtMatrixLayoutCreate(&mut c, out_ty, n as u64, m as u64, n as i64), "layout c")?;
+                check(cublasLtMatrixLayoutCreate(&mut c, out_ty, n as u64, m as u64, ldc as i64), "layout c")?;
                 let mut pref = std::ptr::null_mut();
                 check(cublasLtMatmulPreferenceCreate(&mut pref), "pref")?;
                 let ws = self.workspace_size as u64;
@@ -224,11 +224,21 @@ impl CublasLt {
         self.gemm_ty(stream, m, n, k, x, w, y, (CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_ty))
     }
 
+    /// bf16 `gemm` of `n` consecutive weight rows into columns of a wider output: `y` points
+    /// at the first of those columns in an output `[m, ldc]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_rows(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, ldc: usize) -> Result<()> {
+        let tys = (CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF);
+        self.plan(stream, m, n, k, x, w, y, tys, ldc)?;
+        let p = &self.plans[&(m, n, k, tys.0, tys.1, tys.2, ldc)];
+        self.run(stream, p, x, w, y)
+    }
+
     /// As `gemm`, with element types `(w, x, y)`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_ty(&mut self, stream: *mut c_void, m: usize, n: usize, k: usize, x: u64, w: u64, y: u64, tys: (i32, i32, i32)) -> Result<()> {
-        self.plan(stream, m, n, k, x, w, y, tys)?;
-        let p = &self.plans[&(m, n, k, tys.0, tys.1, tys.2)];
+        self.plan(stream, m, n, k, x, w, y, tys, n)?;
+        let p = &self.plans[&(m, n, k, tys.0, tys.1, tys.2, n)];
         self.run(stream, p, x, w, y)
     }
 }
