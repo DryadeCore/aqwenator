@@ -468,6 +468,52 @@ a 4.17e-3 / 3.87e-3, b 1.42e-3 / 1.65e-3, c 3.04e-3 / 3.93e-3; top-1 253 / 254, 
 254 / 255 of 256. `aq-check` passes with `AQ_QUANT=int8` on the three 9B references; the exact
 gate is 30/30 with the fault leg failing as it must.
 
+### Three engines on one B200, and state-slot starvation (2026-11-17)
+
+Qwen3.5-9B, trace replay, one GPU per run, 4 minutes per point, zero errors everywhere.
+vLLM 0.33 on the 16-bit checkpoint (`scripts/trace_sweep.sh vllm`); llama.cpp 1.0.0-dev
+(build 12478) through `scripts/baseline_llamacpp.sh`: CUDA, all layers on the GPU, one slot per
+agent with 33792 tokens of context each, f16 GGUF converted from the same checkpoint,
+`-b 4096 -ub 2048` (the best of six settings). `trace_bench.py` counts tokens from `token_ids`
+(vLLM, aq-serve), `tokens` (llama.cpp) or one per text chunk.
+
+turns/min, tok/s, TTFT p50 / p99 ms, TPOT p50 ms:
+
+| Agents | aqwenator bf16 | vLLM, MTP speculation (3) | vLLM, no speculation | llama.cpp |
+|---|---|---|---|---|
+| 1 | 28.2 / 76 / 42 / 205 / 1.6 | 27.5 / 71 / 118 / 172 / 1.5 | 24.2 / 57 / 102 / 169 / 4.1 | 20.5 / 51 / 98 / 475 / 6.6 |
+| 4 | 114.8 / 323 / 43 / 166 / 1.6 | 105.8 / 294 / 132 / 623 / 1.6 | 91.8 / 247 / 114 / 217 / 4.4 | 51.2 / 138 / 361 / 1254 / 15.4 |
+| 16 | 432.8 / 1140 / 52 / 571 / 2.4 | 384.5 / 1007 / 217 / 399 / 3.0 | 313.0 / 836 / 165 / 287 / 7.2 | 80.2 / 185 / 921 / 8089 / 68.8 |
+
+On this card the lead over vLLM is 13% of turns at 16 agents (9% at 4, 3% at 1), against
+60–75% on the Spark, and vLLM has the lower TTFT p99 at 1 and 16 agents. At 1 and 4 agents the
+replay bounds turns per minute for the fast engines. Other llama.cpp settings at 16 agents: f16
+defaults 79.0 / 175, bf16 defaults 78.5 / 175, `--spec-type ngram-mod` 75.5 / 165,
+`--spec-type draft-mtp` 63.2 / 137 (TTFT p50 3100), Q8_0 63.2 / 135 (TTFT p50 3441). Its
+settings come from its help text; nobody who tunes llama.cpp for a living has looked at them.
+Strata and gufo were not run: Strata lists only Qwen3.8-Flash-Next and Qwen3.6-35B-A3B, gufo
+runs on Strix Halo only.
+
+**State-slot starvation.** Every 32-agent number before 2026-11-17 was taken with it. Running
+and parked sessions and their checkpoints each hold one of `--max-seqs` state slots (128 in the
+sweeps), and checkpoints, taps and forks were skipped when no slot was free. With a KV pool
+large enough that nothing is evicted for memory, parked entries filled the slots; a turn then
+consumed the checkpoint it resumed from without leaving a new one, and the session's next turn
+re-read about 16k tokens. A smaller pool hid it because memory pressure evicted stale entries.
+32 agents, B200, bf16 (turns/min, tok/s, TTFT p50 / p99 ms, prompt tokens re-read):
+
+| KV pool, slots | before | with the slot reserve |
+|---|---|---|
+| 48 GB, 128 | 481.3 / 1270 / 152 / 3475 / 6.1M | 738.5 / 1945 / 67 / 405 / 3.1M |
+| 120 GB, 128 | 447.2 / 1201 / 154 / 3876 / 6.1M | 739.2 / 1943 / 68 / 406 / 3.1M |
+| 24 GB, 128 | 750.0 / 1968 / 64 / 384 / 3.1M | |
+| 48 GB, 256 | 752.0 / 1971 / 63 / 371 / 3.1M | |
+
+The fix (`Engine::reserve_slots`) evicts the least-recently-used parked entry before admission
+until an eighth of the slots is free. 16 agents (434.0) and 4 agents (113.8) are unchanged;
+gate 31/31. The eighth was reasoned, not swept. The B200 is therefore not saturated at 16
+agents, and the Spark's 32-agent points (same 128 slots) are probably low for the same reason.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
