@@ -5,12 +5,15 @@ vLLM stays as the server baseline. In order:
 
 1. **int8-weight GEMM kernel** (`gemm_i8w`, in progress): trace-golden KL against the expansion
    path, load test, full gate, then merge.
-2. **Longer, adaptive MTP drafts.** Chained MTP drafts exist and are on by default
-   (`AQ_MTP_K=3`). Others adapt the draft length up to 7 and fall back to plain decoding when
-   drafts keep failing, and report 2.4–3.2 tokens per pass with 3 drafts: measure our accepted
-   tokens per pass on the traces and try the adaptive length.
-3. **Longer prompt-lookup drafts.** Lookup drafts exist (k=4 in `aq-serve`). Others verify up to
-   64 copied tokens in one pass when a request decodes alone; coding-agent turns copy a lot.
+2. **Longer drafts: measured on the B200, no gain there.** Chained MTP drafts (`AQ_MTP_K=3`) and
+   lookup drafts (`--spec-k 4`, the total draft budget) are on by default and give 4.22 tokens
+   per decode pass on the traces (72% of drafted tokens accepted, the MTP head's first draft
+   90%). Budget 8 with 3 / 5 / 7 chained drafts gives 4.38 / 4.51 / 4.54 tokens per pass and
+   435 / 428 / 425 turns/min at 16 agents against 433 (budget 16: 412): the extra rows cost what
+   the extra tokens save. Chaining was +10% on the Spark and neutral on the B200, so repeat this
+   on a bandwidth-limited device before changing the defaults.
+3. **Longer prompt-lookup drafts when a request decodes alone** (others verify up to 64 copied
+   tokens in one pass). Same caveat as 2: measure on a bandwidth-limited device.
 4. **8-bit attention cache** (then 8-bit keys / 4-bit values). Decode attention is 30% of the fp8
    step and bandwidth-bound.
 5. **Session checkpoints in host RAM and on disk**: evicted sessions and restarts resume from the
