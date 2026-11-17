@@ -7,6 +7,10 @@ agentic workloads (many long multi-turn sessions) on a single GPU, down to a DGX
 
 Outputs are checked token for token against `transformers` (`aq-check`).
 
+The aim is good models at good speed on hardware that should not be able to run them, with
+many agents sharing one box. The focus is Qwen models for the moment; other models get added
+when they fit the existing kernels.
+
 ## Numbers
 
 Qwen3.5-9B, replay of recorded OpenHands trajectories, 10 minutes per run, DGX Spark:

@@ -1,34 +1,43 @@
-# Roadmap (agreed 2026-11-16)
+# Direction and roadmap (agreed 2026-11-18)
 
-The competitors for the local goal are Strata, llama.cpp, gufo and the hardware ceiling itself;
-vLLM stays as the server baseline. In order:
+**Target:** the moment of "this should not run on this hardware", at good speed: high-quality
+models on constrained machines, using the whole machine (VRAM, RAM, SSD) and the structure of
+the model to move bytes to where they fit. Speed stays a requirement, not a trade.
+**Edge to build on:** many agents on one box (session cache, checkpoints, exact speculation),
+which is where the engine is measurably ahead of llama.cpp and, on bandwidth-limited hardware,
+of vLLM. **Scope:** Qwen models for the moment. Other models are added opportunistically while
+they reuse the existing kernels and scheduler; the day one "requires significant rework" is a
+decision point, not a default yes. Keep the code lean: fastest path only, trim the rest.
+The competitors are Strata, llama.cpp and gufo; vLLM is the server baseline. Do not rebuild
+Strata: where it is already good (one user, largest model on a gaming PC), measure before
+building.
 
-1. **int8-weight GEMM kernel** (`gemm_i8w`, in progress): trace-golden KL against the expansion
-   path, load test, full gate, then merge.
-2. **Longer drafts: measured on the B200, no gain there.** Chained MTP drafts (`AQ_MTP_K=3`) and
-   lookup drafts (`--spec-k 4`, the total draft budget) are on by default and give 4.22 tokens
-   per decode pass on the traces (72% of drafted tokens accepted, the MTP head's first draft
-   90%). Budget 8 with 3 / 5 / 7 chained drafts gives 4.38 / 4.51 / 4.54 tokens per pass and
-   435 / 428 / 425 turns/min at 16 agents against 433 (budget 16: 412): the extra rows cost what
-   the extra tokens save. Chaining was +10% on the Spark and neutral on the B200, so repeat this
-   on a bandwidth-limited device before changing the defaults.
-3. **Longer prompt-lookup drafts when a request decodes alone** (others verify up to 64 copied
-   tokens in one pass). Same caveat as 2: measure on a bandwidth-limited device.
-4. **8-bit attention cache** (then 8-bit keys / 4-bit values). Decode attention is 30% of the fp8
-   step and bandwidth-bound.
-5. **Session checkpoints in host RAM and on disk**: evicted sessions and restarts resume from the
-   longest exact prefix instead of re-running prefill. Safetensors `main` has a prefetch engine
-   (still changing) worth using for the disk tier.
-6. **6-bit or mixed dense weights.** Measure quality first: others report 4-bit dense at +9%
-   perplexity against +0.2% for 8-bit.
-7. **Benchmarks against Strata, llama.cpp and gufo** on the same traces and machine.
-8. **Qwen3.8-Flash-Next on small hardware** (worth it only if it runs on small cards). New pieces:
-   MoE with 512 experts per layer and 10 active, hyper-connections, sparse attention, a 51 GB
-   n-gram embedding table read from disk. Known lessons: one preallocated expert slot pool with
-   routing remapped to slots so the grouped GEMM is unchanged; LRU is within 3 points of the
-   optimal cache policy; router read-ahead wastes about 40% of its reads; the fastest design keeps
-   all experts in pinned host RAM, the hot ones in VRAM, and computes misses on the CPU.
-9. **Research: zml `attnd`** ("sparse logarithmic attention, on CPU, over UDP"). Only the
+1. **Why vLLM is ahead at 32 agents on the B200** (795 against 739 turns/min; our TPOT goes
+   2.4 -> 4.6 ms from 16 to 32 agents, vLLM's stays near 3.0): one per-op profile at 32 agents.
+2. **Low-bit weights (4-bit) with their own kernel**, quality measured first (others report
+   plain 4-bit dense at +9% perplexity against +0.2% for 8-bit). Goal: the 9B on an 8 GB card
+   (an RTX 3070 laptop is the test machine). Also what expert weights need later.
+3. **Parked sessions in host RAM, then on SSD**: evicted sessions and restarts resume from the
+   longest exact prefix instead of re-running prefill. Safetensors `main` has a prefetch
+   engine (still changing) for the disk tier.
+4. **8-bit attention cache** (then 8-bit keys / 4-bit values): halves the bytes decode attention
+   reads and the cache's memory.
+5. **Larger models, opportunistically.** Qwen3.8-27B if it has the 9B's layout. Then a
+   mixture-of-experts model of the same family (Qwen3.6-35B-A3B: Strata, llama.cpp and vLLM
+   all run it) with the experts tiered across VRAM and RAM, then Qwen3.8-Flash-Next (also
+   hyper-connections, sparse attention, a 51 GB n-gram table on disk). Known lessons: one
+   preallocated expert slot pool with routing remapped to slots so the grouped GEMM is
+   unchanged; LRU is within 3 points of the optimal cache policy; router read-ahead wastes
+   about 40% of its reads; the fastest design keeps all experts in pinned host RAM, the hot
+   ones in VRAM, and computes misses on the CPU.
+6. **Strata under the multi-agent replay**, on a model and machine it supports, before building
+   anything it already does. llama.cpp is in `scripts/baseline_llamacpp.sh`.
+7. **Draft lengths on a bandwidth-limited device.** Chained MTP drafts (`AQ_MTP_K=3`) and
+   lookup drafts (`--spec-k 4`, the total budget) give 4.22 tokens per decode pass on the
+   traces. On the B200 budget 8 with 3 / 5 / 7 chained drafts gives 4.38 / 4.51 / 4.54 tokens
+   per pass and 435 / 428 / 425 turns/min at 16 agents against 433 (budget 16: 412). Chaining
+   was +10% on the Spark, so repeat there or on the laptop before changing defaults.
+8. **Research: zml `attnd`** ("sparse logarithmic attention, on CPU, over UDP"). Only the
    announcement was read; the mechanism is in its video.
 
 # Update 2026-11-16: branch `mythos-review` (main has everything up to the Docker/CI commits; FP8 is branch-only)
@@ -493,6 +502,11 @@ defaults 79.0 / 175, bf16 defaults 78.5 / 175, `--spec-type ngram-mod` 75.5 / 16
 settings come from its help text; nobody who tunes llama.cpp for a living has looked at them.
 Strata and gufo were not run: Strata lists only Qwen3.8-Flash-Next and Qwen3.6-35B-A3B, gufo
 runs on Strix Halo only.
+
+32 agents, with the slot reserve below (turns/min, tok/s, TTFT p50 / p99 ms, TPOT p50 ms):
+vLLM with MTP speculation 795.2 / 2105 / 124 / 273 / 3.1, aqwenator 738.5 / 1945 / 67 / 405 / 4.6,
+vLLM without speculation 576.2 / 1553 / 117 / 322 / 8.8, llama.cpp 79.5 / 112 / 1453 / 17016 /
+227.7. vLLM is ahead at this load on this card.
 
 **State-slot starvation.** Every 32-agent number before 2026-11-17 was taken with it. Running
 and parked sessions and their checkpoints each hold one of `--max-seqs` state slots (128 in the
