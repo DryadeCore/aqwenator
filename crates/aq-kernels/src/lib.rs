@@ -28,17 +28,6 @@ unsafe fn st(p: *mut u16, i: usize, v: f32) {
     unsafe { *p.add(i) = f32_to_bf16_rne(v) }
 }
 
-/// Element `e` of an embedding-shaped table as f32. `tq` = 0: bf16. Otherwise int8 with one
-/// bf16 magnitude per block of 32 at `tscale` (the `quant_i8b` layout; rows are multiples of 32).
-#[inline(always)]
-unsafe fn tld(table: *const u16, tscale: *const u16, tq: u32, e: usize) -> f32 {
-    if tq == 0 {
-        unsafe { ld(table, e) }
-    } else {
-        unsafe { *(table as *const i8).add(e) as f32 * bf16_to_f32(*tscale.add(e / 32)) * (1.0 / 127.0) }
-    }
-}
-
 #[inline(always)]
 fn rb(v: f32) -> f32 {
     bf16_to_f32(f32_to_bf16_rne(v))
@@ -291,19 +280,15 @@ pub mod kernels {
     use super::*;
     use cuda_device::{DynamicSharedArray, SharedArray, kernel};
 
-    /// out[t, :] = table[ids[t], :] (`tscale`, `tq`: see `tld`). grid = (T), block = (256).
+    /// out[t, :] = table[ids[t], :]. grid = (T), block = (256).
     #[kernel]
-    pub unsafe fn embed(ids: *const u32, table: *const u16, tscale: *const u16, tq: u32, out: *mut u16, hidden: u32) {
+    pub unsafe fn embed(ids: *const u32, table: *const u16, out: *mut u16, hidden: u32) {
         let t = thread::blockIdx_x() as usize;
         let h = hidden as usize;
         let id = unsafe { *ids.add(t) } as usize;
         let mut i = thread::threadIdx_x() as usize;
         while i < h {
-            if tq == 0 {
-                unsafe { *out.add(t * h + i) = *table.add(id * h + i) };
-            } else {
-                unsafe { st(out, t * h + i, tld(table, tscale, tq, id * h + i)) };
-            }
+            unsafe { *out.add(t * h + i) = *table.add(id * h + i) };
             i += thread::blockDim_x() as usize;
         }
     }
@@ -3308,8 +3293,7 @@ pub mod kernels {
         wh: *const u16,
         we: *const u16,
         table: *const u16,
-        tscale: *const u16,
-        tq: u32,
+        slot_of: *const u32,
         next: *const u32,
         sampled: *const u32,
         out: *mut u16,
@@ -3355,10 +3339,14 @@ pub mod kernels {
         // pre_fc_norm_embedding of the next token -> first half.
         let nx = unsafe { *next.add(t) };
         let id = if nx & 0x8000_0000 != 0 { unsafe { *sampled.add((nx & 0x7fff_ffff) as usize) } } else { nx } as usize;
+        // With `slot_of` (token -> row of `table`, u32::MAX = absent) the table holds only some
+        // tokens' rows; an absent token reads as zeros.
+        let row = if slot_of.is_null() { id } else { (unsafe { *slot_of.add(id) }) as usize };
+        let have = slot_of.is_null() || row != u32::MAX as usize;
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
-            let v = unsafe { tld(table, tscale, tq, id * h + i) };
+            let v = if have { unsafe { ld(table, row * h + i) } } else { 0.0 };
             ss += v * v;
             i += bd;
         }
@@ -3366,7 +3354,7 @@ pub mod kernels {
         let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
         let mut i = tid;
         while i < h {
-            unsafe { st(out, t * 2 * h + i, tld(table, tscale, tq, id * h + i) * inv * (1.0 + ld(we, i))) };
+            unsafe { st(out, t * 2 * h + i, (if have { ld(table, row * h + i) } else { 0.0 }) * inv * (1.0 + ld(we, i))) };
             i += bd;
         }
     }
@@ -3383,8 +3371,7 @@ pub mod kernels {
         wh: *const u16,
         we: *const u16,
         table: *const u16,
-        tscale: *const u16,
-        tq: u32,
+        slot_of: *const u32,
         out: *mut u16,
         hidden: u32,
         eps: f32,
@@ -3397,6 +3384,10 @@ pub mod kernels {
         let tid = thread::threadIdx_x() as usize;
         let src = unsafe { *sel.add(t) } as usize;
         let id = unsafe { *tok.add(src) } as usize;
+        // With `slot_of` (token -> row of `table`, u32::MAX = absent) the table holds only some
+        // tokens' rows; an absent token reads as zeros.
+        let row = if slot_of.is_null() { id } else { (unsafe { *slot_of.add(id) }) as usize };
+        let have = slot_of.is_null() || row != u32::MAX as usize;
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
@@ -3414,7 +3405,7 @@ pub mod kernels {
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
-            let v = unsafe { tld(table, tscale, tq, id * h + i) };
+            let v = if have { unsafe { ld(table, row * h + i) } } else { 0.0 };
             ss += v * v;
             i += bd;
         }
@@ -3422,13 +3413,14 @@ pub mod kernels {
         let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
         let mut i = tid;
         while i < h {
-            unsafe { st(out, t * 2 * h + i, tld(table, tscale, tq, id * h + i) * inv * (1.0 + ld(we, i))) };
+            unsafe { st(out, t * 2 * h + i, (if have { ld(table, row * h + i) } else { 0.0 }) * inv * (1.0 + ld(we, i))) };
             i += bd;
         }
     }
 
     /// `out[slots[b], :] = table[ids[slots[b]], :]`: (re)fill rows of a gathered copy of an
-    /// embedding-shaped table. grid = (number of slots), block = (256).
+    /// embedding-shaped table: bf16 (`tq` = 0), or int8 with one bf16 magnitude per block of 32
+    /// at `tscale` (the `quant_i8b` layout). grid = (number of slots), block = (256).
     #[kernel]
     pub unsafe fn gather_rows(table: *const u16, tscale: *const u16, tq: u32, ids: *const u32, slots: *const u32, out: *mut u16, hidden: u32) {
         let slot = unsafe { *slots.add(thread::blockIdx_x() as usize) } as usize;
@@ -3439,7 +3431,8 @@ pub mod kernels {
             if tq == 0 {
                 unsafe { *out.add(slot * h + i) = *table.add(id * h + i) };
             } else {
-                unsafe { st(out, slot * h + i, tld(table, tscale, tq, id * h + i)) };
+                let e = id * h + i;
+                unsafe { st(out, slot * h + i, *(table as *const i8).add(e) as f32 * bf16_to_f32(*tscale.add(e / 32)) * (1.0 / 127.0)) };
             }
             i += thread::blockDim_x() as usize;
         }

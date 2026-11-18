@@ -595,30 +595,34 @@ reference, batched, resumed and speculative paths identical to the single path. 
 with this build: see the commit. B200 replay (turns/min, tok/s, TPOT p50 ms): 4 agents 91.2 /
 247 / 4.9, 16 agents 334.0 / 881 / 6.4 (bf16 114.8 and 432.8; int8 with its kernel 362.5).
 
-**8-bit embedding table and head.** A 4-bit checkpoint leaves the embedding table and the
-output head in bf16 (2 GB each for the 9B, not tied). With such a checkpoint both are stored
-as int8 with a scale per 32 (`quant_i8b`), each as soon as it has been uploaded, and the bf16
-copies are freed; `embed`, `mtp_prep`, `mtp_chain_prep` and `gather_rows` read either form
-(`tld`). Quality is unchanged (0.150 / 0.076 / 0.131 on the traces), as is the replay (1 / 4 /
-16 agents: 23.8 / 91.8 / 332.5 turns/min).
+**8-bit head, embedding table in host memory.** A 4-bit checkpoint leaves the embedding table
+and the output head in bf16 (2 GB each for the 9B, not tied). With such a checkpoint the head
+is stored as int8 with a scale per 32 (`quant_i8b`) as soon as it has been uploaded, and the
+embedding table is not uploaded at all: the checkpoint stays mapped, each step copies the rows
+of its tokens to `x` (there is no `embed` kernel then), and the draft head keeps the rows of
+its shortlist on the device (`short_e`, with a token-to-slot map; `mtp_prep` and
+`mtp_chain_prep` read a token outside the shortlist as zeros, which can only cost a rejected
+draft). The main path therefore uses the exact bf16 embeddings. Quality is unchanged (0.146 /
+0.078 / 0.129 on the traces), as is the replay (1 / 4 / 16 agents: 23.8 / 91.8 / 331.0
+turns/min); gate 31/31.
 
-Device memory of `aq-serve` with the 4-bit 9B, as `nvidia-smi` reports it on a B200 (the
-engine's own "memory:" line counts weights, state and KV only; about 1 GB of context, cuBLAS
-and scratch comes on top):
+Device memory of `aq-serve` with the 4-bit 9B on a B200: what the engine allocates (its load
+lines report it) and what `nvidia-smi` shows, which adds about 0.73 GiB of CUDA context and
+libraries on that card:
 
-| Settings | Device |
-|---|---|
-| defaults of the sweep, 8 slots, 1 GB KV pool | 10.1 GB |
-| the same with `--max-tokens 1024` | 8.9 GB |
-| 4 slots, 1 GB pool, `--max-tokens 1024` | 8.6 GB |
-| the same without the MTP head (`AQ_MTP=0`) | 7.9 GB |
-| 4 slots, 0.5 GB pool, `--max-tokens 512`, `--max-ctx 16384`, no MTP head | 7.3 GB |
+| Settings | Allocated | Device |
+|---|---|---|
+| 8 slots, 1 GB KV pool, `--max-tokens 8192` (1.5 GiB of scratch) | 8.44 GiB | 9.4 GB |
+| the same with `--max-tokens 1024` | 7.23 GiB | 8.1 GB |
+| 4 slots, 1 GB pool, `--max-tokens 1024` | 6.97 GiB | 7.9 GB |
+| the same without the MTP head (`AQ_MTP=0`) | 6.01 GiB | 6.9 GB |
+| 4 slots, 0.5 GB pool, `--max-tokens 512`, `--max-ctx 16384`, no MTP head | 5.43 GiB | 6.3 GB |
 
-So an 8 GB card runs the 9B only without the draft head and with little room, if the card
-drives no display. The weights are 6.3 GiB (layers 3.6, tables 2.0, MTP head and its
-shortlist 0.7). Next reductions, largest first: the embedding table in host RAM (prompt rows
-uploaded per step; only the draft head's shortlist needs rows on the device), an 8-bit KV
-cache, and finding what the 1 GB outside the engine's accounting is made of.
+The weights are 5.5 GiB with the draft head (layers 3.6, head 1.0, draft head with its two
+shortlists 0.9) and 4.6 without. With the embedding table on the device in 8 bits each row
+above was 0.75 GiB larger. Whether the third row fits an 8 GB card depends on that card's
+context size and on whether it drives a display; not measured on one yet. Next reduction: an
+8-bit KV cache.
 
 Not done: a kernel that multiplies the codes directly (the expansion costs what the int8
 expansion cost).

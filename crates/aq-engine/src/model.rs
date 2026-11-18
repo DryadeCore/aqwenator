@@ -130,6 +130,10 @@ pub struct Mtp {
     g_short_ids: u64,
     g_short_slots: u64,
     short_w: u64,
+    /// With the embedding table kept in host memory: the shortlisted tokens' embedding rows
+    /// and each token's slot, on the device for the draft head (0 otherwise).
+    short_e: u64,
+    g_short_pos: u64,
 }
 
 impl Mtp {
@@ -244,7 +248,12 @@ pub struct Batch {
 pub struct Model {
     pub cfg: TextConfig,
     pub gpu: Gpu,
-    embed: Weight,
+    /// The embedding table on the device, or 0 when it stays in host memory (`embed_host`).
+    embed: u64,
+    /// The mapped checkpoint and the embedding tensor's name, and the buffer a step's rows
+    /// are gathered into.
+    embed_host: Option<(Checkpoint, String)>,
+    embed_rows: Vec<u8>,
     final_norm: u64,
     lm_head: Weight,
     /// The output head's bf16 rows (the MTP shortlist gathers from it).
@@ -498,26 +507,23 @@ impl Model {
         let mut gpu = Gpu::new(0)?;
         let one = |n: &str| vec![format!("{P}{n}")];
 
-        // A 4-bit checkpoint is for small devices: its embedding table and output head (2 GB
-        // each for the 9B, never quantized by the checkpoint) are stored in 8 bits, each as soon
-        // as it has been uploaded so the load's peak stays near its final footprint.
+        // A 4-bit checkpoint is for small devices. Its embedding table and output head (2 GB
+        // each for the 9B) are bf16: the head is stored in 8 bits as soon as it has been
+        // uploaded, and the embedding table stays in host memory (the mapped checkpoint): a
+        // step uploads the rows of its tokens, and the draft head keeps its shortlist's rows.
         let small_tables = ck.has(&format!("{P}layers.0.mlp.gate_proj.weight.q4")) && cfg.hidden_size % 32 == 0;
         let tied = cfg.tied() || !ck.has("lm_head.weight");
-        let embed_p = concat_bf16(&mut gpu, &ck, &one("embed_tokens.weight"))?;
+        let embed_name = format!("{P}embed_tokens.weight");
         let mut small_head = None;
         let (embed, head_table) = if small_tables {
+            ck.bf16(&embed_name)?;
+            let t = concat_bf16(&mut gpu, &ck, &[if tied { embed_name.clone() } else { "lm_head.weight".to_string() }])?;
             gpu.drain_uploads()?;
-            let e = gpu.quantize_weight(embed_p, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?;
-            small_head = Some(if tied {
-                e
-            } else {
-                let t = concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?;
-                gpu.drain_uploads()?;
-                gpu.quantize_weight(t, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?
-            });
-            (e, 0)
+            small_head = Some(gpu.quantize_weight(t, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?);
+            (0, 0)
         } else {
-            (Weight::bf16(embed_p), if tied { embed_p } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
+            let e = concat_bf16(&mut gpu, &ck, &[embed_name.clone()])?;
+            (e, if tied { e } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
         };
         let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
         // AQ_QUANT (experimental, not exact: outputs differ from the bf16 reference) stores the
@@ -656,6 +662,8 @@ impl Model {
                 g_short_ids: gpu.alloc(short_n * 4)?,
                 g_short_slots: gpu.alloc(short_n * 4)?,
                 short_w: gpu.alloc(short_n * cfg.hidden_size * 2)?,
+                short_e: if small_tables { gpu.alloc(short_n * cfg.hidden_size * 2)? } else { 0 },
+                g_short_pos: if small_tables { gpu.alloc(cfg.vocab_size * 4)? } else { 0 },
                 short_ids,
                 short_pos,
                 layer,
@@ -676,7 +684,8 @@ impl Model {
         if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4) {
             anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
             gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
-            eprintln!("4-bit weights from the checkpoint (one scale per 128), 8-bit embedding table and head: not exact");
+            anyhow::ensure!(mtp.as_ref().is_none_or(|m| m.short_n > 0), "the embedding table is in host memory: the draft head needs its shortlist (AQ_MTP_SHORT)");
+            eprintln!("4-bit weights from the checkpoint (one scale per 128), 8-bit head, embedding table in host memory: not exact");
         }
         if quant != Fmt::Bf16 {
             let head = std::env::var("AQ_QUANT_HEAD").as_deref() == Ok("1") && cfg.vocab_size % 8 == 0 && h % 32 == 0;
@@ -760,6 +769,8 @@ impl Model {
             cfg,
             gpu,
             embed,
+            embed_host: small_tables.then_some((ck, embed_name)),
+            embed_rows: Vec::new(),
             final_norm,
             lm_head,
             head_table,
@@ -1382,6 +1393,15 @@ impl Model {
             g.upload(s.dtile_len, &dl)?;
         }
         g.upload(s.ids, &b.tokens)?;
+        if let Some((ck, name)) = self.embed_host.as_ref().filter(|_| !self.chain_mode) {
+            // The embedding table is in host memory: this step's rows go straight to `x`.
+            let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
+            self.embed_rows.clear();
+            for &tok in &b.tokens {
+                self.embed_rows.extend_from_slice(&table[tok as usize * hb..(tok as usize + 1) * hb]);
+            }
+            g.upload(s.x, &self.embed_rows)?;
+        }
         g.upload(s.tok_pos, &b.tok_pos)?;
         g.upload(s.tok_seq, &b.tok_seq)?;
         g.upload(s.seq_start, &b.seq_start)?;
@@ -1413,6 +1433,23 @@ impl Model {
                 )
             }
             .map_err(de)?;
+            if let Some((ck, name)) = self.embed_host.as_ref() {
+                // The same slots' embedding rows, from host memory, and the token -> slot map.
+                let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
+                let row = |slot: u32| { let tok = m.short_ids[slot as usize] as usize; &table[tok * hb..(tok + 1) * hb] };
+                if m.short_dirty.len() == m.short_n {
+                    self.embed_rows.clear();
+                    for slot in 0..m.short_n as u32 {
+                        self.embed_rows.extend_from_slice(row(slot));
+                    }
+                    g.upload(m.short_e, &self.embed_rows)?;
+                } else {
+                    for &slot in &m.short_dirty {
+                        g.upload(m.short_e + (slot as usize * hb) as u64, row(slot))?;
+                    }
+                }
+                g.upload(m.g_short_pos, &m.short_pos)?;
+            }
             m.short_dirty.clear();
         }
         if self.mtp_on && self.mtp.is_some() {
@@ -1465,9 +1502,9 @@ impl Model {
         let mb = lim.max_blocks_per_seq() as u32;
         let bs = lim.block_size as u32;
         let chain = self.chain_mode;
-        if !chain {
+        if !chain && self.embed != 0 {
             unsafe {
-                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed.p as *const u16, self.embed.scale as *const u16, (self.embed.fmt == Fmt::Int8) as u32, s.x as *mut u16, hd)
+                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
             }
             .map_err(de)?;
             mark!("embed");
@@ -1528,9 +1565,8 @@ impl Model {
                         s.next as *const u32,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed.p as *const u16,
-                        self.embed.scale as *const u16,
-                        (self.embed.fmt == Fmt::Int8) as u32,
+                        (if self.embed != 0 { self.embed } else { m.short_e }) as *const u16,
+                        m.g_short_pos as *const u32,
                         s.proj as *mut u16,
                         hd,
                         eps,
@@ -1554,9 +1590,8 @@ impl Model {
                         self.final_norm as *const u16,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed.p as *const u16,
-                        self.embed.scale as *const u16,
-                        (self.embed.fmt == Fmt::Int8) as u32,
+                        (if self.embed != 0 { self.embed } else { m.short_e }) as *const u16,
+                        m.g_short_pos as *const u32,
                         s.next as *const u32,
                         s.tok as *const u32,
                         s.proj as *mut u16,
