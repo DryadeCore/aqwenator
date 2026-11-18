@@ -230,8 +230,7 @@ pub struct SpecStats {
     /// Drafts whose first token came from the MTP head, and how many of those were accepted.
     pub mtp_drafted: u64,
     pub mtp_accepted: u64,
-    /// Requests that stopped on a token inside a fully accepted draft (the verified state
-    /// then covers tokens past the stop and is discarded).
+    /// Requests that stopped on a token inside a fully accepted draft.
     pub stop_in_draft: u64,
 }
 
@@ -1626,8 +1625,7 @@ impl Engine {
                 }
             }
             let s = &mut self.running[i];
-            // Tokens this entry emits: the accepted targets up to and including the first one
-            // that ends the request (the token limit cannot fall inside a draft: see `kmax`).
+            // The token limit cannot fall inside a draft (see `kmax`); a stop token can.
             let ends = |t: &u32| !s.req.ignore_eos && eos.contains(t);
             let emit = if nr == 0 { 0 } else { targets[..m + 1].iter().position(ends).map_or(m + 1, |p| p + 1) };
             if k < decode_seqs && self.spec_trace {
@@ -1642,10 +1640,7 @@ impl Engine {
                     draft_local[k]
                 );
             }
-            // The spare slot holds the state after the pending tokens and all m accepted
-            // drafts. A stop before the last accepted draft leaves that state ahead of the
-            // tokens the request emitted: it is then dropped like a rejection, so `computed`
-            // never passes the known tokens and the session parks the state of what it emitted.
+            // The spare slot's state is ahead of the emitted tokens: drop it like a rejection.
             let overrun = !d.is_empty() && m == d.len() && emit < m;
             if overrun {
                 st.stop_in_draft += 1;

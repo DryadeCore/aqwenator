@@ -672,10 +672,8 @@ fn main() -> Result<()> {
             );
             failed |= !ok;
         }
-        // ---- 6b. stop tokens under speculation. A request must end exactly at its stop token
-        // when that token sits inside an accepted draft, and the session it parks must hold
-        // the state of the tokens it emitted, nothing past them: a follow-up that extends the
-        // stopped output has to continue like a cold run of the same prompt.
+        // ---- 6b. stop tokens under speculation: a request ends at its stop token even inside
+        // an accepted draft, and a follow-up resumes from the parked session like a cold run.
         if let Some((_, plain)) = first_off.iter().find(|f| f.0 == "single") {
             let plain = &plain[0];
             eng.session_cache = true;
@@ -694,13 +692,12 @@ fn main() -> Result<()> {
                 Ok((out, stop))
             };
             let (mut tested, mut ok) = (0, true);
-            // Stop tokens: output positions whose token has not occurred earlier in the output.
+            // Stop at output positions whose token has not occurred earlier.
             for j in (1..plain.len().min(120)).filter(|&j| !plain[..j].contains(&plain[j])).take(12) {
                 tested += 1;
                 eng.eos = vec![plain[j]];
                 let (got, stop) = run1(&mut eng, 600, prompts[0].clone(), SPEC_TEST_LEN, true, k)?;
-                // (A speculative run may leave the plain run's path at a near-tie, see above:
-                // the stop token then comes elsewhere, or not at all.)
+                // A speculative run may leave the plain path at a near-tie and never stop.
                 let at = got.iter().position(|&t| t == plain[j]);
                 if at.map(|a| a + 1) != stop.then_some(got.len()) {
                     ok = false;
@@ -712,7 +709,7 @@ fn main() -> Result<()> {
                 }
                 eng.eos.clear();
                 let next: Vec<u32> = prompts[0].iter().chain(&got).copied().chain([plain[0]]).collect();
-                // (A cold run prefills the whole prompt: every fourth position is enough.)
+                // The follow-up costs a cold prefill of the whole prompt: every fourth position.
                 if tested % 4 != 1 {
                     continue;
                 }
@@ -723,7 +720,7 @@ fn main() -> Result<()> {
                     let p: Vec<u32> = next.iter().chain(&cold[..same]).copied().collect();
                     run1(&mut eng, 603, p, 1, false, 0)?;
                     let (_, a, b) = top2(&eng.model.logits()?);
-                    if a - b >= NEAR_TIE {
+                    if a - b >= near_tie {
                         ok = false;
                         println!("  stop at token {j}: the follow-up diverges from a cold run after {same} tokens where the margin is {:.3}: REAL MISMATCH", a - b);
                     }
