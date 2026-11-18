@@ -51,8 +51,9 @@ aq-serve qwen35-9b-int4
 
 4.1 bits per layer weight; on long agent traces about 92% of greedy tokens agree with the
 bf16 model (KL 0.08–0.15 nats), which is that checkpoint's quality, not something the engine
-adds. The embedding table and the output head are still 16-bit, so the 9B takes 8.3 GB of
-weights for now.
+adds. The embedding table and the output head are stored in 8 bits. The 9B then needs 7.3 to
+8.6 GB of device memory depending on the settings (see docs/HANDOFF.md): not yet comfortable
+on an 8 GB card.
 
 Method, more machines and the history are in [docs/HANDOFF.md](docs/HANDOFF.md).
 

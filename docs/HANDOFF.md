@@ -595,9 +595,33 @@ reference, batched, resumed and speculative paths identical to the single path. 
 with this build: see the commit. B200 replay (turns/min, tok/s, TPOT p50 ms): 4 agents 91.2 /
 247 / 4.9, 16 agents 334.0 / 881 / 6.4 (bf16 114.8 and 432.8; int8 with its kernel 362.5).
 
+**8-bit embedding table and head.** A 4-bit checkpoint leaves the embedding table and the
+output head in bf16 (2 GB each for the 9B, not tied). With such a checkpoint both are stored
+as int8 with a scale per 32 (`quant_i8b`), each as soon as it has been uploaded, and the bf16
+copies are freed; `embed`, `mtp_prep`, `mtp_chain_prep` and `gather_rows` read either form
+(`tld`). Quality is unchanged (0.150 / 0.076 / 0.131 on the traces), as is the replay (1 / 4 /
+16 agents: 23.8 / 91.8 / 332.5 turns/min).
+
+Device memory of `aq-serve` with the 4-bit 9B, as `nvidia-smi` reports it on a B200 (the
+engine's own "memory:" line counts weights, state and KV only; about 1 GB of context, cuBLAS
+and scratch comes on top):
+
+| Settings | Device |
+|---|---|
+| defaults of the sweep, 8 slots, 1 GB KV pool | 10.1 GB |
+| the same with `--max-tokens 1024` | 8.9 GB |
+| 4 slots, 1 GB pool, `--max-tokens 1024` | 8.6 GB |
+| the same without the MTP head (`AQ_MTP=0`) | 7.9 GB |
+| 4 slots, 0.5 GB pool, `--max-tokens 512`, `--max-ctx 16384`, no MTP head | 7.3 GB |
+
+So an 8 GB card runs the 9B only without the draft head and with little room, if the card
+drives no display. The weights are 6.3 GiB (layers 3.6, tables 2.0, MTP head and its
+shortlist 0.7). Next reductions, largest first: the embedding table in host RAM (prompt rows
+uploaded per step; only the draft head's shortlist needs rows on the device), an 8-bit KV
+cache, and finding what the 1 GB outside the engine's accounting is made of.
+
 Not done: a kernel that multiplies the codes directly (the expansion costs what the int8
-expansion cost); the embedding table in host RAM and an 8-bit head, without which the 9B does
-not fit in 8 GB (weights are 8.3 GB on the device today).
+expansion cost).
 
 # Handoff: aqwenator state as of 2026-11-13
 

@@ -244,10 +244,11 @@ pub struct Batch {
 pub struct Model {
     pub cfg: TextConfig,
     pub gpu: Gpu,
-    embed: u64,
+    embed: Weight,
     final_norm: u64,
     lm_head: Weight,
     /// The output head's bf16 rows (the MTP shortlist gathers from it).
+    /// The bf16 output head (0 when only its 8-bit form in `lm_head` is kept).
     head_table: u64,
     pub layers: Vec<Layer>,
     /// MTP draft head (when the checkpoint has one, unless AQ_MTP=0).
@@ -497,13 +498,28 @@ impl Model {
         let mut gpu = Gpu::new(0)?;
         let one = |n: &str| vec![format!("{P}{n}")];
 
-        let embed = concat_bf16(&mut gpu, &ck, &one("embed_tokens.weight"))?;
-        let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
-        let head_table = if cfg.tied() || !ck.has("lm_head.weight") {
-            embed
+        // A 4-bit checkpoint is for small devices: its embedding table and output head (2 GB
+        // each for the 9B, never quantized by the checkpoint) are stored in 8 bits, each as soon
+        // as it has been uploaded so the load's peak stays near its final footprint.
+        let small_tables = ck.has(&format!("{P}layers.0.mlp.gate_proj.weight.q4")) && cfg.hidden_size % 32 == 0;
+        let tied = cfg.tied() || !ck.has("lm_head.weight");
+        let embed_p = concat_bf16(&mut gpu, &ck, &one("embed_tokens.weight"))?;
+        let mut small_head = None;
+        let (embed, head_table) = if small_tables {
+            gpu.drain_uploads()?;
+            let e = gpu.quantize_weight(embed_p, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?;
+            small_head = Some(if tied {
+                e
+            } else {
+                let t = concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?;
+                gpu.drain_uploads()?;
+                gpu.quantize_weight(t, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?
+            });
+            (e, 0)
         } else {
-            concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?
+            (Weight::bf16(embed_p), if tied { embed_p } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
         };
+        let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
         // AQ_QUANT (experimental, not exact: outputs differ from the bf16 reference) stores the
         // layers' GEMM weights in 8 bits:
         //   fp8   E4M3 weights and activations: about half the GEMM time, but ~4 significant
@@ -656,11 +672,11 @@ impl Model {
         }
         gpu.sync()?;
         gpu.flush_uploads()?;
-        let mut lm_head = Weight::bf16(head_table);
+        let mut lm_head = small_head.unwrap_or(Weight::bf16(head_table));
         if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4) {
             anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
             gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
-            eprintln!("4-bit weights from the checkpoint (one scale per 128): not exact");
+            eprintln!("4-bit weights from the checkpoint (one scale per 128), 8-bit embedding table and head: not exact");
         }
         if quant != Fmt::Bf16 {
             let head = std::env::var("AQ_QUANT_HEAD").as_deref() == Ok("1") && cfg.vocab_size % 8 == 0 && h % 32 == 0;
@@ -1382,7 +1398,9 @@ impl Model {
                 g.k.gather_rows(
                     &st,
                     cfg((m.short_dirty.len() as u32, 1, 1), 256),
-                    self.head_table as *const u16,
+                    (if self.head_table != 0 { self.head_table } else { self.lm_head.p }) as *const u16,
+                    self.lm_head.scale as *const u16,
+                    (self.head_table == 0) as u32,
                     m.g_short_ids as *const u32,
                     m.g_short_slots as *const u32,
                     m.short_w as *mut u16,
@@ -1444,7 +1462,7 @@ impl Model {
         let chain = self.chain_mode;
         if !chain {
             unsafe {
-                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
+                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed.p as *const u16, self.embed.scale as *const u16, (self.embed.fmt == Fmt::Int8) as u32, s.x as *mut u16, hd)
             }
             .map_err(de)?;
             mark!("embed");
@@ -1505,7 +1523,9 @@ impl Model {
                         s.next as *const u32,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed as *const u16,
+                        self.embed.p as *const u16,
+                        self.embed.scale as *const u16,
+                        (self.embed.fmt == Fmt::Int8) as u32,
                         s.proj as *mut u16,
                         hd,
                         eps,
@@ -1529,7 +1549,9 @@ impl Model {
                         self.final_norm as *const u16,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed as *const u16,
+                        self.embed.p as *const u16,
+                        self.embed.scale as *const u16,
+                        (self.embed.fmt == Fmt::Int8) as u32,
                         s.next as *const u32,
                         s.tok as *const u32,
                         s.proj as *mut u16,
