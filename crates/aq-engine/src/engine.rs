@@ -230,6 +230,8 @@ pub struct SpecStats {
     /// Drafts whose first token came from the MTP head, and how many of those were accepted.
     pub mtp_drafted: u64,
     pub mtp_accepted: u64,
+    /// Requests that stopped on a token inside a fully accepted draft.
+    pub stop_in_draft: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -255,7 +257,7 @@ pub struct Engine {
     /// Max snapshot slots kept at once.
     pub max_snapshots: usize,
     clock: u64,
-    eos: Vec<u32>,
+    pub eos: Vec<u32>,
     pub last: StepStats,
     pub cache: CacheStats,
     /// Keep finished sequences for prefix reuse (on by default).
@@ -1623,6 +1625,9 @@ impl Engine {
                 }
             }
             let s = &mut self.running[i];
+            // The token limit cannot fall inside a draft (see `kmax`); a stop token can.
+            let ends = |t: &u32| !s.req.ignore_eos && eos.contains(t);
+            let emit = if nr == 0 { 0 } else { targets[..m + 1].iter().position(ends).map_or(m + 1, |p| p + 1) };
             if k < decode_seqs && self.spec_trace {
                 eprintln!(
                     "[spec] id {} out {} computed {} known {} n {n} slot {} spare {:?} local {} draft {d:?} targets {targets:?} m {m}",
@@ -1635,9 +1640,14 @@ impl Engine {
                     draft_local[k]
                 );
             }
+            // The spare slot's state is ahead of the emitted tokens: drop it like a rejection.
+            let overrun = !d.is_empty() && m == d.len() && emit < m;
+            if overrun {
+                st.stop_in_draft += 1;
+            }
             if d.is_empty() {
                 s.computed += n;
-            } else if m == d.len() {
+            } else if m == d.len() && !overrun {
                 // Every draft accepted: the spare slot holds the state after all n tokens.
                 s.k_cur = if self.spec_adaptive && d.len() >= s.k_cur.max(self.spec_k) { (2 * d.len()).min(MAX_DECODE_ROWS_PER_SEQ - 1) } else { 0 };
                 s.computed += n;
@@ -1647,7 +1657,7 @@ impl Engine {
             }
             // else: rejection. The old slot still holds the state before this step; the
             // accepted tokens become pending and are fed again next step.
-            if !d.is_empty() && m < d.len() {
+            if !d.is_empty() && (m < d.len() || overrun) {
                 s.k_cur = 0;
             }
             if k < decode_seqs && nr > 0 {
@@ -1667,7 +1677,7 @@ impl Engine {
             // The MTP head's prediction at the row whose sample is the last token emitted.
             let mtp_pred = if nr > 0 { self.model.last_mtp.get(r0 + m).copied() } else { None };
             let mut finished = false;
-            for &tok in &targets[..if nr > 0 { m + 1 } else { 0 }] {
+            for &tok in &targets[..emit] {
                 s.out.push(tok);
                 self.model.mtp_note([tok]);
                 if self.global_draft {
@@ -1696,6 +1706,7 @@ impl Engine {
                     break;
                 }
             }
+            debug_assert!(s.computed <= s.known());
             s.mtp_next = mtp_pred.map(|t| (s.known(), vec![t]));
             if finished {
                 done.push(i);
