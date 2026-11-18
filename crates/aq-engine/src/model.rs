@@ -436,6 +436,38 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 /// zero rows. Unless `fmt` is bf16 it is quantized as soon as its upload has landed and the
 /// bf16 copy freed, so the load never holds much more than the final footprint.
 fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fmt: Fmt) -> Result<Weight> {
+    // A pre-quantized checkpoint (scripts/convert_autoround.py) carries `<name>.q4` codes and
+    // `<name>.q4s` scales in place of the bf16 matrix; it is used as it is.
+    if names.iter().all(|n| ck.has(&format!("{n}.q4"))) {
+        anyhow::ensure!(k % 128 == 0, "4-bit weights need K to be a multiple of 128");
+        let pad_rows = pad_bytes / 2 / k;
+        let (mut qv, mut sv) = (Vec::new(), Vec::new());
+        for n in names {
+            let (q, sc) = (ck.get(&format!("{n}.q4"))?, ck.get(&format!("{n}.q4s"))?);
+            anyhow::ensure!(q.dtype == safetensors::Dtype::U8 && sc.dtype == safetensors::Dtype::F32 && q.bytes.len() / (k / 2) == sc.bytes.len() / (k / 128 * 4), "{n}: unexpected 4-bit layout");
+            qv.push(q);
+            sv.push(sc);
+        }
+        let (qb, sb): (usize, usize) = (qv.iter().map(|v| v.bytes.len()).sum(), sv.iter().map(|v| v.bytes.len()).sum());
+        let (p, scale) = (gpu.alloc_uninit(qb + pad_rows * k / 2)?, gpu.alloc_uninit(sb + pad_rows * k / 128 * 4)?);
+        let (mut qo, mut so) = (0u64, 0u64);
+        for (q, sc) in qv.into_iter().zip(sv) {
+            // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
+            unsafe {
+                gpu.queue_upload(p + qo, q.bytes, q.direct)?;
+                gpu.queue_upload(scale + so, sc.bytes, sc.direct)?;
+            }
+            qo += q.bytes.len() as u64;
+            so += sc.bytes.len() as u64;
+        }
+        if pad_rows > 0 {
+            // Zero scales make the padding rows zero whatever their codes are.
+            gpu.zero(p + qo, pad_rows * k / 2)?;
+            gpu.zero(scale + so, pad_rows * k / 128 * 4)?;
+            gpu.sync()?;
+        }
+        return Ok(Weight { p, scale, fmt: Fmt::Int4 });
+    }
     let p = concat_bf16_padded(gpu, ck, names, pad_bytes)?;
     let mut bytes = pad_bytes;
     for n in names {
@@ -625,6 +657,11 @@ impl Model {
         gpu.sync()?;
         gpu.flush_uploads()?;
         let mut lm_head = Weight::bf16(head_table);
+        if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4) {
+            anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
+            gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
+            eprintln!("4-bit weights from the checkpoint (one scale per 128): not exact");
+        }
         if quant != Fmt::Bf16 {
             let head = std::env::var("AQ_QUANT_HEAD").as_deref() == Ok("1") && cfg.vocab_size % 8 == 0 && h % 32 == 0;
             match quant {

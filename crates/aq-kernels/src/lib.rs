@@ -544,6 +544,33 @@ pub mod kernels {
         }
     }
 
+    /// Expand 4-bit weights to bf16: `out = bf16((code - 8) * scale)`, codes two per byte (low
+    /// nibble first), one f32 scale per 128 codes along a row. Rows are contiguous and their
+    /// length is a multiple of 128, so a matrix is `n * k / 32` blocks of 32 codes and block
+    /// `b` uses scale `b / 4`; one block per thread. grid = (ceil(blocks / 256)), block = (256).
+    #[kernel]
+    pub unsafe fn dequant_i4g(q: *const u8, scale: *const f32, out: *mut u16, blocks: u32) {
+        let b = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if b >= blocks as usize {
+            return;
+        }
+        let s = unsafe { *scale.add(b / 4) };
+        let qv = unsafe { q.add(b * 16) }.cast::<u32>();
+        let ov = unsafe { out.cast::<U32x4>().add(b * 4) };
+        #[unroll]
+        for j in 0..4 {
+            let v = unsafe { *qv.add(j) };
+            let mut packed = [0u32; 4];
+            #[unroll]
+            for e in 0..4 {
+                let c0 = ((v >> (8 * e)) & 15) as f32 - 8.0;
+                let c1 = ((v >> (8 * e + 4)) & 15) as f32 - 8.0;
+                packed[e] = pk(c0 * s, c1 * s);
+            }
+            unsafe { *ov.add(j) = U32x4::new(packed) };
+        }
+    }
+
     /// Split a bf16 matrix into two int8 digit planes for `gemm_i8w`:
     /// `x ~ sx[r, b] * (256 * xh + xl)`, a 16-bit fixed-point form with one scale per block of
     /// 32 elements along a row, `sx = max|block| / 32639` (the bound keeps the high digit of a

@@ -576,6 +576,29 @@ Plan for an 8 GB card: load the AutoRound format directly (4.125 bits per weight
 layer weights), 8-bit head, embedding table in host RAM (it is only gathered from), about 7 GB
 with a 1.5 GB KV pool. That budget is arithmetic on tensor sizes, not a measured load.
 
+### 4-bit weights from a pre-quantized checkpoint (2026-11-18)
+
+`scripts/convert_autoround.py <quantized dir> <original dir> <out dir>` turns a 4-bit AutoRound /
+GPTQ checkpoint (packing `auto_round:auto_gptq`, symmetric, group size 128; tested with
+`Intel/Qwen3.5-9B-int4-AutoRound`) into `<name>.weight.q4` (uint8 `[out, in / 2]`, two codes per
+byte, value = code - 8) and `<name>.weight.q4s` (f32 `[out, in / 128]`), plus everything else
+as it was (the MTP head comes from the original checkpoint, which the quantized one lacks).
+`gemm_weight` uses those tensors when a checkpoint has them (`Fmt::Int4`); nothing is selected
+by environment. `Gpu::gemm` expands 1024 rows at a time with `dequant_i4g` into the int8 path's
+buffer and runs the bf16 GEMM, as the int8 expansion does. No quantizer of our own.
+
+9B: 8.52 GiB on disk, of which the embedding table and the output head are 2 GB each in bf16.
+Quality is the checkpoint's: mean KL 0.147 / 0.079 / 0.129 on the three trace references (the
+same checkpoint dequantized to bf16 offline gives 0.142 / 0.079 / 0.127), top-1 235 / 232 /
+241 of 256. `aq-check` on the short reference passes: greedy 32/32 identical to the
+reference, batched, resumed and speculative paths identical to the single path. Exact gate
+with this build: see the commit. B200 replay (turns/min, tok/s, TPOT p50 ms): 4 agents 91.2 /
+247 / 4.9, 16 agents 334.0 / 881 / 6.4 (bf16 114.8 and 432.8; int8 with its kernel 362.5).
+
+Not done: a kernel that multiplies the codes directly (the expansion costs what the int8
+expansion cost); the embedding table in host RAM and an 8-bit head, without which the 9B does
+not fit in 8 GB (weights are 8.3 GB on the device today).
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)

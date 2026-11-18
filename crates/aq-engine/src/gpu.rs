@@ -21,6 +21,9 @@ pub enum Fmt {
     Fp8,
     /// int8 with one bf16 magnitude per block of 32 along a row; expanded to bf16 for the GEMM.
     Int8,
+    /// 4-bit codes (two per byte, value = code - 8) with one f32 scale per 128 along a row,
+    /// from a pre-quantized checkpoint; expanded to bf16 for the GEMM.
+    Int4,
 }
 
 /// A GEMM weight matrix `[n, k]` at `p`, with its scales at `scale` (0 for bf16).
@@ -385,7 +388,7 @@ impl Gpu {
                 unsafe { self.k.quant_i8b(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut u16, k as u32) }.map_err(de)?;
                 scale
             }
-            Fmt::Bf16 => anyhow::bail!("quantize_weight to bf16"),
+            Fmt::Bf16 | Fmt::Int4 => anyhow::bail!("quantize_weight to {fmt:?}"),
         };
         if !keep {
             self.free(w)?;
@@ -497,6 +500,23 @@ impl Gpu {
         .min(cap)
         .max(m);
         let s = self.raw_stream();
+        if w.fmt == Fmt::Int4 {
+            // Same scheme as the int8 expansion below, from a quarter of the bf16 bytes.
+            anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "int4 weights write bf16");
+            let tmp = self.wtmp[self.lane];
+            let nc = self.i8_rows().min(n);
+            anyhow::ensure!(nc * k * 2 <= self.wtmp_bytes, "int4 weight chunk larger than its expansion buffer");
+            for c in (0..n).step_by(nc) {
+                let rows = nc.min(n - c);
+                unsafe {
+                    let blocks = (rows * k / 32) as u32;
+                    self.k.dequant_i4g(&self.stream, cfg((blocks.div_ceil(256), 1, 1), 256), (w.p + (c * k / 2) as u64) as *const u8, (w.scale + (c * k / 128 * 4) as u64) as *const f32, tmp as *mut u16, blocks)
+                }
+                .map_err(de)?;
+                self.lt.gemm_rows(s, mb, rows, k, x, tmp, y + (c * 2) as u64, n)?;
+            }
+            return Ok(());
+        }
         if w.fmt == Fmt::Int8 {
             // Expand to bf16 (exactly what the weight stands for), then the bf16 GEMM, in
             // chunks of rows small enough for the expansion to stay in cache.

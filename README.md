@@ -40,6 +40,20 @@ turns/min and 131 tok/s on this replay (TTFT 1052 / 3739 ms).
 `fp8` is the fast one and changes about 3% of greedy tokens; `int8` is near the bf16 noise
 floor and trades speed for memory.
 
+### 4-bit weights (pre-quantized checkpoint)
+
+A 4-bit AutoRound / GPTQ checkpoint is loaded as it is after one conversion:
+
+```sh
+python scripts/convert_autoround.py <Intel/Qwen3.5-9B-int4-AutoRound dir> <Qwen/Qwen3.5-9B dir> qwen35-9b-int4
+aq-serve qwen35-9b-int4
+```
+
+4.1 bits per layer weight; on long agent traces about 92% of greedy tokens agree with the
+bf16 model (KL 0.08–0.15 nats), which is that checkpoint's quality, not something the engine
+adds. The embedding table and the output head are still 16-bit, so the 9B takes 8.3 GB of
+weights for now.
+
 Method, more machines and the history are in [docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## Run
