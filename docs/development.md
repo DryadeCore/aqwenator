@@ -1,0 +1,107 @@
+# Development
+
+## Build
+
+With Docker:
+
+```sh
+docker build -t aqwenator .                                         # image
+docker build --target binaries --output type=local,dest=bin .       # binaries only
+```
+
+Without: the CUDA 13 toolkit, clang 21, Rust 1.99.1 and `cargo-oxide`. `scripts/setup.sh`
+installs them in user space under `~/aq`.
+
+```sh
+source scripts/env.sh
+cargo oxide build --arch sm_80 -- --release -p aq-engine -p aq-server --bins
+```
+
+Kernels target `sm_80` and the driver compiles them for the device, so one build serves every
+supported GPU. Do not run `cargo fmt --all`.
+
+| Binary | Use |
+|---|---|
+| `aq-serve` | The server |
+| `aq-check` | Correctness against reference files ([correctness](correctness.md)) |
+| `aq-bench` | Synthetic load without HTTP |
+| `aq-ceiling` | What a device allows: bandwidth, GEMM rate, bounds for one step of a model |
+
+## Server options
+
+```
+aq-serve <model> [options]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--port` | 8000 | |
+| `--max-seqs` | 64 | State slots: running plus parked sessions |
+| `--max-running` | | Sequences running at once |
+| `--max-ctx` | 32768 | Longest context |
+| `--max-tokens` | 8192 | Prefill tokens per step; also sizes the scratch memory |
+| `--kv-gb` | | Attention cache pool |
+| `--mixed-prefill` | | Prefill tokens allowed in a step that also decodes |
+| `--spec-k` | 4 | Draft budget per sequence, 0 = off |
+| `--session-cache` | true | Park finished sessions for reuse |
+| `--burst-prefill`, `--burst-every` | 4096, 3 | A long prompt gets a whole step every few steps |
+| `--srpt` | true | Shortest prefill first |
+| `--prewarm` | false | Create every GEMM plan at startup |
+| `--evict`, `--pin-snapshots`, `--load-control` | | Cache policy |
+
+Environment:
+
+| Variable | Meaning |
+|---|---|
+| `AQ_QUANT=fp8\|int8` | Weight tier ([quantization](quantization.md)) |
+| `AQ_KV=int8` | 8-bit attention cache |
+| `AQ_MTP=0` | Do not load the draft head |
+| `AQ_MTP_K`, `AQ_MTP_SHORT` | Chained drafts (3), draft shortlist size (32768) |
+| `AQ_BG_PREFILL=N` | Background prefill lane |
+| `AQ_PROFILE=1\|decode\|prefill` | Per-operation GPU time, printed periodically |
+| `AQ_TRACE=1` | Step and request logs |
+| `AQ_KINFO=1` | Registers and shared memory of every kernel |
+
+`AQ_PROFILE` records CUDA events between operations and turns CUDA graphs off, so small
+operations include their launch latency.
+
+## Scripts
+
+| Script | Use |
+|---|---|
+| `setup.sh`, `env.sh` | Toolchain in user space |
+| `golden.py`, `gate.sh` | Reference files and the correctness gate |
+| `trace_bench.py`, `trace_sweep.sh`, `trace_tail.py` | The replay benchmark ([benchmarks](benchmarks.md)) |
+| `baseline_vllm.sh`, `baseline_llamacpp.sh`, `setup_ref.sh`, `cuda_shim.sh` | Other engines on the same replay |
+| `convert_autoround.py` | 4-bit checkpoints |
+
+## Working on kernels
+
+- bf16 values travel as raw `u16`; math happens in f32. Where the reference materializes a
+  bf16 tensor, round (`rb`) at the same place.
+- A kernel takes raw device pointers into the engine's arena. Its launch shape must not
+  depend on data, or the step cannot be captured as a graph.
+- Check shared memory against the smallest device you target (about 100 KiB per block on a
+  GB10) and opt in above 48 KiB.
+- Integer division by a runtime value is slow enough to show in a profile; so is a 64-bit
+  one.
+- Measure against `aq-ceiling` before optimizing: a kernel at its bandwidth bound needs fewer
+  bytes, not better code.
+- Keep the fastest variant and delete the others, unless they differ in correctness.
+
+## Running on a shared machine
+
+Launch long jobs detached, with a timeout and a marker file on completion. Kill only your own
+process ids, and pick an idle GPU before starting.
+
+## Documentation
+
+The pages in `docs/` are an [mdBook](https://rust-lang.github.io/mdBook/): `mdbook serve`
+previews them, and a push to `main` publishes them to GitHub Pages. `docs/results.md` is
+generated ([benchmarks](benchmarks.md#results)).
+
+## Release
+
+Pushing a tag `vX.Y.Z` builds amd64 and arm64 images with provenance and an SBOM, publishes
+`ghcr.io/<owner>/aqwenator:X.Y.Z` and `:latest`, and attaches the binaries and their SHA-256
+sums to a GitHub release. Versions follow `0.x`: a minor bump may break.
