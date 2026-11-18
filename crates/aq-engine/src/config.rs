@@ -22,7 +22,17 @@ pub struct TextConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    /// MLP width; for a mixture-of-experts model, the shared expert's.
+    #[serde(default)]
     pub intermediate_size: usize,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
     pub vocab_size: usize,
     pub rms_norm_eps: f64,
     pub layer_types: Vec<String>,
@@ -55,6 +65,9 @@ impl TextConfig {
         let root: Root = serde_json::from_str(&raw).context("parsing config.json")?;
         let mut c = root.text_config;
         c.tie_word_embeddings = c.tie_word_embeddings.or(root.tie_word_embeddings);
+        if c.moe() {
+            c.intermediate_size = c.shared_expert_intermediate_size;
+        }
         c.validate()?;
         Ok(c)
     }
@@ -76,6 +89,12 @@ impl TextConfig {
         if self.hidden_size % 8 != 0 || self.hidden_size > 8192 || self.intermediate_size % 8 != 0 || self.vocab_size % 8 != 0 {
             bail!("vectorized kernels need hidden/intermediate/vocab multiples of 8 and hidden <= 8192");
         }
+        if self.moe() && (self.num_experts != 256 || self.num_experts_per_tok != 8 || self.moe_intermediate_size % 64 != 0 || self.shared_expert_intermediate_size != self.moe_intermediate_size || self.hidden_size % 128 != 0) {
+            bail!("expert kernels assume 256 experts, 8 per token, an expert width that is a multiple of 64 and also the shared expert's, and a hidden size that is a multiple of 128");
+        }
+        if self.intermediate_size == 0 {
+            bail!("config has no MLP width");
+        }
         if self.layer_types.len() != self.num_hidden_layers {
             bail!("layer_types length mismatch");
         }
@@ -87,6 +106,11 @@ impl TextConfig {
             "full_attention" => LayerKind::Full,
             _ => LayerKind::Linear,
         }
+    }
+
+    /// Mixture-of-experts MLPs (`qwen3_5_moe`).
+    pub fn moe(&self) -> bool {
+        self.num_experts > 0
     }
 
     pub fn tied(&self) -> bool {
