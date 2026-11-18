@@ -64,7 +64,8 @@ docker run --gpus all -p 8000:8000 -v ~/models:/models:ro \
 | 9B, 4-bit, settings above | Engine allocates |
 |---|---|
 | with the draft head | 7.0 GiB |
-| without it (`-e AQ_MTP=0`) | 6.0 GiB |
+| with the draft head, `-e AQ_KV=int8 --kv-gb 0.5` (about the same context) | 6.5 GiB |
+| without the draft head (`-e AQ_MTP=0`) | 6.0 GiB |
 
 plus the CUDA context (0.7 GiB on a B200). `-e AQ_KV=int8` stores the attention cache in 8
 bits: the same `--kv-gb` then holds 1.9 times the context, at no measurable cost in quality. Measured on a B200 only so far, where it does 339

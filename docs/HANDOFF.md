@@ -664,6 +664,10 @@ the staging area leaves room for one sub-tile instead of two within 100 KiB. It 
 and for bandwidth-limited devices, where decode attention reads half the bytes; not measured
 on one.
 
+Device memory with the 4-bit 9B, 4 slots, `--max-tokens 1024` on a B200 (0.73 GiB of it is
+the CUDA context): 8-bit cache with a 0.5 GB pool (about 27k tokens with the draft head's
+layer) 7.36 GB, the same without the draft head 6.38 GB; a 1 GB pool 7.86 GB.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
