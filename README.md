@@ -3,13 +3,24 @@
 An inference server written for one model family: Qwen3.5 hybrid (Gated DeltaNet + attention)
 models, on NVIDIA GPUs. Rust host, kernels in Rust compiled to PTX with
 [cuda-oxide](https://github.com/NVIDIA/cuda-rust), GEMMs through cuBLASLt. It targets
-agentic workloads (many long multi-turn sessions) on a single GPU, down to a DGX Spark.
+agentic workloads (many long multi-turn sessions) on a single GPU, from a datacenter card
+down to a DGX Spark, with a 4-bit path meant for 8 GB cards.
 
 Outputs are checked token for token against `transformers` (`aq-check`).
 
 The aim is good models at good speed on hardware that should not be able to run them, with
 many agents sharing one box. The focus is Qwen models for the moment; other models get added
 when they fit the existing kernels.
+
+## What is in it
+
+- Sessions stay on the device between turns: paged attention cache, recurrent state slots,
+  prompt checkpoints, eviction of the least recently used session. A returning agent only
+  pays for its new tokens.
+- Speculative decoding with the model's own draft head (MTP, chained) and prompt-lookup drafts.
+- Tensor-core kernels for prefill and decode attention and for integer-weight GEMMs.
+- Weight tiers: bf16 (exact), `fp8`, `int8`, and 4-bit AutoRound / GPTQ checkpoints.
+- Small-card options: 8-bit attention cache, 8-bit output head, embedding table in host memory.
 
 ## Numbers
 
@@ -21,6 +32,17 @@ Qwen3.5-9B, replay of recorded OpenHands trajectories, 10 minutes per run, DGX S
 | 16 | vLLM 0.33, MTP speculation | 57.4 | 122 | 1022 / 2909 |
 | 8 | aqwenator | 57.4 | 157 | |
 | 8 | vLLM 0.33, MTP speculation | 44.6 | 102 | |
+
+Same model and replay on one B200, turns/min:
+
+| Agents | aqwenator | vLLM 0.33, MTP speculation | vLLM 0.33 | llama.cpp 1.0-dev (f16) |
+|---|---|---|---|---|
+| 1 | 28.2 | 27.5 | 24.2 | 20.5 |
+| 4 | 114.8 | 105.8 | 91.8 | 51.2 |
+| 16 | 432.8 | 384.5 | 313.0 | 80.2 |
+| 32 | 738.5 | 795.2 | 576.2 | 79.5 |
+
+vLLM is ahead at 32 agents, and has the better TTFT p99 at 1, 16 and 32.
 
 Cold start, 9B on the Spark: first token 3.2 s after launch, page cache warm or cold.
 
@@ -186,6 +208,12 @@ first two times and forks a snapshot from the third on; a prefix shorter than 10
 never snapshotted; with `AQ_COEXEC` or `AQ_BG_PREFILL` (study modes, off by default) tokens
 are picked on the device, so only greedy, unconstrained requests are served, and a request
 without `temperature` is greedy there.
+
+Endpoints: `/v1/chat/completions`, `/v1/completions` (text or token-id prompts, `stream`), `/v1/models`, `/health`.
+`aq-serve <model> --help`-style options are listed in `crates/aq-server/src/main.rs`; the ones
+that matter are `--max-seqs`, `--max-ctx`, `--max-tokens` (prefill tokens per step) and
+`--kv-gb` (attention cache pool). Environment: `AQ_QUANT=fp8|int8` (weight tier),
+`AQ_KV=int8` (8-bit attention cache), `AQ_MTP=0` (no draft head).
 
 ## Build
 
