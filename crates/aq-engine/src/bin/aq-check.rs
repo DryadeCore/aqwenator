@@ -291,11 +291,10 @@ fn main() -> Result<()> {
     // AQ_SPEC_K: run the engine-level checks below with speculative decoding on.
     let spec_env: usize = std::env::var("AQ_SPEC_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     eng.spec_k = spec_env;
-    // AQ_CHECK_POLICY=mru,pin,load,srpt: run the engine-level tests under these policies.
+    // AQ_CHECK_POLICY=pin,load,srpt: run the engine-level tests under these policies.
     if let Ok(p) = std::env::var("AQ_CHECK_POLICY") {
         for f in p.split(',') {
             match f {
-                "mru" => eng.policy.evict = aq_engine::engine::Evict::Mru,
                 "idle" => eng.policy.evict = aq_engine::engine::Evict::Idle,
                 "pin" => eng.policy.pin_snapshots = true,
                 "load" => eng.policy.load_control = true,

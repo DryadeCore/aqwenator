@@ -192,7 +192,6 @@ struct EngineOpts {
     spec_k: usize,
     policy: aq_engine::engine::Policy,
     max_snapshots: Option<usize>,
-    itl_target_ms: Option<f64>,
     adaptive: Option<(usize, usize)>,
     prewarm: bool,
     /// Burst prefill for long prompts: tokens per burst step (0 = off) and steps between bursts.
@@ -239,9 +238,8 @@ fn engine_loop(dir: PathBuf, limits: Limits, opts: EngineOpts, eos: Vec<u32>, rx
     if let Some(n) = opts.max_snapshots {
         eng.max_snapshots = n;
     }
-    eng.itl_target_us = opts.itl_target_ms.map(|m| m * 1000.0);
     eng.mixed_prefill_adaptive = opts.adaptive;
-    eprintln!("policy: {:?} max_snapshots {} itl_target_ms {:?}", eng.policy, eng.max_snapshots, opts.itl_target_ms);
+    eprintln!("policy: {:?} max_snapshots {}", eng.policy, eng.max_snapshots);
     let mut last_report = Instant::now();
     eprintln!("engine ready in {:.2}s", t0.elapsed().as_secs_f64());
     let _ = ready.send(Ok(()));
@@ -341,7 +339,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let model = args.next().context("usage: aq-serve <model> [--port N] [--max-seqs N] [--max-ctx N] [--max-tokens N] [--mixed-prefill N]")?;
     let (mut port, mut max_seqs, mut max_ctx, mut max_tokens) = (8000u16, 64usize, 32768usize, 8192usize);
-    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, itl_target_ms: None, adaptive: None, prewarm: false, burst: (4096, 3) };
+    let mut opts = EngineOpts { mixed: None, max_running: None, session_cache: true, spec_k: 4, policy: Default::default(), max_snapshots: None, adaptive: None, prewarm: false, burst: (4096, 3) };
     // Shortest remaining prefill first by default (`--srpt false` restores admission order):
     // on real agent traces it keeps small turns from queueing behind a long tool result, at
     // the same throughput (Spark, 16 agents: TTFT p90 2633 -> 1506 ms).
@@ -361,9 +359,8 @@ async fn main() -> Result<()> {
             "--evict" => {
                 opts.policy.evict = match v.as_str() {
                     "lru" => aq_engine::engine::Evict::Lru,
-                    "mru" => aq_engine::engine::Evict::Mru,
                     "idle" => aq_engine::engine::Evict::Idle,
-                    _ => anyhow::bail!("--evict lru|mru|idle"),
+                    _ => anyhow::bail!("--evict lru|idle"),
                 }
             }
             "--pin-snapshots" => opts.policy.pin_snapshots = v.parse()?,
@@ -384,7 +381,6 @@ async fn main() -> Result<()> {
                 opts.adaptive = Some((a.parse()?, b.parse()?));
             }
             "--max-snapshots" => opts.max_snapshots = Some(v.parse()?),
-            "--itl-target-ms" => opts.itl_target_ms = Some(v.parse()?),
             "--kv-gb" => kv_gb = v.parse()?,
             _ => anyhow::bail!("unknown option {k}"),
         }

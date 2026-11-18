@@ -122,9 +122,6 @@ fn is_strict_prefix(t: &[u32], prompt: &[u32]) -> bool {
 pub enum Evict {
     /// Least recently parked first (classic LRU).
     Lru,
-    /// Most recently parked first. With bounded tool think time, the session parked longest
-    /// ago is the one most likely to come back next, so LRU evicts exactly the wrong one.
-    Mru,
     /// Idle-aware: sessions idle longer than `dead_after_ms` are presumed finished and go
     /// first (oldest first); among the live ones, most recently parked first.
     Idle,
@@ -333,22 +330,9 @@ pub struct Engine {
     /// from stalling the sequences that are generating. Not combined with co-execution.
     pub bg_prefill: usize,
     pub policy: Policy,
-    /// Frame pacing: target duration of a step that carries decode tokens (µs).
-    pub itl_target_us: Option<f64>,
-    pace: Pace,
     /// Set during an admission that may only evict sessions presumed finished.
     dead_only: bool,
 }
-
-/// Online step-cost model for frame pacing.
-#[derive(Debug, Clone, Copy)]
-struct Pace {
-    decode_us: f64,
-    prefill_us_per_tok: f64,
-}
-
-/// Smallest prefill chunk frame pacing will schedule next to decodes (keeps prefill moving).
-const PACE_MIN_CHUNK: usize = 256;
 
 impl Engine {
     pub fn new(model: Model, eos: Vec<u32>) -> Self {
@@ -397,8 +381,6 @@ impl Engine {
             bg_prefill: 0,
             // AQ_SRPT=1: test hook, so aq-check can run its suite under the SRPT prefill order.
             policy: Policy { srpt: std::env::var("AQ_SRPT").as_deref() == Ok("1"), ..Policy::default() },
-            itl_target_us: None,
-            pace: Pace { decode_us: 5000.0, prefill_us_per_tok: 30.0 },
             dead_only: false,
         };
         // The MTP head keeps its own KV over the whole context, so it runs on every step of
@@ -612,7 +594,6 @@ impl Engine {
         }
         let victim = match self.policy.evict {
             Evict::Lru => (0..self.parked.len()).min_by_key(|&i| self.parked[i].last_used),
-            Evict::Mru => (0..self.parked.len()).max_by_key(|&i| self.parked[i].last_used),
             Evict::Idle => {
                 let now = Instant::now();
                 let dead = |i: usize| now.duration_since(self.parked[i].parked_at).as_millis() as u64 >= self.policy.dead_after_ms;
@@ -1425,13 +1406,6 @@ impl Engine {
                 None => self.mixed_prefill_budget,
             };
             budget = budget.min(mixed);
-            // Frame pacing: size the prefill part so the whole step fits the ITL target,
-            // from online estimates of the decode cost and the per-token prefill cost.
-            if let Some(target) = self.itl_target_us {
-                let room = target - self.pace.decode_us.min(target * 0.8);
-                let tokens = (room / self.pace.prefill_us_per_tok.max(1e-3)) as usize;
-                budget = budget.min(tokens.max(PACE_MIN_CHUNK));
-            }
         }
         // Prefill order: admission order, or shortest remaining prefill first (SRPT).
         // Prompts long enough for the background lane wait for it instead of taking main steps.
@@ -1592,16 +1566,6 @@ impl Engine {
         }
         for &(i, _) in &plan {
             self.running[i].steps += 1;
-        }
-        // Update the pacing model: pure-decode steps give the decode cost, mixed steps give
-        // the per-token prefill cost on top of it.
-        let prefill_tokens = b.tokens.len() - decode_seqs;
-        if prefill_tokens == 0 {
-            self.pace.decode_us = 0.9 * self.pace.decode_us + 0.1 * gpu_us as f64;
-        } else if prefill_tokens >= 64 {
-            let base = if decode_seqs > 0 { self.pace.decode_us } else { 0.0 };
-            let per = ((gpu_us as f64 - base).max(0.0)) / prefill_tokens as f64;
-            self.pace.prefill_us_per_tok = 0.8 * self.pace.prefill_us_per_tok + 0.2 * per;
         }
 
         // Tokens from a collected background batch come first: this step may already have
