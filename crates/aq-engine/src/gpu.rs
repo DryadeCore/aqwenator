@@ -54,6 +54,9 @@ pub struct Gpu {
     /// (pointer, bytes) of every live allocation.
     allocs: Vec<(u64, usize)>,
     pub allocated_bytes: usize,
+    /// AQ_DEVICE_GB: refuse allocations past this many bytes (0 = no limit), to size a
+    /// configuration for a smaller card than the one at hand. The CUDA context is not counted.
+    budget_bytes: usize,
     /// The weight loader, between the first `queue_upload` and `flush_uploads`.
     loader: Option<Loader>,
     /// True between `begin_capture` and `end_capture`.
@@ -219,6 +222,7 @@ impl Gpu {
             allocs: vec![(ws, WORKSPACE_BYTES)],
             loader: None,
             allocated_bytes: WORKSPACE_BYTES,
+            budget_bytes: std::env::var("AQ_DEVICE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(0, |g| (g * (1u64 << 30) as f64) as usize),
             capturing: Default::default(),
             x8: Vec::new(),
             x8_dims: (0, 0),
@@ -297,9 +301,22 @@ impl Gpu {
         self.stream.cu_stream() as *mut c_void
     }
 
+    fn charge(&self, bytes: usize) -> Result<()> {
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        anyhow::ensure!(
+            self.budget_bytes == 0 || self.allocated_bytes + bytes <= self.budget_bytes,
+            "device memory budget exceeded (AQ_DEVICE_GB): {:.2} GiB allocated, {:.2} more requested, budget {:.2}",
+            gib(self.allocated_bytes),
+            gib(bytes),
+            gib(self.budget_bytes)
+        );
+        Ok(())
+    }
+
     /// Allocate `bytes` (rounded up to 256) of device memory, zeroed.
     pub fn alloc(&mut self, bytes: usize) -> Result<u64> {
         let bytes = bytes.max(1).next_multiple_of(256);
+        self.charge(bytes)?;
         let p = unsafe { memory::malloc_sync(bytes) }.map_err(de)?;
         unsafe { memory::memset_d8_async(p, 0, bytes, self.stream.cu_stream()) }.map_err(de)?;
         self.allocs.push((p, bytes));
@@ -311,6 +328,7 @@ impl Gpu {
     /// the caller overwrites completely (weights).
     pub fn alloc_uninit(&mut self, bytes: usize) -> Result<u64> {
         let bytes = bytes.max(1).next_multiple_of(256);
+        self.charge(bytes)?;
         let p = unsafe { memory::malloc_sync(bytes) }.map_err(de)?;
         self.allocs.push((p, bytes));
         self.allocated_bytes += bytes;
@@ -636,7 +654,9 @@ impl Gpu {
     pub fn max_smem_optin(&self) -> Result<usize> {
         let mut v = 0i32;
         drv(unsafe { cuDeviceGetAttribute(&mut v, 97, self.ctx.cu_device() as i32) }, "cuDeviceGetAttribute")?;
-        Ok(v as usize)
+        // AQ_SMEM_KB: pretend the device allows less, as a smaller card would.
+        let cap = std::env::var("AQ_SMEM_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |k| k * 1024);
+        Ok((v as usize).min(cap))
     }
 
     pub fn launch_graph(&self, exec: u64) -> Result<()> {
@@ -670,6 +690,7 @@ impl Gpu {
     }
 
     pub fn opt_in_dynamic_smem(&self, kernel: &str, bytes: u32) -> Result<()> {
+        anyhow::ensure!(bytes as usize <= self.max_smem_optin()?, "{kernel} needs {bytes} bytes of shared memory per block, more than this device allows");
         const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
         let name = std::ffi::CString::new(kernel)?;
         let mut f = std::ptr::null_mut();
@@ -693,6 +714,7 @@ impl Gpu {
     /// Opt a kernel into more than 48 KiB of dynamic shared memory (raw launches do not go
     /// through cuda-oxide's launch contracts, which would otherwise do this).
     pub fn set_max_dynamic_smem(&self, kernel: &str, bytes: u32) -> Result<()> {
+        anyhow::ensure!(bytes as usize <= self.max_smem_optin()?, "{kernel} needs {bytes} bytes of shared memory per block, more than this device allows");
         let module = self.k.as_cuda_module().cu_module() as *mut c_void;
         let name = std::ffi::CString::new(kernel)?;
         let mut f = std::ptr::null_mut();
