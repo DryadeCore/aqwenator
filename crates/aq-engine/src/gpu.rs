@@ -71,13 +71,11 @@ pub struct Gpu {
     /// AQ_I8_CHUNK: rows of an int8 weight expanded and multiplied at a time (0 = `i8_rows`).
     i8_chunk: usize,
     /// AQ_I8_KERNEL_M: int8 GEMMs of at most this many rows use `gemm_i8w` (0 = never); larger
-    /// ones expand the weight and use the bf16 GEMM. On a B200 the kernel wins up to ~128-256
-    /// rows (0.25 ms vs 0.35 ms at 128 for a 24576 x 4096 weight).
+    /// ones expand the weight and use the bf16 GEMM, because the kernel's cost grows per row.
     i8_kernel_m: usize,
     /// Weights with fewer rows than this take the expansion path: the kernel launches one
-    /// block per 128 weight rows, too few to fill the device, while expanding a small weight
-    /// is cheap. Default: a block for every fourth SM (measured on a B200, 148 SMs: 6144 rows
-    /// win, 4096 lose); AQ_I8_KERNEL_MIN_N overrides.
+    /// block per 128 weight rows, too few to fill the device. Default: a block for every
+    /// fourth SM (on a B200, 6144 rows win and 4096 lose); AQ_I8_KERNEL_MIN_N overrides.
     i8_kernel_min_n: usize,
     /// AQ_QSIM diagnostic: 8-bit round trip of (weights, activations); 0 = off, 1 = E4M3,
     /// 2 = int8. Everything still runs as bf16 GEMMs.
@@ -101,11 +99,9 @@ const STAGE_BUFS: usize = 12;
 const ALIGN: usize = 4096;
 
 /// The weight loader: reader threads fill page-locked staging buffers in parallel and the
-/// thread that owns the `Gpu` copies each filled buffer to the device. With direct I/O the
-/// readers bypass the page cache, which reads an NVMe drive at its full speed whether or
-/// not the file is cached (faulting in a cold mapping gave 1 GB/s on the DGX Spark). A
-/// plain `cuMemcpyHtoD` from pageable memory stages through the driver on one thread, which
-/// measured 0.35-0.5 GB/s there.
+/// thread that owns the `Gpu` copies each filled buffer to the device. Direct I/O reads the
+/// drive at full speed whether or not the file is cached, and page-locked buffers avoid the
+/// driver's single-threaded staging of pageable memory.
 struct Loader {
     jobs: Option<mpsc::Sender<Piece>>,
     /// (buffer, piece, offset of the piece's first byte in the buffer or the read error)
@@ -365,10 +361,9 @@ impl Gpu {
         m <= self.i8_kernel_m && n >= self.i8_kernel_min_n && k % 64 == 0 && n % 8 == 0
     }
 
-    /// Rows of an int8 weight expanded and multiplied at a time. Expanding a chunk and
-    /// multiplying it right away keeps the bf16 copy within the cache's reach: on the DGX
-    /// Spark (9B, 16 x 16k) 1024 rows gave 192 ms between tokens, the whole weight 234 ms,
-    /// 512 and 2048 rows less throughput, and uneven chunk sizes 243 ms.
+    /// Rows of an int8 weight expanded and multiplied at a time: small enough to keep the bf16
+    /// copy within the cache's reach (1024 was the best of 512 to the whole weight on a DGX
+    /// Spark).
     fn i8_rows(&self) -> usize {
         if self.i8_chunk > 0 { self.i8_chunk } else { 1024 }
     }
@@ -475,9 +470,9 @@ impl Gpu {
     }
 
     /// Host-to-device copy, enqueued on the compute stream so it is ordered after every kernel
-    /// already queued there (a synchronous copy on the legacy default stream is not, and once
-    /// overwrote a step's metadata while that step's kernels were still reading it). The
-    /// source is pageable, so the driver stages it before returning and `src` may be dropped.
+    /// already queued there (a synchronous copy could overwrite metadata a queued kernel still
+    /// reads). The source is pageable: the driver stages it before returning, so `src` may be
+    /// dropped.
     pub fn upload<T>(&self, dst: u64, src: &[T]) -> Result<()> {
         unsafe { memory::memcpy_htod_async(dst, src.as_ptr(), std::mem::size_of_val(src), self.stream.cu_stream()) }.map_err(de)
     }

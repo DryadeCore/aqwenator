@@ -130,10 +130,9 @@ pub struct Mtp {
     norm: u64,
     pre_e: u64,
     pre_h: u64,
-    /// Shortlisted output head: the head's argmax runs over a gathered copy of `short_n`
-    /// output-embedding rows instead of the whole vocabulary (reading the full table costs
-    /// more than the rest of the head). A wrong shortlist only costs a rejected draft.
-    /// 0 = full vocabulary.
+    /// The head's argmax runs over `short_n` gathered output-embedding rows (0 = the whole
+    /// vocabulary): reading the full table costs more than the rest of the head, and a wrong
+    /// shortlist only costs a rejected draft.
     short_n: usize,
     /// Token id in each slot, and each token's slot (`u32::MAX` = not shortlisted).
     short_ids: Vec<u32>,
@@ -271,8 +270,8 @@ pub struct Model {
     embed_rows: Vec<u8>,
     final_norm: u64,
     lm_head: Weight,
-    /// The output head's bf16 rows (the MTP shortlist gathers from it).
-    /// The bf16 output head (0 when only its 8-bit form in `lm_head` is kept).
+    /// The bf16 output head, which the MTP shortlist gathers from (0 when only its 8-bit
+    /// form in `lm_head` is kept).
     head_table: u64,
     pub layers: Vec<Layer>,
     /// MTP draft head (when the checkpoint has one, unless AQ_MTP=0).
@@ -428,7 +427,8 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
 }
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per sub-tile and query head of the group)
-/// plus one 32-key K tile and one V tile, all 256-wide bf16.
+/// plus `nbuf` pairs of 32-key K and V tiles, all 256-wide bf16, plus with the 8-bit cache
+/// the staging area for one pair as stored.
 fn attention_tc_smem(group: usize, qt: usize, nbuf: usize, kv8: bool) -> u32 {
     ((qt * group * 16 + nbuf * 2 * 32) * 256 * 2 + if kv8 { 2 * 32 * KV8_ROW } else { 0 }) as u32
 }
@@ -446,7 +446,6 @@ const KV8_ROW: usize = 272;
 /// Padded batch sizes that get a captured decode graph.
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
-/// Upload several bf16 matrices concatenated along rows into one buffer.
 /// Row stride of the router logits: 256 experts, the shared expert's gate, padding.
 const MOE_ROUTER_LD: usize = 264;
 /// Shared memory of a `moe_gemm` block.
@@ -481,6 +480,7 @@ fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, n: &dyn Fn(&str
     ))
 }
 
+/// Upload several bf16 matrices concatenated along rows into one buffer.
 fn concat_bf16(gpu: &mut Gpu, ck: &Checkpoint, names: &[String]) -> Result<u64> {
     concat_bf16_padded(gpu, ck, names, 0)
 }
@@ -509,8 +509,8 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 /// zero rows. Unless `fmt` is bf16 it is quantized as soon as its upload has landed and the
 /// bf16 copy freed, so the load never holds much more than the final footprint.
 fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fmt: Fmt) -> Result<Weight> {
-    // A pre-quantized checkpoint (scripts/convert_autoround.py) carries `<name>.q4` codes and
-    // `<name>.q4s` scales in place of the bf16 matrix; it is used as it is.
+    // A pre-quantized checkpoint (scripts/convert_autoround.py) has `<name>.q4` codes and
+    // `<name>.q4s` scales in place of the bf16 matrix.
     if names.iter().all(|n| ck.has(&format!("{n}.q4"))) {
         anyhow::ensure!(k % 128 == 0, "4-bit weights need K to be a multiple of 128");
         let pad_rows = pad_bytes / 2 / k;
@@ -570,10 +570,9 @@ impl Model {
         let mut gpu = Gpu::new(0)?;
         let one = |n: &str| vec![format!("{P}{n}")];
 
-        // A 4-bit checkpoint is for small devices. Its embedding table and output head (2 GB
-        // each for the 9B) are bf16: the head is stored in 8 bits as soon as it has been
-        // uploaded, and the embedding table stays in host memory (the mapped checkpoint): a
-        // step uploads the rows of its tokens, and the draft head keeps its shortlist's rows.
+        // A 4-bit checkpoint is for small devices, and its embedding table and output head
+        // are still bf16: the head is stored in 8 bits and the table stays in host memory (a
+        // step uploads its tokens' rows; the draft head keeps its shortlist's).
         let small_tables = ck.has(&format!("{P}layers.0.mlp.gate_proj.weight.q4")) && cfg.hidden_size % 32 == 0;
         let tied = cfg.tied() || !ck.has("lm_head.weight");
         let embed_name = format!("{P}embed_tokens.weight");
@@ -589,12 +588,9 @@ impl Model {
             (e, if tied { e } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
         };
         let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
-        // AQ_QUANT (experimental, not exact: outputs differ from the bf16 reference) stores the
-        // layers' GEMM weights in 8 bits:
-        //   fp8   E4M3 weights and activations: about half the GEMM time, but ~4 significant
-        //         bits (mean KL to the reference 0.03 nats on real traces, bf16 0.002);
-        //   int8  int8 weights with a scale per 32 values, expanded to bf16 for each GEMM:
-        //         at the reference's noise floor (0.003), slower than bf16.
+        // AQ_QUANT (not exact) stores the layers' GEMM weights in 8 bits:
+        //   fp8   E4M3 weights and activations;
+        //   int8  int8 weights with a scale per 32 values, bf16 activations.
         // AQ_QUANT_HEAD=1: the output head too. AQ_QUANT_SET: which layer GEMMs (default all):
         // g = GDN input projection, o = GDN output projection, q = attention q/k/v,
         // a = attention output, u = MLP gate/up, d = MLP down.
@@ -620,8 +616,8 @@ impl Model {
         anyhow::ensure!(!kv8 || cfg.head_dim == 256, "the 8-bit KV cache needs 256-wide heads");
         let kv_row = if kv8 { KV8_ROW } else { cfg.head_dim * 2 };
         let mut lim = limits;
-        // The MTP draft head is used whenever the checkpoint ships one (AQ_MTP=0 turns it off).
-        // It adds one attention layer's KV to every page (9 instead of 8 layers for the 9B).
+        // The MTP draft head is used whenever the checkpoint has one (AQ_MTP=0 turns it off).
+        // It adds one attention layer's KV to every page.
         let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
@@ -1014,12 +1010,8 @@ impl Model {
         self.gpu.download(self.s.tok, ns)
     }
 
-    /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
-    /// before they are read and need no reset).
-    /// Create and run once every cuBLASLt plan the engine can hit (each M bucket up to
-    /// `max_tokens` for every weight shape, and the LM head up to `max_seqs`) on scratch
-    /// buffers, so no step pays for a plan's first use mid-run. Results in the scratch buffers are garbage and
-    /// are overwritten by the next real step. Returns the number of M values tried.
+    /// Create and run once, on scratch buffers, every cuBLASLt plan the engine can hit, so no
+    /// step pays for a plan's first use. Returns the number of row counts tried.
     pub fn prewarm_gemms(&mut self) -> Result<usize> {
         let c = self.cfg.clone();
         let lim = self.limits;
@@ -1059,6 +1051,8 @@ impl Model {
         Ok(ms.len())
     }
 
+    /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
+    /// before they are read and need no reset).
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
         let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;
         let csz = self.cfg.conv_dim() * 3 * 2;
@@ -1221,12 +1215,11 @@ impl Model {
         Ok(toks)
     }
 
-    /// Decode-only step where some sequences feed several tokens (speculative verification),
-    /// through a captured graph of fixed shape: the sequence count is padded to a bucket, every
-    /// sequence gets W rows of room (W = max tokens of any sequence), and the leftover rows go
-    /// to a padding sequence of length 0 on the dummy slot and dummy KV page. All rows are
-    /// sampled; the caller's sample rows are picked out afterwards. Needs fixed-size attention
-    /// slices, so padding the slice count is exact (empty slices add nothing).
+    /// Decode-only step where sequences may feed several tokens (speculative verification),
+    /// through a captured graph: sequences are padded to a bucket and rows to a multiple of
+    /// 16, the padding going to the dummy slot and dummy KV page. All rows are sampled and the
+    /// caller's are picked out afterwards. Padding the slice count is exact because attention
+    /// slices are fixed (empty slices add nothing).
     fn step_graph_spec(&mut self, b: &Batch) -> Result<Vec<u32>> {
         let lim = self.limits;
         let n = b.seq_start.len();
@@ -1415,10 +1408,9 @@ impl Model {
         }
         self.cur_chunks = cs.len();
         self.cur_tiles = ts.len();
-        // Decode attention: cut the decode rows (and, in a decode-only batch, any trailing
-        // padding rows) into tiles of rows of one sequence at consecutive positions. Slices
-        // come from the fixed bounds table, rounded up to a power of two so a few graphs cover
-        // every context length.
+        // Decode attention tiles: rows of one sequence at consecutive positions (padding rows
+        // too in a decode-only batch). The slice count is rounded up to a power of two so a
+        // few graphs cover every context length.
         let nd_seqs = b.n_decode;
         let nd = if nd_seqs == 0 { 0 } else { (b.seq_start[nd_seqs - 1] + b.seq_len[nd_seqs - 1]) as usize };
         self.cur_nd_rows = nd;
