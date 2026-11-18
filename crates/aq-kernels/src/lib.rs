@@ -238,6 +238,83 @@ unsafe fn kv_tile_cp_async(
     }
 }
 
+/// 8-bit KV cache: a key's or a value's row is 272 bytes, 256 int8 then its f32 scale
+/// (value = code * scale), so a row is still a whole number of 16-byte pieces.
+const KV8_ROW: usize = 272;
+
+/// `kv_tile_cp_async` for the 8-bit cache: request `kt` keys' rows as stored, K rows to `sk`
+/// and V rows to `sv` (zeros past `k1`). Like it, the keys must lie within one KV page.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kv_tile8_cp_async(
+    sk: *mut u8,
+    sv: *mut u8,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    table: *const u32,
+    bs: usize,
+    hkv: usize,
+    kv: usize,
+    kb: usize,
+    k1: usize,
+    kt: usize,
+    tid: usize,
+    nthr: usize,
+) {
+    use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16};
+    let page = (kb as u32 / bs as u32) as usize;
+    let blk = unsafe { *table.add(page) } as usize;
+    let base = ((blk * bs + (kb - page * bs)) * hkv + kv) * KV8_ROW;
+    let valid = if k1 > kb { k1 - kb } else { 0 };
+    let mut i = tid;
+    while i < kt * 17 {
+        let row = i / 17;
+        let c = i % 17;
+        let dk = unsafe { sk.add(row * KV8_ROW + c * 16) } as *mut u32;
+        let dv = unsafe { sv.add(row * KV8_ROW + c * 16) } as *mut u32;
+        if row < valid {
+            let off = base + row * hkv * KV8_ROW + c * 16;
+            unsafe {
+                cp_async_cg_16(dk, k_cache.add(off) as *const u32);
+                cp_async_cg_16(dv, v_cache.add(off) as *const u32);
+            }
+        } else {
+            unsafe {
+                cp_async_cg_zfill_16(dk, k_cache, 0);
+                cp_async_cg_zfill_16(dv, v_cache, 0);
+            }
+        }
+        i += nthr;
+    }
+}
+
+/// Expand a staged 8-bit tile (`kt` K rows, then `kt` V rows) into the swizzled bf16 K and V
+/// tiles the MMAs read.
+#[inline(always)]
+unsafe fn kv_tile8_unpack(stage: *const u8, ks: *mut u16, vs: *mut u16, kt: usize, tid: usize, nthr: usize) {
+    let mut i = tid;
+    while i < kt * 32 {
+        let row = i / 32;
+        let c = i % 32;
+        let mut which = 0;
+        while which < 2 {
+            let src = unsafe { stage.add((which * kt + row) * KV8_ROW) };
+            let sc = unsafe { *(src.add(256) as *const f32) };
+            let v = unsafe { *(src.add(c * 8) as *const u64) };
+            let dst = unsafe { (if which == 0 { ks } else { vs }).add(sw256(row, c)) } as *mut u32;
+            let mut e = 0;
+            while e < 4 {
+                let lo = (v >> (16 * e)) as u8 as i8 as f32 * sc;
+                let hi = (v >> (16 * e + 8)) as u8 as i8 as f32 * sc;
+                unsafe { *dst.add(e) = pk(lo, hi) };
+                e += 1;
+            }
+            which += 1;
+        }
+        i += nthr;
+    }
+}
+
 /// Asynchronous (cp.async.cg, 16 bytes per op) copy of a [rows][cols] bf16 tile from global
 /// to shared memory by `nthr` threads. `cols` must be a multiple of 8 and both row strides
 /// (in bytes) and base addresses 16-byte aligned. The caller commits and waits.
@@ -544,6 +621,306 @@ pub mod kernels {
         }
     }
 
+    /// Expand 4-bit weights to bf16: `out = bf16((code - 8) * scale)`, codes two per byte (low
+    /// nibble first), one f32 scale per 128 codes along a row. Rows are contiguous and their
+    /// length is a multiple of 128, so a matrix is `n * k / 32` blocks of 32 codes and block
+    /// `b` uses scale `b / 4`; one block per thread. grid = (ceil(blocks / 256)), block = (256).
+    #[kernel]
+    pub unsafe fn dequant_i4g(q: *const u8, scale: *const f32, out: *mut u16, blocks: u32) {
+        let b = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+        if b >= blocks as usize {
+            return;
+        }
+        let s = unsafe { *scale.add(b / 4) };
+        let qv = unsafe { q.add(b * 16) }.cast::<u32>();
+        let ov = unsafe { out.cast::<U32x4>().add(b * 4) };
+        #[unroll]
+        for j in 0..4 {
+            let v = unsafe { *qv.add(j) };
+            let mut packed = [0u32; 4];
+            #[unroll]
+            for e in 0..4 {
+                let c0 = ((v >> (8 * e)) & 15) as f32 - 8.0;
+                let c1 = ((v >> (8 * e + 4)) & 15) as f32 - 8.0;
+                packed[e] = pk(c0 * s, c1 * s);
+            }
+            unsafe { *ov.add(j) = U32x4::new(packed) };
+        }
+    }
+
+    /// Split a bf16 matrix into two int8 digit planes for `gemm_i8w`:
+    /// `x ~ sx[r, b] * (256 * xh + xl)`, a 16-bit fixed-point form with one scale per block of
+    /// 32 elements along a row, `sx = max|block| / 32639` (the bound keeps the high digit of a
+    /// balanced split in int8 range). A scale per block, not per row: one very large element
+    /// then costs precision only to its 31 neighbours.
+    /// Requires k % 32 == 0. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn quant_x16(x: *const u16, xh: *mut u8, xl: *mut u8, sx: *mut f32, k: u32) {
+        let nb = k as usize / 32;
+        let r = thread::blockIdx_x() as usize;
+        let mut b = thread::threadIdx_x() as usize;
+        while b < nb {
+            let xv = unsafe { x.cast::<U32x4>().add((r * nb + b) * 4) };
+            let mut w = [[0u32; 4]; 4];
+            let mut top = 0u32;
+            #[unroll]
+            for j in 0..4 {
+                w[j] = unsafe { *xv.add(j) }.to_array();
+                #[unroll]
+                for e in 0..4 {
+                    top = top.max(w[j][e] & 0x7fff).max((w[j][e] >> 16) & 0x7fff);
+                }
+            }
+            let mx = bf16_to_f32(top as u16);
+            unsafe { *sx.add(r * nb + b) = mx * (1.0 / 32639.0) };
+            let inv = if mx > 0.0 { 32639.0 / mx } else { 0.0 };
+            #[unroll]
+            for j in 0..4 {
+                let (mut hi, mut lo) = (0u64, 0u64);
+                #[unroll]
+                for e in 0..4 {
+                    let (a0, a1) = cvt_f32x2_bf16x2(w[j][e]);
+                    let (i0, i1) = (libm::rintf(a0 * inv) as i32, libm::rintf(a1 * inv) as i32);
+                    lo |= (((i0 & 0xff) | ((i1 & 0xff) << 8)) as u64) << (16 * e);
+                    hi |= (((((i0 + 128) >> 8) & 0xff) | ((((i1 + 128) >> 8) & 0xff) << 8)) as u64) << (16 * e);
+                }
+                unsafe {
+                    *(xh.add((r * nb + b) * 32 + j * 8) as *mut u64) = hi;
+                    *(xl.add((r * nb + b) * 32 + j * 8) as *mut u64) = lo;
+                }
+            }
+            b += 256;
+        }
+    }
+
+    /// `y[m, n] = x[m, k] . w[n, k]^T` for block-scaled int8 weights (`quant_i8b` layout), on
+    /// the integer tensor cores: the weight bytes go from memory into `mma` as they are, read
+    /// once. The activations come as the two int8 digit planes of `quant_x16`; each 32-wide
+    /// block of k is one `m16n8k32` product per digit, and the block's weight and activation
+    /// scales are applied to that partial sum as it is added to the f32 accumulator.
+    ///
+    /// A block owns 128 weight rows (warp w: rows 16w..16w+16, two n8 tiles) and up to 128
+    /// activation rows, and walks K in chunks of 64 through a 4-stage `cp.async` ring, so three
+    /// chunks of weights, scales and activations are in flight while one is multiplied.
+    /// Operands are read with `ldmatrix`; the four 16-byte pieces of a shared row are stored
+    /// XOR-swizzled by `(row >> 1) & 3` so the eight rows of a fragment hit distinct banks.
+    ///
+    /// Stage layout: W [128][64] i8, weight scales [128] x 2 bf16, activation scales
+    /// [mt * 16] x 2 f32, XH then XL [mt * 16][64] i8.
+    /// Requires k % 64 == 0 and n % 8 == 0.
+    /// grid = (ceil(n / 128), ceil(m / 128)), block = (256),
+    /// dynamic shared memory = 4 * (8704 + min(m, 128).div_ceil(16) * 2176) bytes.
+    #[kernel]
+    pub unsafe fn gemm_i8w(xh: *const u8, xl: *const u8, sx: *const f32, q: *const u8, bmax: *const u16, y: *mut u16, m: u32, n: u32, k: u32, ldy: u32, w4: u32) {
+        use cuda_device::async_copy::{cp_async_ca_4, cp_async_ca_8, cp_async_ca_zfill_4, cp_async_ca_zfill_8, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
+        use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k32_s32_s8};
+        const S: usize = 4;
+        // Byte offset of 16-byte piece `c` of shared row `r` (rows of 64 bytes).
+        let sw = |r: usize, c: usize| r * 64 + ((c ^ ((r >> 1) & 3)) * 16);
+        let sm = DynamicSharedArray::<u8, 16>::get_raw();
+        let (m, n, k, ldy) = (m as usize, n as usize, k as usize, ldy as usize);
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let w = tid / 32;
+        let g = lane / 4;
+        let t = lane % 4;
+        let (lr, lm) = (lane % 8, lane / 8); // ldmatrix: row and matrix this lane addresses
+        let nb = thread::blockIdx_x() as usize * 128;
+        let m0 = thread::blockIdx_y() as usize * 128;
+        let mc = if m - m0 < 128 { m - m0 } else { 128 };
+        let mtc = mc.div_ceil(16);
+        let plane = mtc * 1024;
+        // A ring slot: the weight tile (int8: 128 rows x 64 bytes, swizzled; 4-bit: 128 x 32
+        // bytes of codes as they are stored), the rows' scales, the activation rows' scales,
+        // the two digit planes. With 4-bit weights the first 8192 bytes of shared memory hold
+        // the tile being used, unpacked to int8.
+        let w4 = w4 != 0;
+        let wsc = if w4 { 4096 } else { 8192 };
+        let asc = wsc + 512;
+        let xo = asc + mtc * 128;
+        let stage = xo + 2 * plane;
+        let ring = if w4 { unsafe { sm.add(8192) } } else { sm };
+        let kb = k / 32;
+        let chunks = k / 64;
+
+        // Issue chunk `c` into ring slot `c % S` and commit it as one group.
+        let issue = |c: usize| {
+            let sb = unsafe { ring.add((c % S) * stage) };
+            let kc = c * 64;
+            unsafe {
+                if w4 {
+                    // Codes: 128 rows x 2 vectors, one per thread.
+                    let (r, v) = (tid / 2, tid % 2);
+                    let dst = sb.add(r * 32 + v * 16) as *mut u32;
+                    if nb + r < n {
+                        cp_async_cg_16(dst, q.add((nb + r) * (k / 2) + kc / 2 + v * 16) as *const u32);
+                    } else {
+                        cp_async_cg_zfill_16(dst, q, 0);
+                    }
+                } else {
+                    // Weights: 128 rows x 4 vectors, two per thread.
+                    #[unroll]
+                    for u in 0..2 {
+                        let idx = tid + 256 * u;
+                        let (r, v) = (idx / 4, idx % 4);
+                        let dst = sb.add(sw(r, v)) as *mut u32;
+                        if nb + r < n {
+                            cp_async_cg_16(dst, q.add((nb + r) * k + kc + v * 16) as *const u32);
+                        } else {
+                            cp_async_cg_zfill_16(dst, q, 0);
+                        }
+                    }
+                }
+                // Each row's scales for this chunk: two bf16 block magnitudes, or with 4-bit
+                // weights the f32 scale of the 128 columns it is in.
+                if tid < 128 {
+                    let dst = sb.add(wsc + tid * 4) as *mut u32;
+                    if nb + tid < n {
+                        if w4 {
+                            cp_async_ca_4(dst, (bmax as *const u32).add((nb + tid) * (k / 128) + kc / 128));
+                        } else {
+                            cp_async_ca_4(dst, bmax.add((nb + tid) * kb + kc / 32) as *const u32);
+                        }
+                    } else {
+                        cp_async_ca_zfill_4(dst, q, 0);
+                    }
+                }
+                // The two block scales of each activation row.
+                if tid < mtc * 16 {
+                    let dst = sb.add(asc + tid * 8) as *mut u32;
+                    if tid < mc {
+                        cp_async_ca_8(dst, sx.add((m0 + tid) * kb + kc / 32) as *const u32);
+                    } else {
+                        cp_async_ca_zfill_8(dst, q, 0);
+                    }
+                }
+                // Activation digits: mtc * 16 rows x (4 high + 4 low) vectors.
+                let mut idx = tid;
+                while idx < mtc * 128 {
+                    let (r, v) = (idx / 8, idx % 8);
+                    let dst = sb.add(xo + (v / 4) * plane + sw(r, v % 4)) as *mut u32;
+                    if r < mc {
+                        let src = if v < 4 { xh } else { xl };
+                        cp_async_cg_16(dst, src.add((m0 + r) * k + kc + (v % 4) * 16) as *const u32);
+                    } else {
+                        cp_async_cg_zfill_16(dst, q, 0);
+                    }
+                    idx += 256;
+                }
+                cp_async_commit_group();
+            }
+        };
+
+        #[unroll]
+        for c in 0..3 {
+            if c < chunks {
+                issue(c);
+            } else {
+                unsafe { cp_async_commit_group() };
+            }
+        }
+        let mut acc = [[[0.0f32; 4]; 2]; 8];
+        let mut c = 0;
+        while c < chunks {
+            // Chunk c has landed for this thread; after the barrier, for the block, and
+            // everyone is done with chunk c - 1, whose slot the next issue reuses.
+            unsafe { cp_async_wait_group(2) };
+            thread::sync_threads();
+            if c + 3 < chunks {
+                issue(c + 3);
+            } else {
+                unsafe { cp_async_commit_group() };
+            }
+            let sb = unsafe { ring.add((c % S) * stage) };
+            if w4 {
+                // Unpack the chunk's codes (two per byte, low nibble first, value = code - 8)
+                // into int8 operand rows: each thread turns its 16 bytes into two pieces.
+                let (r, v) = (tid / 2, tid % 2);
+                let src = unsafe { sb.add(r * 32 + v * 16) } as *const u32;
+                #[unroll]
+                for hh in 0..2 {
+                    let mut out = [0u64; 2];
+                    #[unroll]
+                    for u in 0..2 {
+                        let x = unsafe { *src.add(2 * hh + u) };
+                        let mut o = 0u64;
+                        #[unroll]
+                        for jj in 0..4 {
+                            let by = ((x >> (8 * jj)) & 0xff) as u64;
+                            o |= ((by & 15) | ((by >> 4) << 8)) << (16 * jj);
+                        }
+                        // code - 8 as int8: flip bit 3, then extend it through the high nibble.
+                        let tt = o ^ 0x0808_0808_0808_0808;
+                        let s8 = tt & 0x0808_0808_0808_0808;
+                        out[u] = tt | (s8 << 1) | (s8 << 2) | (s8 << 3) | (s8 << 4);
+                    }
+                    let dst = unsafe { sm.add(sw(r, 2 * v + hh)) } as *mut u64;
+                    unsafe {
+                        *dst = out[0];
+                        *dst.add(1) = out[1];
+                    }
+                }
+                thread::sync_threads();
+            }
+            let wop = if w4 { sm } else { sb };
+            #[unroll]
+            for blk in 0..2 {
+                // Both n8 tiles of this warp: rows lr and 8 + lr, two 16-byte pieces each.
+                let b = unsafe { ldmatrix_x4(wop.add(sw(w * 16 + 8 * (lm >> 1) + lr, 2 * blk + (lm & 1))) as *const u32) };
+                let mut sc = [[0.0f32; 2]; 2];
+                #[unroll]
+                for nt in 0..2 {
+                    // This lane's two output columns are weight rows 2t and 2t + 1 of the tile.
+                    let sv = unsafe { *(sb.add(wsc + (w * 16 + nt * 8 + 2 * t) * 4) as *const u64) };
+                    sc[nt] = if w4 {
+                        [f32::from_bits(sv as u32), f32::from_bits((sv >> 32) as u32)]
+                    } else {
+                        [bf16_to_f32((sv >> (16 * blk)) as u16) * (1.0 / 127.0), bf16_to_f32((sv >> (32 + 16 * blk)) as u16) * (1.0 / 127.0)]
+                    };
+                }
+                #[unroll]
+                for mt in 0..8 {
+                    if mt < mtc {
+                        let fx = unsafe { [*(sb.add(asc + (mt * 16 + g) * 8 + blk * 4) as *const f32), *(sb.add(asc + (mt * 16 + g + 8) * 8 + blk * 4) as *const f32)] };
+                        let o = sw(mt * 16 + 8 * (lm & 1) + lr, 2 * blk + (lm >> 1));
+                        let ah = unsafe { ldmatrix_x4(sb.add(xo + o) as *const u32) };
+                        let al = unsafe { ldmatrix_x4(sb.add(xo + plane + o) as *const u32) };
+                        #[unroll]
+                        for nt in 0..2 {
+                            let bn = [b[2 * nt], b[2 * nt + 1]];
+                            let p = unsafe { mma_m16n8k32_s32_s8([0; 4], ah, bn) };
+                            let p = unsafe { mma_m16n8k32_s32_s8([p[0] << 8, p[1] << 8, p[2] << 8, p[3] << 8], al, bn) };
+                            #[unroll]
+                            for e in 0..4 {
+                                acc[mt][nt][e] += p[e] as f32 * (sc[nt][e & 1] * fx[e >> 1]);
+                            }
+                        }
+                    }
+                }
+            }
+            c += 1;
+        }
+
+        #[unroll]
+        for mt in 0..8 {
+            if mt < mtc {
+                let r0 = m0 + mt * 16 + g;
+                #[unroll]
+                for nt in 0..2 {
+                    let col = nb + w * 16 + nt * 8 + 2 * t;
+                    if col < n {
+                        if r0 < m {
+                            unsafe { *(y.add(r0 * ldy + col) as *mut u32) = pk(acc[mt][nt][0], acc[mt][nt][1]) };
+                        }
+                        if r0 + 8 < m {
+                            unsafe { *(y.add((r0 + 8) * ldy + col) as *mut u32) = pk(acc[mt][nt][2], acc[mt][nt][3]) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `y[r, c] *= rs[r] * cs[c]` in place on a bf16 matrix.
     /// Requires n % 8 == 0. grid = (rows), block = (256).
     #[kernel]
@@ -619,6 +996,7 @@ pub mod kernels {
         rot_dim: u32,
         rope_theta: f32,
         eps: f32,
+        kv8: u32,
     ) {
         static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
         static mut ROW: SharedArray<f32, 512> = SharedArray::UNINIT;
@@ -673,10 +1051,30 @@ pub mod kernels {
             let seq = unsafe { *tok_seq.add(t) } as usize;
             let bs = block_size as usize;
             let blk = unsafe { *block_tables.add(seq * max_blocks as usize + pos / bs) } as usize;
-            let off = ((blk * bs + pos % bs) * hkv + kv) * dim + d;
-            unsafe { st(k_cache, off, y) };
+            let vec = (blk * bs + pos % bs) * hkv + kv;
             let v = unsafe { *qkv.add(row + h * 2 * dim + hkv * dim + kv * dim + d) };
-            unsafe { *v_cache.add(off) = v };
+            if kv8 == 0 {
+                let off = vec * dim + d;
+                unsafe { st(k_cache, off, y) };
+                unsafe { *v_cache.add(off) = v };
+            } else {
+                // 8-bit cache: each row as int8 with its own scale (the largest magnitude / 127).
+                let vf = bf16_to_f32(v);
+                let mk = unsafe { block_max(y.abs(), red) };
+                let mv = unsafe { block_max(vf.abs(), red) };
+                let kq = unsafe { (k_cache as *mut u8).add(vec * KV8_ROW) };
+                let vq = unsafe { (v_cache as *mut u8).add(vec * KV8_ROW) };
+                let ik = if mk > 0.0 { 127.0 / mk } else { 0.0 };
+                let iv = if mv > 0.0 { 127.0 / mv } else { 0.0 };
+                unsafe {
+                    *kq.add(d) = libm::rintf(y * ik) as i32 as u8;
+                    *vq.add(d) = libm::rintf(vf * iv) as i32 as u8;
+                    if d == 0 {
+                        *(kq.add(256) as *mut f32) = mk * (1.0 / 127.0);
+                        *(vq.add(256) as *mut f32) = mv * (1.0 / 127.0);
+                    }
+                }
+            }
         }
     }
 
@@ -1811,8 +2209,8 @@ pub mod kernels {
     /// fed by `ldmatrix` from XOR-swizzled shared tiles; K/V tiles of 32 keys arrive by `cp.async`.
     /// Softmax is online (exp2 with the scale folded in); P is rounded to bf16 for the PV MMA.
     ///
-    /// Dynamic shared memory: `(QT * group * 16 + 2 * 32) * 256 * 2` bytes (64 KiB for group 4,
-    /// QT 1). grid = (n_tiles, n_kv), block = (32 * group * QT).
+    /// Dynamic shared memory: `(QT * group * 16 + nbuf * 2 * 32) * 256 * 2` bytes (64 KiB for
+    /// group 4, QT 1, one K/V buffer pair). grid = (n_tiles, n_kv), block = (32 * group * QT).
     #[kernel]
     pub unsafe fn attention_tc(
         q: *const u16,
@@ -1831,9 +2229,11 @@ pub mod kernels {
         n_heads: u32,
         n_kv: u32,
         scale: f32,
+        nbuf: u32,
+        kv8: u32,
     ) {
         use cuda_device::DynamicSharedArray;
-        use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all};
+        use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all, cp_async_wait_group};
         use cuda_device::convert::cvt_bf16x2_f32;
         use cuda_device::float::ex2_approx_ftz_f32;
         use cuda_device::wmma::{ldmatrix_x4, ldmatrix_x4_trans, mma_m16n8k16_f32_bf16};
@@ -1865,8 +2265,24 @@ pub mod kernels {
         let n_keys = pos0 + nq;
 
         let qs = smem;
-        let ks = unsafe { smem.add(nwarps * 16 * D) };
-        let vs = unsafe { ks.add(KT * D) };
+        // K/V tile buffers: one pair, or two so that the next tile loads while this one is used.
+        let ks0 = unsafe { smem.add(nwarps * 16 * D) };
+        let vs0 = unsafe { ks0.add(KT * D) };
+        let ks1 = unsafe { vs0.add(KT * D) };
+        let vs1 = unsafe { ks1.add(KT * D) };
+        let piped = nbuf == 2;
+        // 8-bit cache: the tile is requested as stored into a staging area after the first
+        // buffer pair and expanded to bf16 when it is used, so the next tile's fetch overlaps
+        // this one's MMAs with one bf16 pair.
+        let kv8 = kv8 != 0;
+        let stage = ks1 as *mut u8;
+        if kv8 {
+            unsafe {
+                kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
+                kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
+                cp_async_commit_group();
+            }
+        }
 
         // Q tile: nwarps * 16 rows (warp w -> rows 16w..16w+16 = its sub-tile's tokens, its head).
         let qrows = nwarps * 16;
@@ -1901,17 +2317,55 @@ pub mod kernels {
         let mut l_b = 0.0f32;
         let sl2 = scale * LOG2E;
 
-        let mut kb = 0usize;
-        while kb < n_keys {
-            // K/V tile: KT keys x 256 dims each, zero-filled past the end, as two 16-key
-            // halves (each inside one KV page).
+        // K/V tile: KT keys x 256 dims each, zero-filled past the end, as two 16-key halves
+        // (each inside one KV page). With two buffers, tile i + 1 is requested before tile i is
+        // waited for, so its fetch overlaps the MMAs of tile i: one block scans the whole
+        // context serially and is otherwise bound by one fetch latency per tile.
+        if piped {
             unsafe {
-                kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, n_keys, 16, tid, nthreads);
-                kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, kb + 16, n_keys, 16, tid, nthreads);
-            }
-            unsafe {
+                kv_tile_cp_async(ks0, vs0, k_cache, v_cache, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
+                kv_tile_cp_async(ks0.add(16 * D), vs0.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
                 cp_async_commit_group();
-                cp_async_wait_all();
+            }
+        }
+        let mut kb = 0usize;
+        let mut cur = 0usize;
+        while kb < n_keys {
+            let ks = if cur == 0 { ks0 } else { ks1 };
+            let vs = if cur == 0 { vs0 } else { vs1 };
+            if kv8 {
+                unsafe { cp_async_wait_all() };
+                thread::sync_threads();
+                unsafe { kv_tile8_unpack(stage, ks, vs, KT, tid, nthreads) };
+                thread::sync_threads();
+                if kb + KT < n_keys {
+                    unsafe {
+                        kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT, n_keys, 16, tid, nthreads);
+                        kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT + 16, n_keys, 16, tid, nthreads);
+                        cp_async_commit_group();
+                    }
+                }
+            } else if piped {
+                let nx = kb + KT;
+                if nx < n_keys {
+                    let kn = if cur == 0 { ks1 } else { ks0 };
+                    let vn = if cur == 0 { vs1 } else { vs0 };
+                    unsafe {
+                        kv_tile_cp_async(kn, vn, k_cache, v_cache, table, bs, hkv, kv, nx, n_keys, 16, tid, nthreads);
+                        kv_tile_cp_async(kn.add(16 * D), vn.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, nx + 16, n_keys, 16, tid, nthreads);
+                        cp_async_commit_group();
+                        cp_async_wait_group(1);
+                    }
+                } else {
+                    unsafe { cp_async_wait_all() };
+                }
+            } else {
+                unsafe {
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, n_keys, 16, tid, nthreads);
+                    kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, kb + 16, n_keys, 16, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
             }
             thread::sync_threads();
 
@@ -2005,6 +2459,9 @@ pub mod kernels {
             }
             thread::sync_threads();
             kb += KT;
+            if piped {
+                cur ^= 1;
+            }
         }
 
         // Finish the row sums across the quad, normalize, round, gate, store pairs.
@@ -2075,6 +2532,7 @@ pub mod kernels {
         scale: f32,
         part_acc: *mut f32,
         part_ml: *mut f32,
+        kv8: u32,
     ) {
         use cuda_device::DynamicSharedArray;
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all};
@@ -2153,10 +2611,22 @@ pub mod kernels {
 
         let mut kb = k0;
         while kb < k1 {
-            unsafe {
-                kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
-                cp_async_commit_group();
-                cp_async_wait_all();
+            if kv8 != 0 {
+                // 8-bit cache: stage the tile as stored (after the P^T rows), then expand it.
+                let stage = unsafe { vs.add(KT * D).add(nwarps * 128) } as *mut u8;
+                unsafe {
+                    kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
+                thread::sync_threads();
+                unsafe { kv_tile8_unpack(stage, ks, vs, KT, tid, nthreads) };
+            } else {
+                unsafe {
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
             }
             thread::sync_threads();
 
@@ -3018,6 +3488,7 @@ pub mod kernels {
         wh: *const u16,
         we: *const u16,
         table: *const u16,
+        slot_of: *const u32,
         next: *const u32,
         sampled: *const u32,
         out: *mut u16,
@@ -3063,10 +3534,14 @@ pub mod kernels {
         // pre_fc_norm_embedding of the next token -> first half.
         let nx = unsafe { *next.add(t) };
         let id = if nx & 0x8000_0000 != 0 { unsafe { *sampled.add((nx & 0x7fff_ffff) as usize) } } else { nx } as usize;
+        // With `slot_of` (token -> row of `table`, u32::MAX = absent) the table holds only some
+        // tokens' rows; an absent token reads as zeros.
+        let row = if slot_of.is_null() { id } else { (unsafe { *slot_of.add(id) }) as usize };
+        let have = slot_of.is_null() || row != u32::MAX as usize;
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
-            let v = unsafe { ld(table, id * h + i) };
+            let v = if have { unsafe { ld(table, row * h + i) } } else { 0.0 };
             ss += v * v;
             i += bd;
         }
@@ -3074,7 +3549,7 @@ pub mod kernels {
         let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
         let mut i = tid;
         while i < h {
-            unsafe { st(out, t * 2 * h + i, ld(table, id * h + i) * inv * (1.0 + ld(we, i))) };
+            unsafe { st(out, t * 2 * h + i, (if have { ld(table, row * h + i) } else { 0.0 }) * inv * (1.0 + ld(we, i))) };
             i += bd;
         }
     }
@@ -3091,6 +3566,7 @@ pub mod kernels {
         wh: *const u16,
         we: *const u16,
         table: *const u16,
+        slot_of: *const u32,
         out: *mut u16,
         hidden: u32,
         eps: f32,
@@ -3103,6 +3579,10 @@ pub mod kernels {
         let tid = thread::threadIdx_x() as usize;
         let src = unsafe { *sel.add(t) } as usize;
         let id = unsafe { *tok.add(src) } as usize;
+        // With `slot_of` (token -> row of `table`, u32::MAX = absent) the table holds only some
+        // tokens' rows; an absent token reads as zeros.
+        let row = if slot_of.is_null() { id } else { (unsafe { *slot_of.add(id) }) as usize };
+        let have = slot_of.is_null() || row != u32::MAX as usize;
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
@@ -3120,7 +3600,7 @@ pub mod kernels {
         let mut ss = 0.0f32;
         let mut i = tid;
         while i < h {
-            let v = unsafe { ld(table, id * h + i) };
+            let v = if have { unsafe { ld(table, row * h + i) } } else { 0.0 };
             ss += v * v;
             i += bd;
         }
@@ -3128,21 +3608,27 @@ pub mod kernels {
         let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
         let mut i = tid;
         while i < h {
-            unsafe { st(out, t * 2 * h + i, ld(table, id * h + i) * inv * (1.0 + ld(we, i))) };
+            unsafe { st(out, t * 2 * h + i, (if have { ld(table, row * h + i) } else { 0.0 }) * inv * (1.0 + ld(we, i))) };
             i += bd;
         }
     }
 
     /// `out[slots[b], :] = table[ids[slots[b]], :]`: (re)fill rows of a gathered copy of an
-    /// embedding-shaped table. grid = (number of slots), block = (256).
+    /// embedding-shaped table: bf16 (`tq` = 0), or int8 with one bf16 magnitude per block of 32
+    /// at `tscale` (the `quant_i8b` layout). grid = (number of slots), block = (256).
     #[kernel]
-    pub unsafe fn gather_rows(table: *const u16, ids: *const u32, slots: *const u32, out: *mut u16, hidden: u32) {
+    pub unsafe fn gather_rows(table: *const u16, tscale: *const u16, tq: u32, ids: *const u32, slots: *const u32, out: *mut u16, hidden: u32) {
         let slot = unsafe { *slots.add(thread::blockIdx_x() as usize) } as usize;
         let id = unsafe { *ids.add(slot) } as usize;
         let h = hidden as usize;
         let mut i = thread::threadIdx_x() as usize;
         while i < h {
-            unsafe { *out.add(slot * h + i) = *table.add(id * h + i) };
+            if tq == 0 {
+                unsafe { *out.add(slot * h + i) = *table.add(id * h + i) };
+            } else {
+                let e = id * h + i;
+                unsafe { st(out, slot * h + i, *(table as *const i8).add(e) as f32 * bf16_to_f32(*tscale.add(e / 32)) * (1.0 / 127.0)) };
+            }
             i += thread::blockDim_x() as usize;
         }
     }
