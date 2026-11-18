@@ -42,19 +42,36 @@ floor and trades speed for memory.
 
 ### 4-bit weights (pre-quantized checkpoint)
 
-A 4-bit AutoRound / GPTQ checkpoint is loaded as it is after one conversion:
+A 4-bit AutoRound / GPTQ checkpoint is loaded as it is after one conversion (needs `torch`
+and `safetensors`, and both checkpoints on disk):
 
 ```sh
-python scripts/convert_autoround.py <Intel/Qwen3.5-9B-int4-AutoRound dir> <Qwen/Qwen3.5-9B dir> qwen35-9b-int4
-aq-serve qwen35-9b-int4
+hf download Qwen/Qwen3.5-9B
+hf download Intel/Qwen3.5-9B-int4-AutoRound
+python scripts/convert_autoround.py <Intel/Qwen3.5-9B-int4-AutoRound dir> <Qwen/Qwen3.5-9B dir> ~/models/qwen35-9b-int4
 ```
 
-4.1 bits per layer weight; on long agent traces about 92% of greedy tokens agree with the
-bf16 model (KL 0.08–0.15 nats), which is that checkpoint's quality, not something the engine
-adds. The output head is stored in 8 bits and the embedding table stays in host memory. On a
-B200 the 9B then takes 7.9 GB of device memory with the draft head, 4 sessions, a 1 GB
-attention cache and `--max-tokens 1024` (6.9 GB without the draft head); see docs/HANDOFF.md.
-Not yet measured on an 8 GB card.
+The engine multiplies the 4-bit codes directly, stores the output head in 8 bits and leaves
+the embedding table in host memory. For a small card, give it few sessions, a small attention
+cache and short prefill chunks:
+
+```sh
+docker run --gpus all -p 8000:8000 -v ~/models:/models:ro \
+  ghcr.io/<owner>/aqwenator /models/qwen35-9b-int4 \
+  --max-seqs 4 --max-running 2 --kv-gb 1 --max-tokens 1024
+```
+
+| 9B, 4-bit, settings above | Engine allocates |
+|---|---|
+| with the draft head | 7.0 GiB |
+| without it (`-e AQ_MTP=0`) | 6.0 GiB |
+
+plus the CUDA context (0.7 GiB on a B200). Measured on a B200 only so far, where it does 339
+turns/min at 16 agents (bf16: 433); an 8 GB card has not been tried yet.
+
+Quality is the checkpoint's: on 20k-token agent traces about 92% of greedy tokens agree with
+the bf16 model (KL 0.08–0.15 nats), against 99% for the 8-bit tiers. That is the price of 4
+bits on this model, calibrated or not; the engine adds nothing to it.
 
 Method, more machines and the history are in [docs/HANDOFF.md](docs/HANDOFF.md).
 
