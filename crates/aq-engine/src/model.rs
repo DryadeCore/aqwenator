@@ -35,6 +35,12 @@ pub struct Layer {
     // mlp
     gate_up: Weight,
     down: Weight,
+    // mixture of experts (0 for a dense MLP, and gate_up and down are then unused): router
+    // rows then the shared expert's gate row, and the experts' stacked weights with the shared
+    // expert last
+    router: u64,
+    ex_gate_up: u64,
+    ex_down: u64,
     // per-slot state pools
     delta_state: u64,
     conv_state: u64,
@@ -96,6 +102,15 @@ pub struct Scratch {
     conv: u64,
     mix: u64,
     delta: u64,
+    // mixture of experts: router logits, the 8 experts and weights per token, rows grouped
+    // by expert, jobs, and the activation and output of each (token, expert) row
+    moe_logits: u64,
+    moe_idx: u64,
+    moe_w: u64,
+    moe_list: u64,
+    moe_jobs: u64,
+    moe_act: u64,
+    moe_out: u64,
     q: u64,
     logits: u64,
     tok: u64,
@@ -341,6 +356,7 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
     let wide = cfg.gdn_proj_ld().max(cfg.attn_proj_dim()).max(2 * cfg.intermediate_size);
     let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
     let t = lim.max_rows();
+    let mt = if cfg.moe() { t } else { 0 };
     let sq = lim.max_seqs;
     let hvd = cfg.linear_num_value_heads * 128;
     let hq = cfg.num_attention_heads;
@@ -394,6 +410,13 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         conv: gpu.alloc(t * cfg.conv_dim() * 2)?,
         mix: gpu.alloc(t * mixw * 2)?,
         delta: gpu.alloc(t * hd * 2)?,
+        moe_logits: gpu.alloc(mt * MOE_ROUTER_LD * 2)?,
+        moe_idx: gpu.alloc(mt * 8)?,
+        moe_w: gpu.alloc(mt * 8 * 4)?,
+        moe_list: gpu.alloc(mt * 9 * 4)?,
+        moe_jobs: gpu.alloc(if mt > 0 { moe_max_jobs(mt) * 8 } else { 0 })?,
+        moe_act: gpu.alloc(mt * 9 * cfg.moe_intermediate_size * 2)?,
+        moe_out: gpu.alloc(mt * 9 * hd * 2)?,
         q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
         logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
         tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
@@ -424,6 +447,40 @@ const KV8_ROW: usize = 272;
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
 /// Upload several bf16 matrices concatenated along rows into one buffer.
+/// Row stride of the router logits: 256 experts, the shared expert's gate, padding.
+const MOE_ROUTER_LD: usize = 264;
+/// Shared memory of a `moe_gemm` block.
+const MOE_GEMM_SMEM: u32 = 3 * 27648 + 256;
+
+/// Most jobs `moe_bucket` can produce for `t` tokens: full ones, a partial one per expert, and
+/// the shared expert's.
+fn moe_max_jobs(t: usize) -> usize {
+    (9 * t).div_ceil(64) + 257
+}
+
+/// The MLP weights of layer `n(..)`: gate/up and down for a dense MLP, or router and stacked
+/// experts (the shared expert, which has their shape, as expert 256).
+#[allow(clippy::type_complexity)]
+fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<(Weight, Weight, u64, u64, u64)> {
+    let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
+    if !cfg.moe() {
+        return Ok((
+            gemm_weight(gpu, ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], 0, h, fmt.0)?,
+            gemm_weight(gpu, ck, &[n("mlp.down_proj.weight")], 0, inter, fmt.1)?,
+            0,
+            0,
+            0,
+        ));
+    }
+    Ok((
+        Weight::default(),
+        Weight::default(),
+        concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (MOE_ROUTER_LD - 257) * h * 2)?,
+        concat_bf16(gpu, ck, &[n("mlp.experts.gate_up_proj"), n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])?,
+        concat_bf16(gpu, ck, &[n("mlp.experts.down_proj"), n("mlp.shared_expert.down_proj.weight")])?,
+    ))
+}
+
 fn concat_bf16(gpu: &mut Gpu, ck: &Checkpoint, names: &[String]) -> Result<u64> {
     concat_bf16_padded(gpu, ck, names, 0)
 }
@@ -547,6 +604,7 @@ impl Model {
             Ok(other) if !other.is_empty() => anyhow::bail!("AQ_QUANT={other}: expected fp8 or int8"),
             _ => Fmt::Bf16,
         };
+        anyhow::ensure!(quant == Fmt::Bf16 || !cfg.moe(), "AQ_QUANT does not cover mixture-of-experts models yet");
         let set = std::env::var("AQ_QUANT_SET").unwrap_or_else(|_| "goqaud".into());
         let q = |c: char| if set.contains(c) { quant } else { Fmt::Bf16 };
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
@@ -577,6 +635,7 @@ impl Model {
         for l in 0..cfg.num_hidden_layers {
             let n = |s: &str| format!("{P}layers.{l}.{s}");
             let kind = cfg.kind(l);
+            let (gate_up, down, router, ex_gate_up, ex_down) = mlp_weights(&mut gpu, &ck, &cfg, &n, (q('u'), q('d')))?;
             let mut layer = Layer {
                 kind,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
@@ -591,8 +650,11 @@ impl Model {
                 q_norm: 0,
                 k_norm: 0,
                 o_proj: Weight::default(),
-                gate_up: gemm_weight(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], 0, h, q('u'))?,
-                down: gemm_weight(&mut gpu, &ck, &[n("mlp.down_proj.weight")], 0, inter, q('d'))?,
+                gate_up,
+                down,
+                router,
+                ex_gate_up,
+                ex_down,
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: 0,
@@ -639,6 +701,7 @@ impl Model {
         let mtp = if want_mtp {
             let n = |s: &str| format!("mtp.layers.0.{s}");
             let sa = |s: &str| n(&format!("self_attn.{s}"));
+            let (gate_up, down, router, ex_gate_up, ex_down) = mlp_weights(&mut gpu, &ck, &cfg, &n, (Fmt::Bf16, Fmt::Bf16))?;
             let layer = Layer {
                 kind: LayerKind::Full,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
@@ -653,8 +716,11 @@ impl Model {
                 q_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?,
                 k_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?,
                 o_proj: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?),
-                gate_up: Weight::bf16(concat_bf16(&mut gpu, &ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?),
-                down: Weight::bf16(concat_bf16(&mut gpu, &ck, &[n("mlp.down_proj.weight")])?),
+                gate_up,
+                down,
+                router,
+                ex_gate_up,
+                ex_down,
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: gpu.alloc(kv_bytes)?,
@@ -773,6 +839,9 @@ impl Model {
         gpu.set_max_dynamic_smem("gdn_tc_prep", GDN_TC_PREP_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
+        if cfg.moe() {
+            gpu.set_max_dynamic_smem("moe_gemm", MOE_GEMM_SMEM)?;
+        }
         let upload_s = t1.elapsed().as_secs_f64();
         eprintln!(
             "load: scratch + kernel setup {:.2}s, {:.2} GiB of scratch ({:.2} GiB allocated in all)",
@@ -969,10 +1038,12 @@ impl Model {
                     (c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, s.delta, l.o_proj),
                 ],
             };
-            for (n, k, x, y, wt) in w.into_iter().chain([
-                (2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up),
-                (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down),
-            ]) {
+            let mlp = if l.router != 0 {
+                vec![(MOE_ROUTER_LD, c.hidden_size, s.h, s.moe_logits, Weight::bf16(l.router))]
+            } else {
+                vec![(2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up), (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down)]
+            };
+            for (n, k, x, y, wt) in w.into_iter().chain(mlp) {
                 if seen.insert((n, k)) {
                     shapes.push((n, k, x, y));
                     for &m in &ms {
@@ -1363,7 +1434,8 @@ impl Model {
             // sequence, at most 16 rows; longer runs are cut into more tiles.
             let rpw = 8 / (self.cfg.num_attention_heads / self.cfg.num_key_value_heads);
             let longest = b.seq_len[..nd_seqs].iter().copied().max().unwrap_or(1).max(1) as usize;
-            let warps = longest.div_ceil(rpw).min(16 / rpw);
+            // At most 8 warps a block (8 query heads per KV head: one row per warp).
+            let warps = longest.div_ceil(rpw).min(16 / rpw).min(8);
             let cap = (warps * rpw) as u32;
             anyhow::ensure!(
                 rows * splits <= attn_part_rows(self.limits.max_seqs) && rows <= self.limits.max_seqs * MAX_DECODE_ROWS_PER_SEQ,
@@ -2083,17 +2155,45 @@ impl Model {
             }
             .map_err(de)?;
             mark!("norm");
-            let inter = c.intermediate_size;
-            g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
-            mark!("gemm_gate_up");
-            let nvec = (t * inter / 8) as u32;
-            unsafe {
-                g.k.silu_mul(&st, cfg((nvec.div_ceil(256), 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32, t as u32)
+            if l.ex_gate_up == 0 {
+                let inter = c.intermediate_size;
+                g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
+                mark!("gemm_gate_up");
+                let nvec = (t * inter / 8) as u32;
+                unsafe {
+                    g.k.silu_mul(&st, cfg((nvec.div_ceil(256), 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32, t as u32)
+                }
+                .map_err(de)?;
+                mark!("silu_mul");
+                g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
+                mark!("gemm_down");
+            } else {
+                let ei = c.moe_intermediate_size as u32;
+                let jobs = moe_max_jobs(t) as u32;
+                let (tu, ld) = (t as u32, MOE_ROUTER_LD as u32);
+                g.gemm(t, cap, MOE_ROUTER_LD, c.hidden_size, s.h, Weight::bf16(l.router), s.moe_logits, CUDA_R_16BF)?;
+                mark!("gemm_router");
+                unsafe {
+                    g.k.moe_route(&st, cfg((tu.div_ceil(8), 1, 1), 256), s.moe_logits as *const u16, ld, s.moe_idx as *mut u64, s.moe_w as *mut f32, tu).map_err(de)?;
+                    g.k.moe_bucket(&st, cfg((1, 1, 1), 256), s.moe_idx as *const u64, tu, s.moe_list as *mut u32, s.moe_jobs as *mut u32, jobs).map_err(de)?;
+                }
+                mark!("moe_route");
+                let (list, jl) = (s.moe_list as *const u32, s.moe_jobs as *const u32);
+                unsafe {
+                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, tu, 1)
+                        .map_err(de)?;
+                }
+                mark!("moe_gate_up");
+                unsafe {
+                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, tu, 0)
+                        .map_err(de)?;
+                }
+                mark!("moe_down");
+                unsafe {
+                    g.k.moe_combine(&st, cfg((tu, 1, 1), 256), s.moe_out as *const u16, s.moe_w as *const f32, s.moe_logits as *const u16, ld, s.delta as *mut u16, hd, tu).map_err(de)?;
+                }
+                mark!("moe_combine");
             }
-            .map_err(de)?;
-            mark!("silu_mul");
-            g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
-            mark!("gemm_down");
 
             if let Some(d) = dump.as_deref_mut().filter(|_| li < nl) {
                 let x: Vec<u16> = g.download(s.x, t * c.hidden_size)?;
