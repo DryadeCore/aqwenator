@@ -289,6 +289,7 @@ pub struct Model {
     tile_attn: bool,
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
+    attn_nbuf: u32,
     /// Slice bounds of `attn_decode_tq` (keys, DEC_TC_SLICES + 1 entries; device copy and host
     /// copy): fine slices first, coarser ones for long contexts, the last one open-ended.
     dec_bounds: u64,
@@ -393,8 +394,8 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per sub-tile and query head of the group)
 /// plus one 32-key K tile and one V tile, all 256-wide bf16.
-fn attention_tc_smem(group: usize, qt: usize) -> u32 {
-    ((qt * group * 16 + 2 * 32) * 256 * 2) as u32
+fn attention_tc_smem(group: usize, qt: usize, nbuf: usize) -> u32 {
+    ((qt * group * 16 + nbuf * 2 * 32) * 256 * 2) as u32
 }
 
 /// Shared-memory bytes of `attn_decode_tq`: 8 query slots and a 16-key P tile per warp plus one
@@ -663,11 +664,20 @@ impl Model {
         let grp = cfg.num_attention_heads / cfg.num_key_value_heads;
         // Sub-tiles per block: capped by 1024 threads and 100 KiB of shared memory (the most a
         // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
+        let smem_max = gpu.max_smem_optin()? as u32;
         let mut attn_qt: usize = std::env::var("AQ_ATTN_QT").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4);
-        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt) > 100 << 10) {
+        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt, 1) > smem_max.min(100 << 10)) {
             attn_qt -= 1;
         }
-        let attn_tc_smem = attention_tc_smem(grp, attn_qt);
+        // A second K/V buffer pair (the next tile loads while this one is used) where the
+        // device has the shared memory for it; AQ_ATTN_PIPE=0|1 forces it off or on.
+        let attn_nbuf: usize = match std::env::var("AQ_ATTN_PIPE").as_deref() {
+            Ok("0") => 1,
+            _ if attention_tc_smem(grp, attn_qt, 2) <= smem_max => 2,
+            _ => 1,
+        };
+        let attn_tc_smem = attention_tc_smem(grp, attn_qt, attn_nbuf);
+        eprintln!("prefill attention: {attn_qt} sub-tiles, {attn_nbuf} K/V buffer(s), {} KiB shared memory of {} KiB", attn_tc_smem >> 10, smem_max >> 10);
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
             attn_tc_smem,
@@ -717,6 +727,7 @@ impl Model {
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
+            attn_nbuf: attn_nbuf as u32,
             dec_bounds,
             dec_bounds_h,
             attn_qt,
@@ -1896,6 +1907,7 @@ impl Model {
                                 h,
                                 hkv,
                                 scale,
+                                self.attn_nbuf,
                             )
                         }
                         .map_err(de)?;

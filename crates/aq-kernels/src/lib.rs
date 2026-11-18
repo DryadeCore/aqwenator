@@ -2025,8 +2025,8 @@ pub mod kernels {
     /// fed by `ldmatrix` from XOR-swizzled shared tiles; K/V tiles of 32 keys arrive by `cp.async`.
     /// Softmax is online (exp2 with the scale folded in); P is rounded to bf16 for the PV MMA.
     ///
-    /// Dynamic shared memory: `(QT * group * 16 + 2 * 32) * 256 * 2` bytes (64 KiB for group 4,
-    /// QT 1). grid = (n_tiles, n_kv), block = (32 * group * QT).
+    /// Dynamic shared memory: `(QT * group * 16 + nbuf * 2 * 32) * 256 * 2` bytes (64 KiB for
+    /// group 4, QT 1, one K/V buffer pair). grid = (n_tiles, n_kv), block = (32 * group * QT).
     #[kernel]
     pub unsafe fn attention_tc(
         q: *const u16,
@@ -2045,9 +2045,10 @@ pub mod kernels {
         n_heads: u32,
         n_kv: u32,
         scale: f32,
+        nbuf: u32,
     ) {
         use cuda_device::DynamicSharedArray;
-        use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all};
+        use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all, cp_async_wait_group};
         use cuda_device::convert::cvt_bf16x2_f32;
         use cuda_device::float::ex2_approx_ftz_f32;
         use cuda_device::wmma::{ldmatrix_x4, ldmatrix_x4_trans, mma_m16n8k16_f32_bf16};
@@ -2079,8 +2080,12 @@ pub mod kernels {
         let n_keys = pos0 + nq;
 
         let qs = smem;
-        let ks = unsafe { smem.add(nwarps * 16 * D) };
-        let vs = unsafe { ks.add(KT * D) };
+        // K/V tile buffers: one pair, or two so that the next tile loads while this one is used.
+        let ks0 = unsafe { smem.add(nwarps * 16 * D) };
+        let vs0 = unsafe { ks0.add(KT * D) };
+        let ks1 = unsafe { vs0.add(KT * D) };
+        let vs1 = unsafe { ks1.add(KT * D) };
+        let piped = nbuf == 2;
 
         // Q tile: nwarps * 16 rows (warp w -> rows 16w..16w+16 = its sub-tile's tokens, its head).
         let qrows = nwarps * 16;
@@ -2115,17 +2120,43 @@ pub mod kernels {
         let mut l_b = 0.0f32;
         let sl2 = scale * LOG2E;
 
-        let mut kb = 0usize;
-        while kb < n_keys {
-            // K/V tile: KT keys x 256 dims each, zero-filled past the end, as two 16-key
-            // halves (each inside one KV page).
+        // K/V tile: KT keys x 256 dims each, zero-filled past the end, as two 16-key halves
+        // (each inside one KV page). With two buffers, tile i + 1 is requested before tile i is
+        // waited for, so its fetch overlaps the MMAs of tile i: one block scans the whole
+        // context serially and is otherwise bound by one fetch latency per tile.
+        if piped {
             unsafe {
-                kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, n_keys, 16, tid, nthreads);
-                kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, kb + 16, n_keys, 16, tid, nthreads);
-            }
-            unsafe {
+                kv_tile_cp_async(ks0, vs0, k_cache, v_cache, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
+                kv_tile_cp_async(ks0.add(16 * D), vs0.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
                 cp_async_commit_group();
-                cp_async_wait_all();
+            }
+        }
+        let mut kb = 0usize;
+        let mut cur = 0usize;
+        while kb < n_keys {
+            let ks = if cur == 0 { ks0 } else { ks1 };
+            let vs = if cur == 0 { vs0 } else { vs1 };
+            if piped {
+                let nx = kb + KT;
+                if nx < n_keys {
+                    let kn = if cur == 0 { ks1 } else { ks0 };
+                    let vn = if cur == 0 { vs1 } else { vs0 };
+                    unsafe {
+                        kv_tile_cp_async(kn, vn, k_cache, v_cache, table, bs, hkv, kv, nx, n_keys, 16, tid, nthreads);
+                        kv_tile_cp_async(kn.add(16 * D), vn.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, nx + 16, n_keys, 16, tid, nthreads);
+                        cp_async_commit_group();
+                        cp_async_wait_group(1);
+                    }
+                } else {
+                    unsafe { cp_async_wait_all() };
+                }
+            } else {
+                unsafe {
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, n_keys, 16, tid, nthreads);
+                    kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, kb + 16, n_keys, 16, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
             }
             thread::sync_threads();
 
@@ -2219,6 +2250,9 @@ pub mod kernels {
             }
             thread::sync_threads();
             kb += KT;
+            if piped {
+                cur ^= 1;
+            }
         }
 
         // Finish the row sums across the quad, normalize, round, gate, store pairs.

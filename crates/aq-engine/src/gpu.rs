@@ -588,6 +588,14 @@ impl Gpu {
         Ok(v as usize)
     }
 
+    /// Most dynamic shared memory one block may opt in to, in bytes
+    /// (CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN).
+    pub fn max_smem_optin(&self) -> Result<usize> {
+        let mut v = 0i32;
+        drv(unsafe { cuDeviceGetAttribute(&mut v, 97, self.ctx.cu_device() as i32) }, "cuDeviceGetAttribute")?;
+        Ok(v as usize)
+    }
+
     pub fn launch_graph(&self, exec: u64) -> Result<()> {
         drv(unsafe { cuGraphLaunch(exec as *mut c_void, self.raw_stream()) }, "cuGraphLaunch")
     }

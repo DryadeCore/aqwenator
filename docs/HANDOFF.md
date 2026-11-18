@@ -528,6 +528,54 @@ until an eighth of the slots is free. 16 agents (434.0) and 4 agents (113.8) are
 gate 31/31. The eighth was reasoned, not swept. The B200 is therefore not saturated at 16
 agents, and the Spark's 32-agent points (same 128 slots) are probably low for the same reason.
 
+### 32 agents on the B200: where the time goes; prefill attention; low-bit weights (2026-11-18)
+
+**Profile at 32 agents** (bf16, `AQ_PROFILE=decode|prefill` under the replay). Steps that carry
+prefill are about half of the GPU time (1699 steps of 46.6 ms against 6569 decode-only steps of
+10.9 ms), and decoding sequences wait through them: that is the TPOT gap to vLLM. In those
+steps `attn_prefill` is 50% (2.5–3.0 ms per call for about 1000 new tokens over 20k keys),
+`attn_dec` 10%, `gemm_gate_up` 10%. In decode-only steps `attn_dec` is 43%. By the rates in
+the ceilings table, prefill attention runs at about 6% of the card's GEMM rate and 7% of its
+bandwidth bound.
+
+- Tile width is not it: `AQ_ATTN_QT` 1 / 2 / 4 gives 758 / 746 / 748 turns/min and 2.30 / 2.47 /
+  2.52 ms per call. Twice the blocks of half the warps take the same time.
+- **Second K/V buffer pair** in `attention_tc` (the next tile is requested before the current
+  one is waited for; on by default where the device allows the shared memory, 128 KiB for the
+  9B; `AQ_ATTN_PIPE=0` turns it off; the GB10's 100 KiB keeps one pair): 2.56 against 2.95 ms
+  per call (-13%), 755.0 / 756.8 against 741.8 / 739.8 turns/min in an ABAB run, TTFT p50 64
+  against 71 ms. Gate 31/31. vLLM is still ahead at this load (795).
+- What is left: the kernel has one warp per (16 tokens, head) and each scans the whole context
+  serially, so 1000 tokens are about 1000 warps on 148 SMs, each bound by its own dependency
+  chain. More warps per SM needs the key range split across blocks with a combine pass, as
+  the decode kernel does. Not done.
+
+**Low-bit weights, quality only** (teacher-forced mean KL in nats against transformers, the
+three 20k-token trace references of 256 positions; rounding-only schemes emulated on the int8
+grid, one scale per 32 weights; top-1 agreement in brackets):
+
+| Scheme | KL |
+|---|---|
+| 8-bit | 0.002–0.004 (99%) |
+| 6-bit uniform | 0.015–0.045 (96–99%) |
+| 5-bit uniform | 0.11–0.14 (90–95%) |
+| 4-bit uniform | 0.12–0.21 (91–95%) |
+| 4-bit, NF4 levels | 0.15–0.19 |
+| 4-bit uniform, scale clipped to 0.9 … 0.6 of the block maximum | 0.13–0.36 … 0.8–1.3 |
+| 2-bit uniform | 0.5–1.0 (75–86%) |
+| `Intel/Qwen3.5-9B-int4-AutoRound` (calibrated, one scale per 128), dequantized to bf16 | 0.08–0.14 (91–94%) |
+
+4-bit on one group at a time (uniform): g 0.06, o 0.06, q 0.04–0.15, a 0.02–0.04, u 0.07–0.14,
+d 0.03–0.05; NF4 halves the MLP's error (u+d 0.05–0.08 against 0.10–0.13) but not the whole
+model's. No group is the culprit, so mixing 4-bit and 8-bit groups does not rescue it. The
+error grows with context: AutoRound is 0.005 on the short reference and 0.022 at 16k (plain
+rounding 0.013 and 0.038; 32 positions each). About 0.12 nats is the price of 4 bits on this
+model on agent traces, calibrated or not; 6-bit rounding is at the fp8 tier's level.
+The embedding table and the output head are separate 2 GB tensors (not tied).
+Plan for an 8 GB card: load the AutoRound format directly (4.125 bits per weight, 3.6 GB of
+layer weights), 8-bit head, embedding table in host RAM (it is only gathered from), about 7 GB
+with a 1.5 GB KV pool. That budget is arithmetic on tensor sizes, not a measured load.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)
