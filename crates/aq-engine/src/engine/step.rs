@@ -45,7 +45,7 @@ fn emit(s: &mut Seq, tok: u32, eos: &[u32], trace: bool, events: &mut Vec<TokenE
     }
     let stop = !s.req.ignore_eos && eos.contains(&tok);
     let finished = stop || s.out.len() >= s.req.max_new_tokens;
-    events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop });
+    events.push(TokenEvent { id: s.req.id, token: tok, index: s.out.len() - 1, finished, stop, cached: s.reused });
     finished
 }
 

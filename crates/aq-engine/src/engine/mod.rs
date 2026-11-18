@@ -46,6 +46,8 @@ pub struct TokenEvent {
     pub finished: bool,
     /// The request ended on an end-of-sequence token (rather than its token limit).
     pub stop: bool,
+    /// Prompt tokens the request resumed from the session cache instead of computing.
+    pub cached: usize,
 }
 
 struct Seq {

@@ -6,7 +6,8 @@
 //! side so the engine thread never touches text.
 //!
 //! Supported: prompt as text or token ids, `max_tokens`, `ignore_eos`, `stream` (SSE),
-//! `return_token_ids`. Greedy only for now: `temperature` must be absent or 0.
+//! `return_token_ids`. Greedy only for now: `temperature` must be absent or 0. `usage` reports
+//! the prompt tokens served from the session cache (in the last chunk when streaming).
 //!
 //!     aq-serve <model> [--port 8000] [--max-seqs 64] [--max-ctx 32768] [--max-tokens 8192]
 //!              [--mixed-prefill N] [--max-running N] [--session-cache true|false] [--kv-gb X]
@@ -107,6 +108,11 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
     if prompt.is_empty() {
         return bad("empty prompt");
     }
+    let n_prompt = prompt.len();
+    let usage = move |completion: usize, cached: usize| {
+        json!({"prompt_tokens": n_prompt, "completion_tokens": completion, "total_tokens": n_prompt + completion,
+            "prompt_tokens_details": {"cached_tokens": cached}})
+    };
     let id = app.next_id.fetch_add(1, Ordering::Relaxed);
     let req = Request {
         id,
@@ -137,7 +143,10 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
                     if with_ids {
                         choice["token_ids"] = json!([e.token]);
                     }
-                    let chunk = json!({"id": rid, "object": "text_completion", "created": created, "model": model, "choices": [choice]});
+                    let mut chunk = json!({"id": rid, "object": "text_completion", "created": created, "model": model, "choices": [choice]});
+                    if e.finished {
+                        chunk["usage"] = usage(e.index + 1, e.cached);
+                    }
                     let mut v = vec![Ok(Event::default().data(chunk.to_string()))];
                     if e.finished {
                         v.push(Ok(Event::default().data("[DONE]")));
@@ -154,10 +163,12 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
     let mut toks = Vec::new();
     let mut text = String::new();
     let mut finish = "length";
+    let mut cached = 0;
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Error(e) => return bad(e),
             Msg::Token(e) => {
+                cached = e.cached;
                 toks.push(e.token);
                 text.push_str(&detok.push(e.token));
                 if e.finished {
@@ -174,7 +185,7 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
         choice["token_ids"] = json!(toks);
     }
     Json(json!({"id": rid, "object": "text_completion", "created": created, "model": app.model, "choices": [choice],
-        "usage": {"completion_tokens": toks.len()}}))
+        "usage": usage(toks.len(), cached)}))
     .into_response()
 }
 
