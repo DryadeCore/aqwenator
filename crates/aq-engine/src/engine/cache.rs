@@ -310,13 +310,9 @@ impl Engine {
         p.max(s)
     }
 
-    /// Admit waiting requests while there is room, per the policy.
-    /// Keep a share of the state slots free for checkpoints, taps and forks, which are all
-    /// skipped when no slot is free. With a KV pool large enough that nothing is evicted for
-    /// memory, parked entries otherwise take every slot; a turn then consumes the checkpoint
-    /// it resumes from without leaving a new one, and the session's next turn re-reads most
-    /// of its prompt (32 agents on a B200, 128 slots: 6.1M prompt tokens re-read against
-    /// 3.1M, 481 turns per minute against 752).
+    /// Keep an eighth of the state slots free: checkpoints, taps and forks are skipped when
+    /// none is, and with a KV pool large enough that nothing is evicted for memory, parked
+    /// entries would take every slot.
     pub(super) fn reserve_slots(&mut self) {
         let want = self.limits().max_seqs / 8;
         while self.pool.slots.len() < want && self.evict_lru_parked() {}

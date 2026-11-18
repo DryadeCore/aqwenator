@@ -18,7 +18,7 @@ impl Engine {
         let cap = self.max_running.min(self.limits().max_seqs);
         let pol = self.policy;
         if !pol.load_control && !pol.srpt {
-            // Original behavior: strict FIFO, stop at the first request that does not fit.
+            // Strict FIFO: stop at the first request that does not fit.
             while !self.waiting.is_empty() && self.running.len() < cap {
                 if !self.try_admit(0, true)? {
                     break;

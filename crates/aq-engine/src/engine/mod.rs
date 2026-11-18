@@ -1,24 +1,13 @@
 //! Continuous-batching scheduler over [`Model::step`], with a session cache.
 //!
-//! Every step packs, in order: one decode token for each running sequence that has finished
-//! its prompt, then prefill chunks (oldest first) until the token budget is spent.
+//! A step carries the decode rows of every running sequence past its prompt, then prefill
+//! chunks. Admission reserves every KV page a request can need, so a running sequence is
+//! never preempted.
 //!
-//! Admission reserves every KV page a request can need (prompt + max new tokens) up front, so
-//! a running sequence never has to be preempted.
-//!
-//! Session cache: a finished sequence is *parked* instead of freed. Its state slot (DeltaNet
-//! recurrent + conv state) and KV pages stay as they are, keyed by the exact tokens that were
-//! fed through the model. A new request whose prompt strictly extends a parked token list
-//! resumes from it and prefills only the new suffix, which is exact: the state is the state
-//! after those tokens. Parked sessions are evicted least-recently-used when a new request
-//! needs their slot or pages.
-//!
-//! Shared prefixes: when a new request shares a long page-aligned prefix with a known sequence
-//! (e.g. the system prompt every agent starts with), its prefill pauses at that boundary and
-//! the engine snapshots the recurrent state into a spare slot, pinning the prefix's KV pages
-//! with reference counts. Later requests with that prefix fork from the snapshot: a state-slot
-//! copy plus shared read-only pages. Exact, because no sequence ever writes below its own
-//! `computed` position, so shared pages are never written.
+//! A finished sequence is parked, not freed: its state slot and KV pages stay, keyed by the
+//! exact tokens fed through the model, and a request whose prompt extends them resumes there.
+//! A long prefix shared by several prompts is snapshotted once and forked. Both are exact: no
+//! sequence writes below its own `computed` position, so shared pages are never written.
 
 use crate::draft::{DraftIndex, NgramModel};
 use crate::model::{Batch, GDN_TC_CHUNK, Limits, MAX_DECODE_ROWS_PER_SEQ, Model};
@@ -80,15 +69,13 @@ struct Seq {
     turns: u32,
     /// Session id: parked entries left by the same chain of turns share it.
     sid: u64,
-    /// Draft tokens this sequence may carry next step: `spec_k` normally, doubled (up to the
-    /// row limit) after a step that accepted a full draft, because copy runs are long and a
-    /// longer draft only pays while they last.
+    /// Draft length for the next step when above `spec_k`: doubled after a fully accepted
+    /// draft, since copy runs are long.
     k_cur: usize,
     /// The MTP head's predictions for the tokens after the last known one (the first from the
     /// main pass, the rest chained), with the number of known tokens they were made at.
     mtp_next: Option<(usize, Vec<u32>)>,
-    /// When the request was submitted and admitted, and the steps it took part in before its
-    /// first token (AQ_TRACE request log).
+    /// For the AQ_TRACE request log.
     t_add: Instant,
     t_admit: Instant,
     steps: u32,
@@ -135,73 +122,58 @@ pub struct Engine {
     pub session_cache: bool,
     /// Max sequences running at once; state slots beyond this hold parked sessions.
     pub max_running: usize,
-    /// Speculative decoding: max draft tokens per decode step (0 = off). Greedy requests only.
-    /// Exact: drafts are verified through the normal decode-path kernels, the state is written
-    /// to a spare slot, and on a rejection the accepted tokens are simply fed again.
+    /// Draft tokens per sequence and decode step (0 = off). Exact: the state after a draft
+    /// goes to a spare slot, and after a rejection the accepted tokens are fed again.
     pub spec_k: usize,
-    /// Prompt-lookup drafting: longest suffix n-gram (down to `spec_min_ngram`) matched against
-    /// the sequence's own earlier tokens.
+    /// Prompt-lookup drafts match the longest suffix n-gram within these bounds.
     pub spec_max_ngram: usize,
     pub spec_min_ngram: usize,
     pub spec: SpecStats,
-    /// Cross-session draft model: extends (or supplies) drafts with what the server's own
-    /// earlier generations most often produced after the same few tokens. On unless
-    /// AQ_NO_GLOBAL_DRAFT is set.
+    /// Extend drafts with what earlier generations most often produced after the same few
+    /// tokens, across sessions (off with AQ_NO_GLOBAL_DRAFT).
     pub global_draft: bool,
     global: NgramModel,
     /// Grow a sequence's draft length while its drafts are fully accepted (off with
     /// AQ_NO_SPEC_ADAPT).
     pub spec_adaptive: bool,
-    /// Draft tokens taken from the MTP head per step: the first comes with the main pass,
-    /// the rest from chained passes of the head alone (AQ_MTP_K, default 3). Chaining paid
-    /// off once decode attention read K/V once per sequence instead of once per row: on the
-    /// DGX Spark's real traces 3.37 -> 3.97 tokens per step and +10% turns per minute; it is
-    /// neutral on the B200.
+    /// Draft tokens from the MTP head per step: the first comes with the main pass, the rest
+    /// from chained passes of the head alone (AQ_MTP_K).
     pub mtp_k: usize,
-    /// Burst prefill (AQ_BURST_PREFILL=tokens, 0 = off) and the minimum number of steps
-    /// between two bursts (AQ_BURST_EVERY, default 3).
+    /// Tokens of a burst prefill (0 = off) and the steps between two bursts.
     pub burst_prefill: usize,
     pub burst_every: usize,
     since_burst: usize,
     /// AQ_SPEC_TRACE: log every decode entry's draft, targets and acceptance.
     spec_trace: bool,
-    /// AQ_SPEC_FAULT=N: test hook for the correctness check itself. Every Nth rejected draft
-    /// is emitted as if it had been accepted, which the check must report as a mismatch.
+    /// AQ_SPEC_FAULT=N: every Nth rejected draft is emitted as accepted, which `aq-check`
+    /// must report.
     spec_fault: u64,
     spec_rejects: u64,
-    /// Max prefill tokens in a step that also carries decode tokens. Bounds how long a running
-    /// sequence waits for its next token while new prompts are prefilled (ITL tail), at some
-    /// cost to TTFT. `usize::MAX` = no separate cap (only the step budget).
+    /// Prefill tokens allowed in a step that also decodes: trades TTFT for inter-token
+    /// latency.
     pub mixed_prefill_budget: usize,
-    /// Decode/prefill co-execution (AQ_COEXEC=1): prefill batches run asynchronously on lane 0
-    /// while decode steps for the other sequences run on a high-priority lane 1.
+    /// AQ_COEXEC=1: prefill batches run on lane 0 while the other sequences decode on a
+    /// high-priority lane 1.
     pub coexec: bool,
     inflight: Option<Inflight>,
     /// Decode steps that ran while a prefill batch was in flight (co-execution).
     pub overlap_steps: u64,
-    /// Minimum time between decode steps while a prefill batch is in flight (AQ_COEXEC_PACE_US):
-    /// leaves the GPU to prefill between decode steps, trading inter-token latency for TTFT.
+    /// Minimum time between decode steps while a prefill batch is in flight.
     pub coexec_pace: std::time::Duration,
     last_decode: Option<Instant>,
     /// (larger budget, pending-prefill threshold in tokens): switch mixed steps to the larger
     /// prefill budget while more than `threshold` admitted prompt tokens await prefill.
     pub mixed_prefill_adaptive: Option<(usize, usize)>,
-    /// Prompt checkpoints: keep a copy of the state at the last page boundary at least
-    /// `CKPT_BACKOFF` tokens before a request's prompt ends (a parked entry sharing the
-    /// prompt's KV pages). A later request that extends the *prompt* then resumes from it even
-    /// if it does not extend the tokens this engine generated, which is what agent harnesses
-    /// send: the previous prompt plus the assistant turn as the chat template renders it.
-    /// The backoff is there because templates end a prompt with a generation header whose
-    /// last token re-tokenizes once the turn's text follows it (Qwen3.5: `<think>\n` becomes
-    /// `<think>\n\n`), so consecutive prompts diverge just before the previous one's end.
+    /// Park a copy of the state at the last page boundary at least `CKPT_BACKOFF` tokens
+    /// before a prompt's end. Agent harnesses send the previous prompt plus the assistant
+    /// turn as the template renders it, not the tokens this engine generated, and a prompt's
+    /// last token re-tokenizes once text follows it (`<think>\n` becomes `<think>\n\n`), so
+    /// the next prompt extends the checkpoint but not the parked generation.
     pub prompt_checkpoints: bool,
-    /// AQ_TRACE=1: log one line per step (`[step]`: composition and GPU time) and one per
-    /// request at its first token (`[req]`: queue wait, steps, time to first token).
+    /// AQ_TRACE=1: a `[step]` line per step and a `[req]` line per request at its first token.
     pub trace: bool,
-    /// Background prefill (AQ_BG_PREFILL=tokens, 0 = off): a prompt with at least this many
-    /// tokens left to prefill runs as one asynchronous batch on a second lane, while steps for
-    /// everyone else (decode, speculation, short prefills) continue. Keeps a long tool result
-    /// from stalling the sequences that are generating. Not combined with co-execution.
+    /// AQ_BG_PREFILL=tokens (0 = off): a prompt with at least this much left to prefill runs
+    /// as one batch on a second lane while the others keep stepping. Not with co-execution.
     pub bg_prefill: usize,
     pub policy: Policy,
     /// Set during an admission that may only evict sessions presumed finished.
