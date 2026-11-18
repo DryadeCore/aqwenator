@@ -624,8 +624,21 @@ above was 0.75 GiB larger. Whether the third row fits an 8 GB card depends on th
 context size and on whether it drives a display; not measured on one yet. Next reduction: an
 8-bit KV cache.
 
-Not done: a kernel that multiplies the codes directly (the expansion costs what the int8
-expansion cost).
+**Direct kernel.** `gemm_i8w` has a 4-bit mode (`w4`): a ring slot holds the tile's packed
+codes as stored (128 rows x 32 bytes) and the rows' f32 group scales; when a chunk is used
+each thread unpacks its 16 bytes to int8 (flip bit 3, extend it through the high nibble) into
+one shared operand tile, then the MMAs run as for int8. Shared memory is
+`8192 + 4 * (4608 + ceil(m / 16) * 2176)` bytes, less than the int8 mode, whose request is now
+sized from the row cap (and the cap lowered to what the device allows) instead of a constant
+that exceeded the GB10's 100 KiB. The minimum weight size for the kernel is now 32 rows per SM
+(`AQ_I8_KERNEL_MIN_N` overrides), the same choices as before on the B200.
+B200 replay, kernel on / off (turns/min; TPOT p50 ms): 1 agent 24.8 / 22.0 (3.8 / 5.6), 4
+agents 96.0 / 84.0 (4.1 / 6.0), 16 agents 339.0 / 309.8 (6.3 / 7.7), both runs with the decode
+profile on. us per call: gate_up 175 / 247, gdn_in 101 / 145, lm_head (int8) 279 / 685; the
+int8 mode does gate_up in 100 and the bf16 GEMM in 45, so on this card the unpack is the cost.
+Quality is the same either way (0.147 / 0.078 / 0.127 against 0.146 / 0.078 / 0.129).
+What it is for is a bandwidth-limited card, where it reads 0.5 bytes per weight against about
+4.5 for the expansion; not measured on one yet.
 
 # Handoff: aqwenator state as of 2026-11-13
 

@@ -634,7 +634,7 @@ pub mod kernels {
     /// grid = (ceil(n / 128), ceil(m / 128)), block = (256),
     /// dynamic shared memory = 4 * (8704 + min(m, 128).div_ceil(16) * 2176) bytes.
     #[kernel]
-    pub unsafe fn gemm_i8w(xh: *const u8, xl: *const u8, sx: *const f32, q: *const u8, bmax: *const u16, y: *mut u16, m: u32, n: u32, k: u32, ldy: u32) {
+    pub unsafe fn gemm_i8w(xh: *const u8, xl: *const u8, sx: *const f32, q: *const u8, bmax: *const u16, y: *mut u16, m: u32, n: u32, k: u32, ldy: u32, w4: u32) {
         use cuda_device::async_copy::{cp_async_ca_4, cp_async_ca_8, cp_async_ca_zfill_4, cp_async_ca_zfill_8, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
         use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k32_s32_s8};
         const S: usize = 4;
@@ -653,40 +653,64 @@ pub mod kernels {
         let mc = if m - m0 < 128 { m - m0 } else { 128 };
         let mtc = mc.div_ceil(16);
         let plane = mtc * 1024;
-        let xo = 8704 + mtc * 128; // digit planes, after the activation scales
+        // A ring slot: the weight tile (int8: 128 rows x 64 bytes, swizzled; 4-bit: 128 x 32
+        // bytes of codes as they are stored), the rows' scales, the activation rows' scales,
+        // the two digit planes. With 4-bit weights the first 8192 bytes of shared memory hold
+        // the tile being used, unpacked to int8.
+        let w4 = w4 != 0;
+        let wsc = if w4 { 4096 } else { 8192 };
+        let asc = wsc + 512;
+        let xo = asc + mtc * 128;
         let stage = xo + 2 * plane;
+        let ring = if w4 { unsafe { sm.add(8192) } } else { sm };
         let kb = k / 32;
         let chunks = k / 64;
 
         // Issue chunk `c` into ring slot `c % S` and commit it as one group.
         let issue = |c: usize| {
-            let sb = unsafe { sm.add((c % S) * stage) };
+            let sb = unsafe { ring.add((c % S) * stage) };
             let kc = c * 64;
             unsafe {
-                // Weights: 128 rows x 4 vectors, two per thread.
-                #[unroll]
-                for u in 0..2 {
-                    let idx = tid + 256 * u;
-                    let (r, v) = (idx / 4, idx % 4);
-                    let dst = sb.add(sw(r, v)) as *mut u32;
+                if w4 {
+                    // Codes: 128 rows x 2 vectors, one per thread.
+                    let (r, v) = (tid / 2, tid % 2);
+                    let dst = sb.add(r * 32 + v * 16) as *mut u32;
                     if nb + r < n {
-                        cp_async_cg_16(dst, q.add((nb + r) * k + kc + v * 16) as *const u32);
+                        cp_async_cg_16(dst, q.add((nb + r) * (k / 2) + kc / 2 + v * 16) as *const u32);
                     } else {
                         cp_async_cg_zfill_16(dst, q, 0);
                     }
+                } else {
+                    // Weights: 128 rows x 4 vectors, two per thread.
+                    #[unroll]
+                    for u in 0..2 {
+                        let idx = tid + 256 * u;
+                        let (r, v) = (idx / 4, idx % 4);
+                        let dst = sb.add(sw(r, v)) as *mut u32;
+                        if nb + r < n {
+                            cp_async_cg_16(dst, q.add((nb + r) * k + kc + v * 16) as *const u32);
+                        } else {
+                            cp_async_cg_zfill_16(dst, q, 0);
+                        }
+                    }
                 }
-                // The two block scales of each row.
+                // Each row's scales for this chunk: two bf16 block magnitudes, or with 4-bit
+                // weights the f32 scale of the 128 columns it is in.
                 if tid < 128 {
-                    let dst = sb.add(8192 + tid * 4) as *mut u32;
+                    let dst = sb.add(wsc + tid * 4) as *mut u32;
                     if nb + tid < n {
-                        cp_async_ca_4(dst, bmax.add((nb + tid) * kb + kc / 32) as *const u32);
+                        if w4 {
+                            cp_async_ca_4(dst, (bmax as *const u32).add((nb + tid) * (k / 128) + kc / 128));
+                        } else {
+                            cp_async_ca_4(dst, bmax.add((nb + tid) * kb + kc / 32) as *const u32);
+                        }
                     } else {
                         cp_async_ca_zfill_4(dst, q, 0);
                     }
                 }
                 // The two block scales of each activation row.
                 if tid < mtc * 16 {
-                    let dst = sb.add(8704 + tid * 8) as *mut u32;
+                    let dst = sb.add(asc + tid * 8) as *mut u32;
                     if tid < mc {
                         cp_async_ca_8(dst, sx.add((m0 + tid) * kb + kc / 32) as *const u32);
                     } else {
@@ -730,22 +754,57 @@ pub mod kernels {
             } else {
                 unsafe { cp_async_commit_group() };
             }
-            let sb = unsafe { sm.add((c % S) * stage) };
+            let sb = unsafe { ring.add((c % S) * stage) };
+            if w4 {
+                // Unpack the chunk's codes (two per byte, low nibble first, value = code - 8)
+                // into int8 operand rows: each thread turns its 16 bytes into two pieces.
+                let (r, v) = (tid / 2, tid % 2);
+                let src = unsafe { sb.add(r * 32 + v * 16) } as *const u32;
+                #[unroll]
+                for hh in 0..2 {
+                    let mut out = [0u64; 2];
+                    #[unroll]
+                    for u in 0..2 {
+                        let x = unsafe { *src.add(2 * hh + u) };
+                        let mut o = 0u64;
+                        #[unroll]
+                        for jj in 0..4 {
+                            let by = ((x >> (8 * jj)) & 0xff) as u64;
+                            o |= ((by & 15) | ((by >> 4) << 8)) << (16 * jj);
+                        }
+                        // code - 8 as int8: flip bit 3, then extend it through the high nibble.
+                        let tt = o ^ 0x0808_0808_0808_0808;
+                        let s8 = tt & 0x0808_0808_0808_0808;
+                        out[u] = tt | (s8 << 1) | (s8 << 2) | (s8 << 3) | (s8 << 4);
+                    }
+                    let dst = unsafe { sm.add(sw(r, 2 * v + hh)) } as *mut u64;
+                    unsafe {
+                        *dst = out[0];
+                        *dst.add(1) = out[1];
+                    }
+                }
+                thread::sync_threads();
+            }
+            let wop = if w4 { sm } else { sb };
             #[unroll]
             for blk in 0..2 {
                 // Both n8 tiles of this warp: rows lr and 8 + lr, two 16-byte pieces each.
-                let b = unsafe { ldmatrix_x4(sb.add(sw(w * 16 + 8 * (lm >> 1) + lr, 2 * blk + (lm & 1))) as *const u32) };
+                let b = unsafe { ldmatrix_x4(wop.add(sw(w * 16 + 8 * (lm >> 1) + lr, 2 * blk + (lm & 1))) as *const u32) };
                 let mut sc = [[0.0f32; 2]; 2];
                 #[unroll]
                 for nt in 0..2 {
                     // This lane's two output columns are weight rows 2t and 2t + 1 of the tile.
-                    let sv = unsafe { *(sb.add(8192 + (w * 16 + nt * 8 + 2 * t) * 4) as *const u64) };
-                    sc[nt] = [bf16_to_f32((sv >> (16 * blk)) as u16) * (1.0 / 127.0), bf16_to_f32((sv >> (32 + 16 * blk)) as u16) * (1.0 / 127.0)];
+                    let sv = unsafe { *(sb.add(wsc + (w * 16 + nt * 8 + 2 * t) * 4) as *const u64) };
+                    sc[nt] = if w4 {
+                        [f32::from_bits(sv as u32), f32::from_bits((sv >> 32) as u32)]
+                    } else {
+                        [bf16_to_f32((sv >> (16 * blk)) as u16) * (1.0 / 127.0), bf16_to_f32((sv >> (32 + 16 * blk)) as u16) * (1.0 / 127.0)]
+                    };
                 }
                 #[unroll]
                 for mt in 0..8 {
                     if mt < mtc {
-                        let fx = unsafe { [*(sb.add(8704 + (mt * 16 + g) * 8 + blk * 4) as *const f32), *(sb.add(8704 + (mt * 16 + g + 8) * 8 + blk * 4) as *const f32)] };
+                        let fx = unsafe { [*(sb.add(asc + (mt * 16 + g) * 8 + blk * 4) as *const f32), *(sb.add(asc + (mt * 16 + g + 8) * 8 + blk * 4) as *const f32)] };
                         let o = sw(mt * 16 + 8 * (lm & 1) + lr, 2 * blk + (lm >> 1));
                         let ah = unsafe { ldmatrix_x4(sb.add(xo + o) as *const u32) };
                         let al = unsafe { ldmatrix_x4(sb.add(xo + plane + o) as *const u32) };
