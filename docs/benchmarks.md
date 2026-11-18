@@ -34,7 +34,10 @@ python scripts/trace_bench.py run --traces traces.json --model <model> --agents 
 python scripts/trace_bench.py report docs/results.jsonl > docs/results.md
 ```
 
-The page shows the latest run of each engine label, model, device and agent count.
+The page shows the latest run of each engine label, model, device and agent count, and under
+each table the largest recorded load at which each engine still meets a latency target
+(`report --ttft-p99 1000 --tpot-p99 50` by default). `--repeats N` measures N windows back
+to back and reports their spread.
 
 Caveats: a row is a single run of 4 to 10 minutes, turns per minute moves by a few percent
 between runs, the B200 is a shared machine, and the other engines run with settings taken

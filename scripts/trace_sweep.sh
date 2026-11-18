@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Real-trace replay sweep (scripts/trace_bench.py) against one engine.
 # Usage: scripts/trace_sweep.sh <vllm|aq> <model> <traces.json> <tag>
-#   AGENTS="4 8 16"  DURATION=240 WARMUP=60
-#   aq:   AQ_SERVE_BIN, AQ_KV_GB=48, AQ_ARGS="extra aq-serve flags"
+#   AGENTS="4 8 16"  DURATION=240 WARMUP=60 REPEATS=1 (measurement windows per point)
+#   MAX_RUNNING=32 (sequences decoding at once, both engines)
+#   aq:   AQ_SERVE_BIN, AQ_KV_GB=48, AQ_MAX_SEQS=128 (state slots), AQ_ARGS="extra aq-serve flags"
 #   vllm: VLLM_UTIL=0.6 (fraction of device memory), VLLM_SPEC='{"method":"ngram",...}'
+#   LABEL="engine name for the results", DEVICE and RECORD=docs/results.jsonl to keep the runs
 #   AQ_HOME=~/aq  AQ_VENV=$AQ_HOME/venv-ref (python with requests; vllm for the vllm engine)
 # Results: $AQ_HOME/results/trace/<tag>/agents<N>.json
 set -euo pipefail
@@ -34,12 +36,12 @@ if [ "$ENGINE" = vllm ]; then
     export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=$PATH:${CUDA_HOME:-/usr/local/cuda}/bin
   fi
   vllm serve "$MODEL" --port "$PORT" --max-model-len $MAX_CTX --gpu-memory-utilization "${VLLM_UTIL:-0.6}" \
-    --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 64 "${VLLM_ARGS[@]}" > "$OUT/server.log" 2>&1 &
-  LABEL="vLLM $(python -c 'import vllm; print(vllm.__version__)')"
+    --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs "${MAX_RUNNING:-64}" "${VLLM_ARGS[@]}" > "$OUT/server.log" 2>&1 &
+  LABEL=${LABEL:-"vLLM $(python -c 'import vllm; print(vllm.__version__)')"}
 else
-  "${AQ_SERVE_BIN:?set AQ_SERVE_BIN}" "$MODEL" --port "$PORT" --max-seqs 128 --max-running 32 --max-ctx $MAX_CTX \
+  "${AQ_SERVE_BIN:?set AQ_SERVE_BIN}" "$MODEL" --port "$PORT" --max-seqs "${AQ_MAX_SEQS:-128}" --max-running "${MAX_RUNNING:-32}" --max-ctx $MAX_CTX \
     --kv-gb "${AQ_KV_GB:-48}" --mixed-prefill 2048 --prewarm true --pin-snapshots true ${AQ_ARGS:-} > "$OUT/server.log" 2>&1 &
-  LABEL="aqwenator $TAG"
+  LABEL=${LABEL:-"aqwenator $TAG"}
 fi
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT
@@ -51,6 +53,7 @@ done
 echo "engine=$LABEL model=$MODEL traces=$TRACES" | tee "$OUT/meta.txt"
 for n in $AGENTS; do
   python "$HERE/trace_bench.py" run --traces "$TRACES" --url "http://localhost:$PORT" --model "$MODEL" --engine "$LABEL" \
-    --agents "$n" --warmup "$WARMUP" --duration "$DURATION" --out "$OUT/agents$n.json" | tee -a "$OUT/summary.txt"
+    --agents "$n" --warmup "$WARMUP" --duration "$DURATION" --repeats "${REPEATS:-1}" --device "${DEVICE:-unknown}" \
+    ${RECORD:+--record "$RECORD"} --out "$OUT/agents$n.json" | tee -a "$OUT/summary.txt"
 done
 echo SWEEP_DONE
