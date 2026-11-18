@@ -1,0 +1,16 @@
+[book]
+title = "aqwenator"
+description = "An inference server for Qwen3.5 hybrid models on NVIDIA GPUs"
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["docs/theme/hf.css"]
+git-repository-url = "https://github.com/McPatate/aqwenator"
+edit-url-template = "https://github.com/McPatate/aqwenator/blob/main/{path}"
+no-section-label = true

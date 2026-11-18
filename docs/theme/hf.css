@@ -1,0 +1,96 @@
+/* Hugging Face-ish palette over mdBook's light and navy themes. */
+:root {
+    --hf-yellow: #ffd21e;
+    --hf-orange: #ff9d00;
+    --content-max-width: 960px;
+    --mono-font: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html {
+    font-family: "Source Sans 3", "Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.light, html:not(.js) {
+    --bg: #ffffff;
+    --fg: #1f2937;
+    --sidebar-bg: #f9fafb;
+    --sidebar-fg: #374151;
+    --sidebar-non-existant: #9ca3af;
+    --sidebar-active: #b45309;
+    --sidebar-spacer: #e5e7eb;
+    --links: #b45309;
+    --inline-code-color: #9a3412;
+    --theme-popup-bg: #ffffff;
+    --theme-popup-border: #e5e7eb;
+    --quote-bg: #fffbeb;
+    --quote-border: var(--hf-yellow);
+    --table-border-color: #e5e7eb;
+    --table-header-bg: #fffbeb;
+    --table-alternate-bg: #f9fafb;
+    --searchbar-border-color: #d1d5db;
+    --search-mark-bg: var(--hf-yellow);
+}
+
+.navy {
+    --bg: #0b0f19;
+    --fg: #d1d5db;
+    --sidebar-bg: #111827;
+    --sidebar-fg: #d1d5db;
+    --sidebar-non-existant: #6b7280;
+    --sidebar-active: var(--hf-yellow);
+    --sidebar-spacer: #1f2937;
+    --links: var(--hf-yellow);
+    --inline-code-color: #fbbf24;
+    --theme-popup-bg: #111827;
+    --theme-popup-border: #374151;
+    --quote-bg: #111827;
+    --quote-border: var(--hf-yellow);
+    --table-border-color: #1f2937;
+    --table-header-bg: #111827;
+    --table-alternate-bg: #0f1420;
+    --searchbar-border-color: #374151;
+    --search-mark-bg: var(--hf-orange);
+}
+
+#mdbook-menu-bar, #menu-bar {
+    border-block-end: 3px solid var(--hf-yellow);
+}
+
+.menu-title {
+    font-weight: 700;
+    letter-spacing: 0.01em;
+}
+
+.content h1, .content h2 {
+    font-weight: 700;
+}
+
+.content h2 {
+    border-block-end: 1px solid var(--table-border-color);
+    padding-block-end: 0.25em;
+}
+
+.content table {
+    margin-inline: 0;
+    font-size: 0.92em;
+}
+
+.content table td, .content table th {
+    padding: 5px 12px;
+}
+
+.content table td:last-child {
+    white-space: nowrap;
+}
+
+.on-this-page {
+    border-inline-start-color: var(--hf-yellow);
+}
+
+.content code {
+    font-family: var(--mono-font);
+}
+
+.chapter li.chapter-item a.active {
+    font-weight: 700;
+}
