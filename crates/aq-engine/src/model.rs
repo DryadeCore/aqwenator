@@ -750,7 +750,12 @@ impl Model {
         gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
         let upload_s = t1.elapsed().as_secs_f64();
-        eprintln!("load: scratch + kernel setup {:.2}s", upload_s - layers_s);
+        eprintln!(
+            "load: scratch + kernel setup {:.2}s, {:.2} GiB of scratch ({:.2} GiB allocated in all)",
+            upload_s - layers_s,
+            (gpu.allocated_bytes - weight_bytes) as f64 / (1u64 << 30) as f64,
+            gpu.allocated_bytes as f64 / (1u64 << 30) as f64
+        );
         Ok(Self {
             cfg,
             gpu,
