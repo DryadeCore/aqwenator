@@ -640,6 +640,30 @@ Quality is the same either way (0.147 / 0.078 / 0.127 against 0.146 / 0.078 / 0.
 What it is for is a bandwidth-limited card, where it reads 0.5 bytes per weight against about
 4.5 for the expansion; not measured on one yet.
 
+### 8-bit KV cache (`AQ_KV=int8`, 2026-11-18)
+
+Opt-in, not exact. A key's or a value's row is 272 bytes (256 int8 and its f32 scale, the
+row's largest magnitude / 127) instead of 512, so a pool holds 1.88 times the tokens.
+`attn_prep` writes the rows; `attention_tc` and `attn_decode_tq` request them as stored into a
+staging area (`kv_tile8_cp_async`) and expand a tile to the bf16 tiles their MMAs already read
+(`kv_tile8_unpack`). In `attention_tc` the staging area doubles as the second buffer: the next
+tile is fetched while the current one is used. The reference kernels (`AQ_ATTN_NAIVE`,
+`AQ_ATTN_TILE`) do not read it. A prefill tile is 32 keys and a page 16, so it is requested as
+two halves like the bf16 tile; the first version requested 32 keys at once, read past the page
+whenever two pages were not adjacent, and was caught by the prompt-checkpoint check. The gate
+now has an `AQ_KV=int8` leg.
+
+Quality is at the bf16 noise floor: mean KL 0.0025 / 0.0013 / 0.0016 on the trace references
+(bf16 cache, same build: 0.0020 / 0.0022 / 0.0011), top-1 255 / 255 / 256 of 256; with the
+4-bit checkpoint 0.145 / 0.076 / 0.124, as without it. `aq-check` passes on the three 9B
+references.
+
+B200 replay, bf16 weights (turns/min, 8-bit / bf16 cache): 4 agents 108.0 / 114.8, 16 agents
+358.8 / 430.2, 32 agents 486.5 / 713.0. Slower on this card: the expansion is compute, and
+the staging area leaves room for one sub-tile instead of two within 100 KiB. It is for memory
+and for bandwidth-limited devices, where decode attention reads half the bytes; not measured
+on one.
+
 # Handoff: aqwenator state as of 2026-11-13
 
 ## FIRST: known correctness bug on main (fix exists, unmerged)

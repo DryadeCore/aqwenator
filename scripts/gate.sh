@@ -20,7 +20,7 @@ run() { # <env string> <reference file> <expect: pass|fail>
   if { [ "$4" = pass ] && [ $code -eq 0 ]; } || { [ "$4" = fail ] && [ $code -ne 0 ]; }; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "   UNEXPECTED"; fi
 }
 last=
-for env in "AQ_GATE=1" "AQ_SRPT=1 AQ_BURST_PREFILL=2048 AQ_BURST_EVERY=2" "AQ_CHECK_BUDGET=1000 AQ_CHECK_CHUNK=777" "AQ_MTP=0" "AQ_MTP_K=1"; do
+for env in "AQ_GATE=1" "AQ_SRPT=1 AQ_BURST_PREFILL=2048 AQ_BURST_EVERY=2" "AQ_CHECK_BUDGET=1000 AQ_CHECK_CHUNK=777" "AQ_MTP=0" "AQ_MTP_K=1" "AQ_KV=int8"; do
   for g in "$GOLDEN"/*.safetensors; do
     case $(basename "$g") in *trace*) continue ;; esac
     # qwen35-9b-long.safetensors -> Qwen/Qwen3.5-9B, looked up among the cached models

@@ -238,6 +238,83 @@ unsafe fn kv_tile_cp_async(
     }
 }
 
+/// 8-bit KV cache: a key's or a value's row is 272 bytes, 256 int8 then its f32 scale
+/// (value = code * scale), so a row is still a whole number of 16-byte pieces.
+const KV8_ROW: usize = 272;
+
+/// `kv_tile_cp_async` for the 8-bit cache: request `kt` keys' rows as stored, K rows to `sk`
+/// and V rows to `sv` (zeros past `k1`). Like it, the keys must lie within one KV page.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kv_tile8_cp_async(
+    sk: *mut u8,
+    sv: *mut u8,
+    k_cache: *const u8,
+    v_cache: *const u8,
+    table: *const u32,
+    bs: usize,
+    hkv: usize,
+    kv: usize,
+    kb: usize,
+    k1: usize,
+    kt: usize,
+    tid: usize,
+    nthr: usize,
+) {
+    use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16};
+    let page = (kb as u32 / bs as u32) as usize;
+    let blk = unsafe { *table.add(page) } as usize;
+    let base = ((blk * bs + (kb - page * bs)) * hkv + kv) * KV8_ROW;
+    let valid = if k1 > kb { k1 - kb } else { 0 };
+    let mut i = tid;
+    while i < kt * 17 {
+        let row = i / 17;
+        let c = i % 17;
+        let dk = unsafe { sk.add(row * KV8_ROW + c * 16) } as *mut u32;
+        let dv = unsafe { sv.add(row * KV8_ROW + c * 16) } as *mut u32;
+        if row < valid {
+            let off = base + row * hkv * KV8_ROW + c * 16;
+            unsafe {
+                cp_async_cg_16(dk, k_cache.add(off) as *const u32);
+                cp_async_cg_16(dv, v_cache.add(off) as *const u32);
+            }
+        } else {
+            unsafe {
+                cp_async_cg_zfill_16(dk, k_cache, 0);
+                cp_async_cg_zfill_16(dv, v_cache, 0);
+            }
+        }
+        i += nthr;
+    }
+}
+
+/// Expand a staged 8-bit tile (`kt` K rows, then `kt` V rows) into the swizzled bf16 K and V
+/// tiles the MMAs read.
+#[inline(always)]
+unsafe fn kv_tile8_unpack(stage: *const u8, ks: *mut u16, vs: *mut u16, kt: usize, tid: usize, nthr: usize) {
+    let mut i = tid;
+    while i < kt * 32 {
+        let row = i / 32;
+        let c = i % 32;
+        let mut which = 0;
+        while which < 2 {
+            let src = unsafe { stage.add((which * kt + row) * KV8_ROW) };
+            let sc = unsafe { *(src.add(256) as *const f32) };
+            let v = unsafe { *(src.add(c * 8) as *const u64) };
+            let dst = unsafe { (if which == 0 { ks } else { vs }).add(sw256(row, c)) } as *mut u32;
+            let mut e = 0;
+            while e < 4 {
+                let lo = (v >> (16 * e)) as u8 as i8 as f32 * sc;
+                let hi = (v >> (16 * e + 8)) as u8 as i8 as f32 * sc;
+                unsafe { *dst.add(e) = pk(lo, hi) };
+                e += 1;
+            }
+            which += 1;
+        }
+        i += nthr;
+    }
+}
+
 /// Asynchronous (cp.async.cg, 16 bytes per op) copy of a [rows][cols] bf16 tile from global
 /// to shared memory by `nthr` threads. `cols` must be a multiple of 8 and both row strides
 /// (in bytes) and base addresses 16-byte aligned. The caller commits and waits.
@@ -919,6 +996,7 @@ pub mod kernels {
         rot_dim: u32,
         rope_theta: f32,
         eps: f32,
+        kv8: u32,
     ) {
         static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
         static mut ROW: SharedArray<f32, 512> = SharedArray::UNINIT;
@@ -973,10 +1051,30 @@ pub mod kernels {
             let seq = unsafe { *tok_seq.add(t) } as usize;
             let bs = block_size as usize;
             let blk = unsafe { *block_tables.add(seq * max_blocks as usize + pos / bs) } as usize;
-            let off = ((blk * bs + pos % bs) * hkv + kv) * dim + d;
-            unsafe { st(k_cache, off, y) };
+            let vec = (blk * bs + pos % bs) * hkv + kv;
             let v = unsafe { *qkv.add(row + h * 2 * dim + hkv * dim + kv * dim + d) };
-            unsafe { *v_cache.add(off) = v };
+            if kv8 == 0 {
+                let off = vec * dim + d;
+                unsafe { st(k_cache, off, y) };
+                unsafe { *v_cache.add(off) = v };
+            } else {
+                // 8-bit cache: each row as int8 with its own scale (the largest magnitude / 127).
+                let vf = bf16_to_f32(v);
+                let mk = unsafe { block_max(y.abs(), red) };
+                let mv = unsafe { block_max(vf.abs(), red) };
+                let kq = unsafe { (k_cache as *mut u8).add(vec * KV8_ROW) };
+                let vq = unsafe { (v_cache as *mut u8).add(vec * KV8_ROW) };
+                let ik = if mk > 0.0 { 127.0 / mk } else { 0.0 };
+                let iv = if mv > 0.0 { 127.0 / mv } else { 0.0 };
+                unsafe {
+                    *kq.add(d) = libm::rintf(y * ik) as i32 as u8;
+                    *vq.add(d) = libm::rintf(vf * iv) as i32 as u8;
+                    if d == 0 {
+                        *(kq.add(256) as *mut f32) = mk * (1.0 / 127.0);
+                        *(vq.add(256) as *mut f32) = mv * (1.0 / 127.0);
+                    }
+                }
+            }
         }
     }
 
@@ -2132,6 +2230,7 @@ pub mod kernels {
         n_kv: u32,
         scale: f32,
         nbuf: u32,
+        kv8: u32,
     ) {
         use cuda_device::DynamicSharedArray;
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all, cp_async_wait_group};
@@ -2172,6 +2271,18 @@ pub mod kernels {
         let ks1 = unsafe { vs0.add(KT * D) };
         let vs1 = unsafe { ks1.add(KT * D) };
         let piped = nbuf == 2;
+        // 8-bit cache: the tile is requested as stored into a staging area after the first
+        // buffer pair and expanded to bf16 when it is used, so the next tile's fetch overlaps
+        // this one's MMAs with one bf16 pair.
+        let kv8 = kv8 != 0;
+        let stage = ks1 as *mut u8;
+        if kv8 {
+            unsafe {
+                kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
+                kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
+                cp_async_commit_group();
+            }
+        }
 
         // Q tile: nwarps * 16 rows (warp w -> rows 16w..16w+16 = its sub-tile's tokens, its head).
         let qrows = nwarps * 16;
@@ -2222,7 +2333,19 @@ pub mod kernels {
         while kb < n_keys {
             let ks = if cur == 0 { ks0 } else { ks1 };
             let vs = if cur == 0 { vs0 } else { vs1 };
-            if piped {
+            if kv8 {
+                unsafe { cp_async_wait_all() };
+                thread::sync_threads();
+                unsafe { kv_tile8_unpack(stage, ks, vs, KT, tid, nthreads) };
+                thread::sync_threads();
+                if kb + KT < n_keys {
+                    unsafe {
+                        kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT, n_keys, 16, tid, nthreads);
+                        kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT + 16, n_keys, 16, tid, nthreads);
+                        cp_async_commit_group();
+                    }
+                }
+            } else if piped {
                 let nx = kb + KT;
                 if nx < n_keys {
                     let kn = if cur == 0 { ks1 } else { ks0 };
@@ -2409,6 +2532,7 @@ pub mod kernels {
         scale: f32,
         part_acc: *mut f32,
         part_ml: *mut f32,
+        kv8: u32,
     ) {
         use cuda_device::DynamicSharedArray;
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all};
@@ -2487,10 +2611,22 @@ pub mod kernels {
 
         let mut kb = k0;
         while kb < k1 {
-            unsafe {
-                kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
-                cp_async_commit_group();
-                cp_async_wait_all();
+            if kv8 != 0 {
+                // 8-bit cache: stage the tile as stored (after the P^T rows), then expand it.
+                let stage = unsafe { vs.add(KT * D).add(nwarps * 128) } as *mut u8;
+                unsafe {
+                    kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
+                thread::sync_threads();
+                unsafe { kv_tile8_unpack(stage, ks, vs, KT, tid, nthreads) };
+            } else {
+                unsafe {
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    cp_async_commit_group();
+                    cp_async_wait_all();
+                }
             }
             thread::sync_threads();
 

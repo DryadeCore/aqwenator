@@ -66,7 +66,8 @@ docker run --gpus all -p 8000:8000 -v ~/models:/models:ro \
 | with the draft head | 7.0 GiB |
 | without it (`-e AQ_MTP=0`) | 6.0 GiB |
 
-plus the CUDA context (0.7 GiB on a B200). Measured on a B200 only so far, where it does 339
+plus the CUDA context (0.7 GiB on a B200). `-e AQ_KV=int8` stores the attention cache in 8
+bits: the same `--kv-gb` then holds 1.9 times the context, at no measurable cost in quality. Measured on a B200 only so far, where it does 339
 turns/min at 16 agents (bf16: 433); an 8 GB card has not been tried yet.
 
 Quality is the checkpoint's: on 20k-token agent traces about 92% of greedy tokens agree with

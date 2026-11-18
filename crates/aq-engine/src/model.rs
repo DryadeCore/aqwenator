@@ -300,6 +300,8 @@ pub struct Model {
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
     attn_nbuf: u32,
+    /// Keys and values are cached in 8 bits (AQ_KV=int8).
+    kv8: bool,
     /// Slice bounds of `attn_decode_tq` (keys, DEC_TC_SLICES + 1 entries; device copy and host
     /// copy): fine slices first, coarser ones for long contexts, the last one open-ended.
     dec_bounds: u64,
@@ -404,15 +406,19 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per sub-tile and query head of the group)
 /// plus one 32-key K tile and one V tile, all 256-wide bf16.
-fn attention_tc_smem(group: usize, qt: usize, nbuf: usize) -> u32 {
-    ((qt * group * 16 + nbuf * 2 * 32) * 256 * 2) as u32
+fn attention_tc_smem(group: usize, qt: usize, nbuf: usize, kv8: bool) -> u32 {
+    ((qt * group * 16 + nbuf * 2 * 32) * 256 * 2 + if kv8 { 2 * 32 * KV8_ROW } else { 0 }) as u32
 }
 
 /// Shared-memory bytes of `attn_decode_tq`: 8 query slots and a 16-key P tile per warp plus one
 /// K and one V tile of 16 keys.
-fn attn_decode_tq_smem(warps: usize) -> u32 {
-    ((8 * warps + 2 * 16) * 512 + 256 * warps) as u32
+fn attn_decode_tq_smem(warps: usize, kv8: bool) -> u32 {
+    ((8 * warps + 2 * 16) * 512 + 256 * warps + if kv8 { 2 * 16 * KV8_ROW } else { 0 }) as u32
 }
+
+/// Bytes of one key or value row in the 8-bit KV cache (256 int8 and an f32 scale; must match
+/// the kernels).
+const KV8_ROW: usize = 272;
 
 /// Padded batch sizes that get a captured decode graph.
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
@@ -546,16 +552,25 @@ impl Model {
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
 
         let hv = cfg.linear_num_value_heads;
+        // AQ_KV=int8 (not exact): keys and values are cached as int8 with a scale per row,
+        // 272 bytes instead of 512, expanded to bf16 a tile at a time by the attention kernels.
+        let kv8 = match std::env::var("AQ_KV").as_deref() {
+            Ok("int8") => true,
+            Ok(other) if !other.is_empty() && other != "bf16" => anyhow::bail!("AQ_KV={other}: expected int8 or bf16"),
+            _ => false,
+        };
+        anyhow::ensure!(!kv8 || cfg.head_dim == 256, "the 8-bit KV cache needs 256-wide heads");
+        let kv_row = if kv8 { KV8_ROW } else { cfg.head_dim * 2 };
         let mut lim = limits;
         // The MTP draft head is used whenever the checkpoint ships one (AQ_MTP=0 turns it off).
         // It adds one attention layer's KV to every page (9 instead of 8 layers for the 9B).
         let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
-            let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
+            let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * kv_row;
             lim.kv_blocks = lim.kv_budget_bytes / page_bytes;
         }
-        let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
+        let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * kv_row;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         // Seconds spent allocating and zeroing recurrent state and KV pages (not weights).
         let mut state_s = 0.0f64;
@@ -728,17 +743,17 @@ impl Model {
         // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
         let smem_max = gpu.max_smem_optin()? as u32;
         let mut attn_qt: usize = std::env::var("AQ_ATTN_QT").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4);
-        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt, 1) > smem_max.min(100 << 10)) {
+        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt, 1, kv8) > smem_max.min(100 << 10)) {
             attn_qt -= 1;
         }
         // A second K/V buffer pair (the next tile loads while this one is used) where the
         // device has the shared memory for it; AQ_ATTN_PIPE=0|1 forces it off or on.
         let attn_nbuf: usize = match std::env::var("AQ_ATTN_PIPE").as_deref() {
             Ok("0") => 1,
-            _ if attention_tc_smem(grp, attn_qt, 2) <= smem_max => 2,
+            _ if !kv8 && attention_tc_smem(grp, attn_qt, 2, false) <= smem_max => 2,
             _ => 1,
         };
-        let attn_tc_smem = attention_tc_smem(grp, attn_qt, attn_nbuf);
+        let attn_tc_smem = attention_tc_smem(grp, attn_qt, attn_nbuf, kv8);
         eprintln!("prefill attention: {attn_qt} sub-tiles, {attn_nbuf} K/V buffer(s), {} KiB shared memory of {} KiB", attn_tc_smem >> 10, smem_max >> 10);
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
@@ -746,7 +761,7 @@ impl Model {
         )?;
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attn_decode_tq_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
-            attn_decode_tq_smem(8),
+            attn_decode_tq_smem(8, kv8),
         )?;
         // Fixed slices: 32 fine ones (AQ_DEC_TC_SLICE keys, default 128), then 32 coarse ones
         // sized to reach max_ctx; the last is open-ended. Bounds are multiples of the KV page.
@@ -765,6 +780,13 @@ impl Model {
             (gpu.allocated_bytes - weight_bytes) as f64 / (1u64 << 30) as f64,
             gpu.allocated_bytes as f64 / (1u64 << 30) as f64
         );
+        if kv8 {
+            anyhow::ensure!(
+                std::env::var("AQ_ATTN_NAIVE").is_err() && std::env::var("AQ_ATTN_TILE").is_err(),
+                "the reference attention kernels do not read the 8-bit KV cache"
+            );
+            eprintln!("8-bit KV cache: not exact");
+        }
         Ok(Self {
             cfg,
             gpu,
@@ -797,6 +819,7 @@ impl Model {
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
             attn_nbuf: attn_nbuf as u32,
+            kv8,
             dec_bounds,
             dec_bounds_h,
             attn_qt,
@@ -984,7 +1007,7 @@ impl Model {
 
     /// Copy one KV page (every full-attention layer's K and V rows) into another, on the stream.
     pub fn copy_page(&mut self, dst: usize, src: usize) -> Result<()> {
-        let psz = self.limits.block_size * self.cfg.num_key_value_heads * self.cfg.head_dim * 2;
+        let psz = self.limits.block_size * self.cfg.num_key_value_heads * if self.kv8 { KV8_ROW } else { self.cfg.head_dim * 2 };
         let st = self.gpu.stream.cu_stream();
         for l in &self.layers {
             if l.kind == LayerKind::Full {
@@ -1906,6 +1929,7 @@ impl Model {
                             c.rot_dim() as u32,
                             c.rope_parameters.rope_theta as f32,
                             eps,
+                            self.kv8 as u32,
                         )
                     }
                     .map_err(de)?;
@@ -1941,7 +1965,7 @@ impl Model {
                                 LaunchConfig {
                                     grid_dim: (s.dec_tiles as u32, hkv, ns),
                                     block_dim: (32 * s.dec_warps as u32, 1, 1),
-                                    shared_mem_bytes: attn_decode_tq_smem(s.dec_warps),
+                                    shared_mem_bytes: attn_decode_tq_smem(s.dec_warps, self.kv8),
                                 },
                                 s.q as *const u16,
                                 l.k_cache as *const u16,
@@ -1959,6 +1983,7 @@ impl Model {
                                 scale,
                                 s.attn_part as *mut f32,
                                 s.attn_ml as *mut f32,
+                                self.kv8 as u32,
                             )
                         }
                         .map_err(de)?;
@@ -2007,6 +2032,7 @@ impl Model {
                                 hkv,
                                 scale,
                                 self.attn_nbuf,
+                                self.kv8 as u32,
                             )
                         }
                         .map_err(de)?;
