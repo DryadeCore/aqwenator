@@ -32,8 +32,8 @@ measure it before building the same thing.
    of the device, where the tensor-core kernel is bound by the fixed cost of its ring.
 4. **Parked sessions in host RAM, then on SSD**, so evicted sessions and restarts resume from
    the longest exact prefix instead of running prefill again.
-5. **Prefill attention split across blocks** with a combine pass, the gap to vLLM at 32
-   agents on a large card.
+5. **Scaling past 32 agents on a large card**, where vLLM keeps going and aqwenator levels
+   off: profile at 64 agents first; prefill attention split across blocks is the known item.
 6. **Strata under the multi-agent replay**, on a model and machine it supports.
 
 ## Later

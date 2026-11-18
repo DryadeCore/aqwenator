@@ -91,8 +91,12 @@ pass, as the decode kernel does, is the open item.
 
 ## Known gaps (November 2026)
 
-- vLLM is ahead at 32 agents on a B200 with the 9B, and at every load with the 35B-A3B when
-  it speculates.
+- On a B200 with the 9B, vLLM with MTP speculation is ahead from 32 agents and keeps scaling
+  to at least 96 (1432 turns per minute, within the latency target), while aqwenator levels
+  off near 850 and leaves the target after 64. Not profiled at that load yet. The rows from
+  32 agents up use 160 recorded sessions and up to 128 running sequences; the rows below use
+  40 sessions and 32, so the two sets are not one curve.
+- vLLM is ahead at every load with the 35B-A3B when it speculates.
 - vLLM has the better TTFT p99 in most configurations.
 - Nothing here was measured on a consumer card. The 8-bit and 4-bit kernels and the 8-bit
   attention cache were built for bandwidth-bound devices and have only run on a B200, where

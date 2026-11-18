@@ -53,11 +53,17 @@ Details in [docs/models.md](docs/models.md).
 
 ## Results
 
-On a replay of recorded agent sessions with Qwen3.5-9B (November 2026): on a DGX Spark,
-1.4 to 1.6 times the turns per minute of vLLM with MTP speculation at 8 and 16 agents; on a
-B200, ahead of vLLM up to 16 agents and behind it at 32; several times llama.cpp everywhere.
-vLLM usually has the better TTFT p99. Every run, with its date and device, is in
-[docs/results.md](docs/results.md); the method is in [docs/benchmarks.md](docs/benchmarks.md).
+On a replay of recorded agent sessions with Qwen3.5-9B (November 2026):
+
+- **DGX Spark:** 1.4 to 1.6 times the turns per minute of vLLM with MTP speculation at 8 and
+  16 agents.
+- **One B200:** ahead of vLLM up to 16 agents. From 32 agents vLLM with MTP speculation is
+  ahead and keeps scaling where aqwenator levels off: 1263 against 804 turns per minute at
+  64 agents.
+- Several times llama.cpp everywhere; vLLM usually has the better TTFT p99.
+
+Every run, with its date and device, is in [docs/results.md](docs/results.md); the method is
+in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Documentation
 

@@ -36,7 +36,7 @@ if [ "$ENGINE" = vllm ]; then
     export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=$PATH:${CUDA_HOME:-/usr/local/cuda}/bin
   fi
   vllm serve "$MODEL" --port "$PORT" --max-model-len $MAX_CTX --gpu-memory-utilization "${VLLM_UTIL:-0.6}" \
-    --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs "${MAX_RUNNING:-64}" "${VLLM_ARGS[@]}" > "$OUT/server.log" 2>&1 &
+    --limit-mm-per-prompt '{"image":0,"video":0}' --enable-prompt-tokens-details --max-num-seqs "${MAX_RUNNING:-64}" "${VLLM_ARGS[@]}" > "$OUT/server.log" 2>&1 &
   LABEL=${LABEL:-"vLLM $(python -c 'import vllm; print(vllm.__version__)')"}
 else
   "${AQ_SERVE_BIN:?set AQ_SERVE_BIN}" "$MODEL" --port "$PORT" --max-seqs "${AQ_MAX_SEQS:-128}" --max-running "${MAX_RUNNING:-32}" --max-ctx $MAX_CTX \
