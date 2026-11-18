@@ -81,7 +81,9 @@ Device memory of the 4-bit 9B with those settings, measured on a B200 (the CUDA 
 | `-e AQ_KV=int8 --kv-gb 0.5` (about 27k tokens of context) | 7.4 GB |
 | the same without the draft head (`-e AQ_MTP=0`) | 6.4 GB |
 
-An 8 GB card has not been tried yet.
+An 8 GB card has not been tried yet. What has: the second row under an RTX 30 card's limits
+on the B200 (`AQ_DEVICE_GB=7.0 AQ_SMEM_KB=99`), where it passes `aq-check` and serves with
+6.5 GiB allocated.
 
 ## 8-bit attention cache
 
