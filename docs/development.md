@@ -89,11 +89,6 @@ operations include their launch latency.
   bytes, not better code.
 - Keep the fastest variant and delete the others, unless they differ in correctness.
 
-## Running on a shared machine
-
-Launch long jobs detached, with a timeout and a marker file on completion. Kill only your own
-process ids, and pick an idle GPU before starting.
-
 ## Documentation
 
 The pages in `docs/` are an [mdBook](https://rust-lang.github.io/mdBook/): `mdbook serve`
