@@ -125,9 +125,14 @@ impl Engine {
         self.pool.release(sn.blocks);
     }
 
-    /// Drop every parked session and snapshot (their slots and pages return to the pool).
+    /// Drop every parked session and snapshot, pinned or not.
     pub fn clear_cache(&mut self) {
-        while self.evict_lru() {}
+        while !self.parked.is_empty() {
+            self.drop_parked(0);
+        }
+        while !self.snapshots.is_empty() {
+            self.drop_snapshot(0);
+        }
     }
 
     pub fn num_parked(&self) -> usize {
