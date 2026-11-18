@@ -45,25 +45,11 @@ impl Engine {
         else {
             return Ok(());
         };
-        let s = &self.running[i];
-        let (start, rem) = (s.computed, left(s));
-        let mut n = rem.min(lim.max_tokens);
-        if let Some(at) = s.snapshot_at.filter(|&at| at > start) {
-            n = n.min(at - start);
-        }
-        let mut tap = None;
-        if let Some(cp) = s.ckpt_at.filter(|&at| at > start) {
-            let c = start + (s.req.prompt.len() - CKPT_BACKOFF - start) / GDN_TC_CHUNK * GDN_TC_CHUNK;
-            if self.model.supports_tap() && n == rem && c > start && !self.pool.slots.is_empty() {
-                tap = Some((c, self.pool.slots.pop().unwrap()));
-            } else {
-                n = n.min(cp - start);
-            }
-        }
-        let (mut b, sampled) = self.build_batch(&[(i, n)])?;
-        if let Some((c, slot)) = tap {
-            b.seq_tap = vec![(((c - start) / GDN_TC_CHUNK) as u32, slot)];
-        }
+        let n = left(&self.running[i]).min(lim.max_tokens);
+        let (n, tap) = self.clamp_prefill(i, n, self.model.supports_tap());
+        let plan = [Entry::known(i, n, tap)];
+        let (b, samples) = self.build_batch(&plan)?;
+        let sampled = sampled(&plan, &samples);
         // Whatever the main lane still has queued for this sequence (slot reset or copy, a
         // page copy) must have run before the other lane reads it.
         self.model.gpu.sync()?;
@@ -110,28 +96,28 @@ impl Engine {
         if self.inflight.is_none() {
             let mut budget = lim.max_tokens;
             let mut plan = Vec::new();
-            for (i, s) in self.running.iter().enumerate() {
+            for i in 0..self.running.len() {
                 if budget == 0 {
                     break;
                 }
+                let s = &self.running[i];
                 if !s.in_prefill && s.computed < s.req.prompt.len() {
-                    let mut n = (s.req.prompt.len() - s.computed).min(budget);
-                    for at in [s.snapshot_at, s.ckpt_at].into_iter().flatten().filter(|&at| at > s.computed) {
-                        n = n.min(at - s.computed);
-                    }
-                    plan.push((i, n));
+                    let n = (s.req.prompt.len() - s.computed).min(budget);
+                    let (n, _) = self.clamp_prefill(i, n, false);
+                    plan.push(Entry::known(i, n, None));
                     budget -= n;
                 }
             }
             if !plan.is_empty() {
-                let (b, sampled) = self.build_batch(&plan)?;
+                let (b, samples) = self.build_batch(&plan)?;
+                let sampled = sampled(&plan, &samples);
                 let ns = self.model.launch(&b)?;
                 prefill_tokens = b.tokens.len();
-                for &(i, _) in &plan {
-                    self.running[i].in_prefill = true;
+                for e in &plan {
+                    self.running[e.i].in_prefill = true;
                 }
                 self.inflight = Some(Inflight {
-                    plan: plan.iter().map(|&(i, n)| (self.running[i].req.id, n)).collect(),
+                    plan: plan.iter().map(|e| (self.running[e.i].req.id, e.n)).collect(),
                     sampled: sampled.iter().map(|&i| self.running[i].req.id).collect(),
                     ns,
                     tokens: b.tokens.len(),
@@ -143,14 +129,14 @@ impl Engine {
         }
 
         // 2. One decode step on lane 1 for every ready sequence outside the in-flight batch.
-        let dplan: Vec<(usize, usize)> = self
+        let dplan: Vec<Entry> = self
             .running
             .iter()
             .enumerate()
             .filter(|(_, s)| !s.in_prefill && s.computed >= s.req.prompt.len() && s.known() > s.computed)
             // Normally one pending token; more after a rejected speculative step (spec_k
             // switched off since), which the decode path also handles.
-            .map(|(i, s)| (i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ)))
+            .map(|(i, s)| Entry::known(i, (s.known() - s.computed).min(MAX_DECODE_ROWS_PER_SEQ), None))
             .collect();
         let decode_seqs = dplan.len();
         if decode_seqs > 0 && self.inflight.is_some() && !self.coexec_pace.is_zero() {
@@ -171,14 +157,15 @@ impl Engine {
             if self.inflight.is_some() {
                 self.overlap_steps += 1;
             }
-            let (mut b, sampled) = self.build_batch(&dplan)?;
+            let (mut b, samples) = self.build_batch(&dplan)?;
+            let sampled = sampled(&dplan, &samples);
             b.n_decode = decode_seqs;
             self.model.set_lane(1);
             let toks = self.model.step(&b, None);
             self.model.set_lane(0);
             let toks = toks?;
-            for &(i, n) in &dplan {
-                self.running[i].computed += n;
+            for e in &dplan {
+                self.running[e.i].computed += e.n;
             }
             let done = self.apply_sampled(&sampled, &toks, &mut events);
             self.retire(done);

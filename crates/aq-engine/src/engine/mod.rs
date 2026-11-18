@@ -37,6 +37,7 @@ pub use cache::{CKPT_BACKOFF, CacheStats, Evict, Policy, SNAPSHOT_MIN_TOKENS};
 use cache::{Parked, Snapshot};
 use lanes::Inflight;
 use pool::Pool;
+use step::{Entry, sampled};
 pub use spec::SpecStats;
 pub use step::SMALL_PREFILL;
 
