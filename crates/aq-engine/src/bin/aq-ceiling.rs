@@ -137,16 +137,19 @@ fn main() -> Result<()> {
         let wb = g.alloc(n * k * 2)?;
         g.sync()?;
         let w8 = g.quantize_weight(wb, n, k, Fmt::Int8, true)?;
+        g.enable_int8(k)?;
         let tmp = g.alloc(n * k * 2)?;
         let x = g.alloc(512 * k * 2)?;
         let y = g.alloc(512 * n * 2)?;
         g.sync()?;
         let stream = g.raw_stream();
         let st = g.stream.clone();
-        for m in [16usize, 64, 128] {
+        for m in [16usize, 64, 128, 256, 512] {
             g.lt.gemm(stream, m, n, k, x, wb, y, CUDA_R_16BF)?;
             let t16 = best(&mut g, 5, |g| g.lt.gemm(stream, m, n, k, x, wb, y, CUDA_R_16BF))?;
             println!("i8chunk M={m}: bf16 GEMM {:.3} ms ({:.0} GB/s of weights)", t16 * 1e3, (n * k * 2) as f64 / t16 / 1e9);
+            let tk = best(&mut g, 5, |g| g.gemm_i8w(m, n, k, x, w8, y))?;
+            println!("  gemm_i8w kernel: {:.3} ms ({:.0} GB/s of int8 weights), {:.2}x the bf16 GEMM", tk * 1e3, (n * k) as f64 / tk / 1e9, tk / t16);
             for nc in [n, 8192, 4096, 2048, 1024, 512, 256, 128] {
                 g.lt.gemm(stream, m, nc, k, x, tmp, y, CUDA_R_16BF)?;
                 let t = best(&mut g, 5, |g| {

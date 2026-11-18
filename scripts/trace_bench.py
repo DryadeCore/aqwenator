@@ -169,7 +169,10 @@ async def one_turn(http, args, turn, new_tokens, first, turns_out, errors, t0_me
                     if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
                         continue
                     for ch in json.loads(line[5:]).get("choices", []):
-                        times.extend([now] * len(ch.get("token_ids") or []))
+                        # Token ids where the server streams them (vLLM, aq-serve: `token_ids`;
+                        # llama.cpp: `tokens`), else one token per chunk of text.
+                        ids = ch.get("token_ids") or ch.get("tokens") or []
+                        times.extend([now] * (len(ids) or (1 if ch.get("text") else 0)))
     if not times:
         errors.append("no tokens")
         return

@@ -21,6 +21,9 @@ pub enum Fmt {
     Fp8,
     /// int8 with one bf16 magnitude per block of 32 along a row; expanded to bf16 for the GEMM.
     Int8,
+    /// 4-bit codes (two per byte, value = code - 8) with one f32 scale per 128 along a row,
+    /// from a pre-quantized checkpoint; expanded to bf16 for the GEMM.
+    Int4,
 }
 
 /// A GEMM weight matrix `[n, k]` at `p`, with its scales at `scale` (0 for bf16).
@@ -62,8 +65,20 @@ pub struct Gpu {
     /// Per lane: bf16 buffer an int8 weight is expanded into for its GEMM, and its size.
     wtmp: Vec<u64>,
     wtmp_bytes: usize,
+    /// Per lane, for `gemm_i8w`: the two int8 digit planes of the activations (`[rows][k_max]`
+    /// each), then their f32 scales per block of 32 (`[rows][k_max / 32]`), and `k_max`.
+    xq: Vec<(u64, usize)>,
     /// AQ_I8_CHUNK: rows of an int8 weight expanded and multiplied at a time (0 = `i8_rows`).
     i8_chunk: usize,
+    /// AQ_I8_KERNEL_M: int8 GEMMs of at most this many rows use `gemm_i8w` (0 = never); larger
+    /// ones expand the weight and use the bf16 GEMM. On a B200 the kernel wins up to ~128-256
+    /// rows (0.25 ms vs 0.35 ms at 128 for a 24576 x 4096 weight).
+    i8_kernel_m: usize,
+    /// Weights with fewer rows than this take the expansion path: the kernel launches one
+    /// block per 128 weight rows, too few to fill the device, while expanding a small weight
+    /// is cheap. Default: a block for every fourth SM (measured on a B200, 148 SMs: 6144 rows
+    /// win, 4096 lose); AQ_I8_KERNEL_MIN_N overrides.
+    i8_kernel_min_n: usize,
     /// AQ_QSIM diagnostic: 8-bit round trip of (weights, activations); 0 = off, 1 = E4M3,
     /// 2 = int8. Everything still runs as bf16 GEMMs.
     pub qsim: (u32, u32),
@@ -181,6 +196,14 @@ unsafe fn read_at_least(fd: std::os::fd::RawFd, buf: *mut u8, cap: usize, at: u6
 
 pub const WORKSPACE_BYTES: usize = 64 << 20;
 
+/// Dynamic shared memory of `gemm_i8w` for `m` activation rows (at most 128 per block): four
+/// ring slots of a weight tile, its scales and the digit planes; with 4-bit weights the slots
+/// hold packed codes and one unpacked tile is shared.
+fn i8w_smem(m: usize, w4: bool) -> u32 {
+    let planes = m.min(128).div_ceil(16) as u32 * 2176;
+    if w4 { 8192 + 4 * (4608 + planes) } else { 4 * (8704 + planes) }
+}
+
 impl Gpu {
     pub fn new(ordinal: usize) -> Result<Self> {
         let ctx = CudaContext::new(ordinal).map_err(de)?;
@@ -189,7 +212,7 @@ impl Gpu {
         let k = aq_kernels::kernels::load(&ctx).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
         let lt = CublasLt::new(ws, WORKSPACE_BYTES)?;
-        let me = Self {
+        let mut me = Self {
             ctx,
             streams: vec![stream.clone()],
             stream,
@@ -205,7 +228,10 @@ impl Gpu {
             x8_dims: (0, 0),
             wtmp: Vec::new(),
             wtmp_bytes: 0,
+            xq: Vec::new(),
             i8_chunk: std::env::var("AQ_I8_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            i8_kernel_m: std::env::var("AQ_I8_KERNEL_M").ok().and_then(|v| v.parse().ok()).unwrap_or(96),
+            i8_kernel_min_n: 0,
             qsim: {
                 // e.g. AQ_QSIM=w:f, a:i, wa:i (f = E4M3, i = int8 per row, b = int8 per block of 32)
                 let v = std::env::var("AQ_QSIM").unwrap_or_default();
@@ -219,6 +245,10 @@ impl Gpu {
         if std::env::var("AQ_KINFO").as_deref() == Ok("1") {
             me.print_kernel_info()?;
         }
+        me.i8_kernel_min_n = match std::env::var("AQ_I8_KERNEL_MIN_N").ok().and_then(|v| v.parse().ok()) {
+            Some(n) => n,
+            None => 32 * me.num_sms()?,
+        };
         Ok(me)
     }
 
@@ -239,6 +269,11 @@ impl Gpu {
         if self.wtmp_bytes > 0 {
             let w = self.alloc(self.wtmp_bytes)?;
             self.wtmp.push(w);
+        }
+        if let Some(&(_, k_max)) = self.xq.first() {
+            let rows = self.i8_kernel_m.next_multiple_of(16);
+            let p = self.alloc(2 * rows * k_max + rows * k_max / 8)?;
+            self.xq.push((p, k_max));
         }
         Ok(self.streams.len() - 1)
     }
@@ -305,6 +340,31 @@ impl Gpu {
         Ok(())
     }
 
+    /// Our own GEMM for int8 weights (`gemm_i8w`): the activations are split into two int8
+    /// digit planes, and the weights are read once, as bytes, straight into the integer
+    /// tensor cores. `m` must be at most `i8_kernel_m`.
+    pub fn gemm_i8w(&mut self, m: usize, n: usize, k: usize, x: u64, w: Weight, y: u64) -> Result<()> {
+        let rows = self.i8_kernel_m.next_multiple_of(16);
+        let (xh, kmax) = self.xq[self.lane];
+        anyhow::ensure!(m <= rows && k <= kmax, "gemm_i8w operand larger than its digit planes");
+        let (xl, sx) = (xh + (rows * kmax) as u64, xh + (2 * rows * kmax) as u64);
+        let w4 = w.fmt == Fmt::Int4;
+        let smem = i8w_smem(m.min(128), w4);
+        let grid = ((n as u32).div_ceil(128), (m as u32).div_ceil(128), 1);
+        unsafe {
+            self.k.quant_x16(&self.stream, cfg((m as u32, 1, 1), 256), x as *const u16, xh as *mut u8, xl as *mut u8, sx as *mut f32, k as u32).map_err(de)?;
+            self.k
+                .gemm_i8w(&self.stream, cfg_smem(grid, 256, smem), xh as *const u8, xl as *const u8, sx as *const f32, w.p as *const u8, w.scale as *const u16, y as *mut u16, m as u32, n as u32, k as u32, n as u32, w4 as u32)
+                .map_err(de)
+        }
+    }
+
+    /// Whether `gemm_i8w` takes this GEMM: few enough activation rows (its cost grows with
+    /// them) and a weight with enough rows to fill the device (it runs one block per 128).
+    fn i8w_takes(&self, m: usize, n: usize, k: usize) -> bool {
+        m <= self.i8_kernel_m && n >= self.i8_kernel_min_n && k % 64 == 0 && n % 8 == 0
+    }
+
     /// Rows of an int8 weight expanded and multiplied at a time. Expanding a chunk and
     /// multiplying it right away keeps the bf16 copy within the cache's reach: on the DGX
     /// Spark (9B, 16 x 16k) 1024 rows gave 192 ms between tokens, the whole weight 234 ms,
@@ -320,6 +380,19 @@ impl Gpu {
         for _ in self.wtmp.len()..self.streams.len() {
             let w = self.alloc(self.wtmp_bytes)?;
             self.wtmp.push(w);
+        }
+        // The kernel's row cap also has to fit the shared memory a block may ask for.
+        let max = self.max_smem_optin()?;
+        while self.i8_kernel_m > 0 && i8w_smem(self.i8_kernel_m, false) as usize > max {
+            self.i8_kernel_m = self.i8_kernel_m.next_multiple_of(16) - 16;
+        }
+        if self.i8_kernel_m > 0 {
+            self.opt_in_dynamic_smem("gemm_i8w", i8w_smem(self.i8_kernel_m, false))?;
+            let rows = self.i8_kernel_m.next_multiple_of(16);
+            for _ in self.xq.len()..self.streams.len() {
+                let p = self.alloc(2 * rows * k_max + rows * k_max / 8)?;
+                self.xq.push((p, k_max));
+            }
         }
         Ok(())
     }
@@ -340,7 +413,7 @@ impl Gpu {
                 unsafe { self.k.quant_i8b(&self.stream, cfg((n as u32, 1, 1), 256), w as *const u16, q as *mut u8, scale as *mut u16, k as u32) }.map_err(de)?;
                 scale
             }
-            Fmt::Bf16 => anyhow::bail!("quantize_weight to bf16"),
+            Fmt::Bf16 | Fmt::Int4 => anyhow::bail!("quantize_weight to {fmt:?}"),
         };
         if !keep {
             self.free(w)?;
@@ -452,10 +525,33 @@ impl Gpu {
         .min(cap)
         .max(m);
         let s = self.raw_stream();
+        if w.fmt == Fmt::Int4 {
+            anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "int4 weights write bf16");
+            if self.i8w_takes(m, n, k) {
+                return self.gemm_i8w(m, n, k, x, w, y);
+            }
+            // Otherwise the int8 expansion's scheme, from a quarter of the bf16 bytes.
+            let tmp = self.wtmp[self.lane];
+            let nc = self.i8_rows().min(n);
+            anyhow::ensure!(nc * k * 2 <= self.wtmp_bytes, "int4 weight chunk larger than its expansion buffer");
+            for c in (0..n).step_by(nc) {
+                let rows = nc.min(n - c);
+                unsafe {
+                    let blocks = (rows * k / 32) as u32;
+                    self.k.dequant_i4g(&self.stream, cfg((blocks.div_ceil(256), 1, 1), 256), (w.p + (c * k / 2) as u64) as *const u8, (w.scale + (c * k / 128 * 4) as u64) as *const f32, tmp as *mut u16, blocks)
+                }
+                .map_err(de)?;
+                self.lt.gemm_rows(s, mb, rows, k, x, tmp, y + (c * 2) as u64, n)?;
+            }
+            return Ok(());
+        }
         if w.fmt == Fmt::Int8 {
             // Expand to bf16 (exactly what the weight stands for), then the bf16 GEMM, in
             // chunks of rows small enough for the expansion to stay in cache.
             anyhow::ensure!(out_ty == crate::cublaslt::CUDA_R_16BF, "int8 weights write bf16");
+            if self.i8w_takes(m, n, k) {
+                return self.gemm_i8w(m, n, k, x, w, y);
+            }
             let tmp = self.wtmp[self.lane];
             let nc = self.i8_rows().min(n);
             anyhow::ensure!(nc * k * 2 <= self.wtmp_bytes, "int8 weight chunk larger than its expansion buffer");
@@ -537,6 +633,14 @@ impl Gpu {
     pub fn num_sms(&self) -> Result<usize> {
         let mut v = 0i32;
         drv(unsafe { cuDeviceGetAttribute(&mut v, 16, self.ctx.cu_device() as i32) }, "cuDeviceGetAttribute")?;
+        Ok(v as usize)
+    }
+
+    /// Most dynamic shared memory one block may opt in to, in bytes
+    /// (CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN).
+    pub fn max_smem_optin(&self) -> Result<usize> {
+        let mut v = 0i32;
+        drv(unsafe { cuDeviceGetAttribute(&mut v, 97, self.ctx.cu_device() as i32) }, "cuDeviceGetAttribute")?;
         Ok(v as usize)
     }
 

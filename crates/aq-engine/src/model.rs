@@ -130,6 +130,10 @@ pub struct Mtp {
     g_short_ids: u64,
     g_short_slots: u64,
     short_w: u64,
+    /// With the embedding table kept in host memory: the shortlisted tokens' embedding rows
+    /// and each token's slot, on the device for the draft head (0 otherwise).
+    short_e: u64,
+    g_short_pos: u64,
 }
 
 impl Mtp {
@@ -244,10 +248,16 @@ pub struct Batch {
 pub struct Model {
     pub cfg: TextConfig,
     pub gpu: Gpu,
+    /// The embedding table on the device, or 0 when it stays in host memory (`embed_host`).
     embed: u64,
+    /// The mapped checkpoint and the embedding tensor's name, and the buffer a step's rows
+    /// are gathered into.
+    embed_host: Option<(Checkpoint, String)>,
+    embed_rows: Vec<u8>,
     final_norm: u64,
     lm_head: Weight,
     /// The output head's bf16 rows (the MTP shortlist gathers from it).
+    /// The bf16 output head (0 when only its 8-bit form in `lm_head` is kept).
     head_table: u64,
     pub layers: Vec<Layer>,
     /// MTP draft head (when the checkpoint has one, unless AQ_MTP=0).
@@ -289,6 +299,9 @@ pub struct Model {
     tile_attn: bool,
     /// Dynamic shared memory of `attention_tc` for this model's GQA group size.
     attn_tc_smem: u32,
+    attn_nbuf: u32,
+    /// Keys and values are cached in 8 bits (AQ_KV=int8).
+    kv8: bool,
     /// Slice bounds of `attn_decode_tq` (keys, DEC_TC_SLICES + 1 entries; device copy and host
     /// copy): fine slices first, coarser ones for long contexts, the last one open-ended.
     dec_bounds: u64,
@@ -393,15 +406,19 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
 
 /// Shared-memory bytes of `attention_tc`: Q rows (16 per sub-tile and query head of the group)
 /// plus one 32-key K tile and one V tile, all 256-wide bf16.
-fn attention_tc_smem(group: usize, qt: usize) -> u32 {
-    ((qt * group * 16 + 2 * 32) * 256 * 2) as u32
+fn attention_tc_smem(group: usize, qt: usize, nbuf: usize, kv8: bool) -> u32 {
+    ((qt * group * 16 + nbuf * 2 * 32) * 256 * 2 + if kv8 { 2 * 32 * KV8_ROW } else { 0 }) as u32
 }
 
 /// Shared-memory bytes of `attn_decode_tq`: 8 query slots and a 16-key P tile per warp plus one
 /// K and one V tile of 16 keys.
-fn attn_decode_tq_smem(warps: usize) -> u32 {
-    ((8 * warps + 2 * 16) * 512 + 256 * warps) as u32
+fn attn_decode_tq_smem(warps: usize, kv8: bool) -> u32 {
+    ((8 * warps + 2 * 16) * 512 + 256 * warps + if kv8 { 2 * 16 * KV8_ROW } else { 0 }) as u32
 }
+
+/// Bytes of one key or value row in the 8-bit KV cache (256 int8 and an f32 scale; must match
+/// the kernels).
+const KV8_ROW: usize = 272;
 
 /// Padded batch sizes that get a captured decode graph.
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
@@ -435,6 +452,38 @@ fn concat_bf16_padded(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_byte
 /// zero rows. Unless `fmt` is bf16 it is quantized as soon as its upload has landed and the
 /// bf16 copy freed, so the load never holds much more than the final footprint.
 fn gemm_weight(gpu: &mut Gpu, ck: &Checkpoint, names: &[String], pad_bytes: usize, k: usize, fmt: Fmt) -> Result<Weight> {
+    // A pre-quantized checkpoint (scripts/convert_autoround.py) carries `<name>.q4` codes and
+    // `<name>.q4s` scales in place of the bf16 matrix; it is used as it is.
+    if names.iter().all(|n| ck.has(&format!("{n}.q4"))) {
+        anyhow::ensure!(k % 128 == 0, "4-bit weights need K to be a multiple of 128");
+        let pad_rows = pad_bytes / 2 / k;
+        let (mut qv, mut sv) = (Vec::new(), Vec::new());
+        for n in names {
+            let (q, sc) = (ck.get(&format!("{n}.q4"))?, ck.get(&format!("{n}.q4s"))?);
+            anyhow::ensure!(q.dtype == safetensors::Dtype::U8 && sc.dtype == safetensors::Dtype::F32 && q.bytes.len() / (k / 2) == sc.bytes.len() / (k / 128 * 4), "{n}: unexpected 4-bit layout");
+            qv.push(q);
+            sv.push(sc);
+        }
+        let (qb, sb): (usize, usize) = (qv.iter().map(|v| v.bytes.len()).sum(), sv.iter().map(|v| v.bytes.len()).sum());
+        let (p, scale) = (gpu.alloc_uninit(qb + pad_rows * k / 2)?, gpu.alloc_uninit(sb + pad_rows * k / 128 * 4)?);
+        let (mut qo, mut so) = (0u64, 0u64);
+        for (q, sc) in qv.into_iter().zip(sv) {
+            // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
+            unsafe {
+                gpu.queue_upload(p + qo, q.bytes, q.direct)?;
+                gpu.queue_upload(scale + so, sc.bytes, sc.direct)?;
+            }
+            qo += q.bytes.len() as u64;
+            so += sc.bytes.len() as u64;
+        }
+        if pad_rows > 0 {
+            // Zero scales make the padding rows zero whatever their codes are.
+            gpu.zero(p + qo, pad_rows * k / 2)?;
+            gpu.zero(scale + so, pad_rows * k / 128 * 4)?;
+            gpu.sync()?;
+        }
+        return Ok(Weight { p, scale, fmt: Fmt::Int4 });
+    }
     let p = concat_bf16_padded(gpu, ck, names, pad_bytes)?;
     let mut bytes = pad_bytes;
     for n in names {
@@ -464,13 +513,25 @@ impl Model {
         let mut gpu = Gpu::new(0)?;
         let one = |n: &str| vec![format!("{P}{n}")];
 
-        let embed = concat_bf16(&mut gpu, &ck, &one("embed_tokens.weight"))?;
-        let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
-        let head_table = if cfg.tied() || !ck.has("lm_head.weight") {
-            embed
+        // A 4-bit checkpoint is for small devices. Its embedding table and output head (2 GB
+        // each for the 9B) are bf16: the head is stored in 8 bits as soon as it has been
+        // uploaded, and the embedding table stays in host memory (the mapped checkpoint): a
+        // step uploads the rows of its tokens, and the draft head keeps its shortlist's rows.
+        let small_tables = ck.has(&format!("{P}layers.0.mlp.gate_proj.weight.q4")) && cfg.hidden_size % 32 == 0;
+        let tied = cfg.tied() || !ck.has("lm_head.weight");
+        let embed_name = format!("{P}embed_tokens.weight");
+        let mut small_head = None;
+        let (embed, head_table) = if small_tables {
+            ck.bf16(&embed_name)?;
+            let t = concat_bf16(&mut gpu, &ck, &[if tied { embed_name.clone() } else { "lm_head.weight".to_string() }])?;
+            gpu.drain_uploads()?;
+            small_head = Some(gpu.quantize_weight(t, cfg.vocab_size, cfg.hidden_size, Fmt::Int8, false)?);
+            (0, 0)
         } else {
-            concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])?
+            let e = concat_bf16(&mut gpu, &ck, &[embed_name.clone()])?;
+            (e, if tied { e } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
         };
+        let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
         // AQ_QUANT (experimental, not exact: outputs differ from the bf16 reference) stores the
         // layers' GEMM weights in 8 bits:
         //   fp8   E4M3 weights and activations: about half the GEMM time, but ~4 significant
@@ -491,16 +552,25 @@ impl Model {
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
 
         let hv = cfg.linear_num_value_heads;
+        // AQ_KV=int8 (not exact): keys and values are cached as int8 with a scale per row,
+        // 272 bytes instead of 512, expanded to bf16 a tile at a time by the attention kernels.
+        let kv8 = match std::env::var("AQ_KV").as_deref() {
+            Ok("int8") => true,
+            Ok(other) if !other.is_empty() && other != "bf16" => anyhow::bail!("AQ_KV={other}: expected int8 or bf16"),
+            _ => false,
+        };
+        anyhow::ensure!(!kv8 || cfg.head_dim == 256, "the 8-bit KV cache needs 256-wide heads");
+        let kv_row = if kv8 { KV8_ROW } else { cfg.head_dim * 2 };
         let mut lim = limits;
         // The MTP draft head is used whenever the checkpoint ships one (AQ_MTP=0 turns it off).
         // It adds one attention layer's KV to every page (9 instead of 8 layers for the 9B).
         let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
-            let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
+            let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * kv_row;
             lim.kv_blocks = lim.kv_budget_bytes / page_bytes;
         }
-        let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * cfg.head_dim * 2;
+        let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * kv_row;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         // Seconds spent allocating and zeroing recurrent state and KV pages (not weights).
         let mut state_s = 0.0f64;
@@ -607,6 +677,8 @@ impl Model {
                 g_short_ids: gpu.alloc(short_n * 4)?,
                 g_short_slots: gpu.alloc(short_n * 4)?,
                 short_w: gpu.alloc(short_n * cfg.hidden_size * 2)?,
+                short_e: if small_tables { gpu.alloc(short_n * cfg.hidden_size * 2)? } else { 0 },
+                g_short_pos: if small_tables { gpu.alloc(cfg.vocab_size * 4)? } else { 0 },
                 short_ids,
                 short_pos,
                 layer,
@@ -623,7 +695,13 @@ impl Model {
         }
         gpu.sync()?;
         gpu.flush_uploads()?;
-        let mut lm_head = Weight::bf16(head_table);
+        let mut lm_head = small_head.unwrap_or(Weight::bf16(head_table));
+        if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4) {
+            anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
+            gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
+            anyhow::ensure!(mtp.as_ref().is_none_or(|m| m.short_n > 0), "the embedding table is in host memory: the draft head needs its shortlist (AQ_MTP_SHORT)");
+            eprintln!("4-bit weights from the checkpoint (one scale per 128), 8-bit head, embedding table in host memory: not exact");
+        }
         if quant != Fmt::Bf16 {
             let head = std::env::var("AQ_QUANT_HEAD").as_deref() == Ok("1") && cfg.vocab_size % 8 == 0 && h % 32 == 0;
             match quant {
@@ -663,18 +741,27 @@ impl Model {
         let grp = cfg.num_attention_heads / cfg.num_key_value_heads;
         // Sub-tiles per block: capped by 1024 threads and 100 KiB of shared memory (the most a
         // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
+        let smem_max = gpu.max_smem_optin()? as u32;
         let mut attn_qt: usize = std::env::var("AQ_ATTN_QT").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4);
-        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt) > 100 << 10) {
+        while attn_qt > 1 && (32 * grp * attn_qt > 1024 || attention_tc_smem(grp, attn_qt, 1, kv8) > smem_max.min(100 << 10)) {
             attn_qt -= 1;
         }
-        let attn_tc_smem = attention_tc_smem(grp, attn_qt);
+        // A second K/V buffer pair (the next tile loads while this one is used) where the
+        // device has the shared memory for it; AQ_ATTN_PIPE=0|1 forces it off or on.
+        let attn_nbuf: usize = match std::env::var("AQ_ATTN_PIPE").as_deref() {
+            Ok("0") => 1,
+            _ if !kv8 && attention_tc_smem(grp, attn_qt, 2, false) <= smem_max => 2,
+            _ => 1,
+        };
+        let attn_tc_smem = attention_tc_smem(grp, attn_qt, attn_nbuf, kv8);
+        eprintln!("prefill attention: {attn_qt} sub-tiles, {attn_nbuf} K/V buffer(s), {} KiB shared memory of {} KiB", attn_tc_smem >> 10, smem_max >> 10);
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attention_tc_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
             attn_tc_smem,
         )?;
         gpu.opt_in_dynamic_smem(
             <aq_kernels::kernels::__attn_decode_tq_CudaKernel as cuda_host::CudaKernel>::PTX_NAME,
-            attn_decode_tq_smem(8),
+            attn_decode_tq_smem(8, kv8),
         )?;
         // Fixed slices: 32 fine ones (AQ_DEC_TC_SLICE keys, default 128), then 32 coarse ones
         // sized to reach max_ctx; the last is open-ended. Bounds are multiples of the KV page.
@@ -687,11 +774,25 @@ impl Model {
         gpu.set_max_dynamic_smem("gdn_tc_scan", GDN_TC_SCAN_SMEM)?;
         gpu.set_max_dynamic_smem("gdn_tc_out", GDN_TC_OUT_SMEM)?;
         let upload_s = t1.elapsed().as_secs_f64();
-        eprintln!("load: scratch + kernel setup {:.2}s", upload_s - layers_s);
+        eprintln!(
+            "load: scratch + kernel setup {:.2}s, {:.2} GiB of scratch ({:.2} GiB allocated in all)",
+            upload_s - layers_s,
+            (gpu.allocated_bytes - weight_bytes) as f64 / (1u64 << 30) as f64,
+            gpu.allocated_bytes as f64 / (1u64 << 30) as f64
+        );
+        if kv8 {
+            anyhow::ensure!(
+                std::env::var("AQ_ATTN_NAIVE").is_err() && std::env::var("AQ_ATTN_TILE").is_err(),
+                "the reference attention kernels do not read the 8-bit KV cache"
+            );
+            eprintln!("8-bit KV cache: not exact");
+        }
         Ok(Self {
             cfg,
             gpu,
             embed,
+            embed_host: small_tables.then_some((ck, embed_name)),
+            embed_rows: Vec::new(),
             final_norm,
             lm_head,
             head_table,
@@ -717,6 +818,8 @@ impl Model {
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
+            attn_nbuf: attn_nbuf as u32,
+            kv8,
             dec_bounds,
             dec_bounds_h,
             attn_qt,
@@ -904,7 +1007,7 @@ impl Model {
 
     /// Copy one KV page (every full-attention layer's K and V rows) into another, on the stream.
     pub fn copy_page(&mut self, dst: usize, src: usize) -> Result<()> {
-        let psz = self.limits.block_size * self.cfg.num_key_value_heads * self.cfg.head_dim * 2;
+        let psz = self.limits.block_size * self.cfg.num_key_value_heads * if self.kv8 { KV8_ROW } else { self.cfg.head_dim * 2 };
         let st = self.gpu.stream.cu_stream();
         for l in &self.layers {
             if l.kind == LayerKind::Full {
@@ -1313,6 +1416,15 @@ impl Model {
             g.upload(s.dtile_len, &dl)?;
         }
         g.upload(s.ids, &b.tokens)?;
+        if let Some((ck, name)) = self.embed_host.as_ref().filter(|_| !self.chain_mode) {
+            // The embedding table is in host memory: this step's rows go straight to `x`.
+            let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
+            self.embed_rows.clear();
+            for &tok in &b.tokens {
+                self.embed_rows.extend_from_slice(&table[tok as usize * hb..(tok as usize + 1) * hb]);
+            }
+            g.upload(s.x, &self.embed_rows)?;
+        }
         g.upload(s.tok_pos, &b.tok_pos)?;
         g.upload(s.tok_seq, &b.tok_seq)?;
         g.upload(s.seq_start, &b.seq_start)?;
@@ -1334,7 +1446,9 @@ impl Model {
                 g.k.gather_rows(
                     &st,
                     cfg((m.short_dirty.len() as u32, 1, 1), 256),
-                    self.head_table as *const u16,
+                    (if self.head_table != 0 { self.head_table } else { self.lm_head.p }) as *const u16,
+                    self.lm_head.scale as *const u16,
+                    (self.head_table == 0) as u32,
                     m.g_short_ids as *const u32,
                     m.g_short_slots as *const u32,
                     m.short_w as *mut u16,
@@ -1342,6 +1456,23 @@ impl Model {
                 )
             }
             .map_err(de)?;
+            if let Some((ck, name)) = self.embed_host.as_ref() {
+                // The same slots' embedding rows, from host memory, and the token -> slot map.
+                let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
+                let row = |slot: u32| { let tok = m.short_ids[slot as usize] as usize; &table[tok * hb..(tok + 1) * hb] };
+                if m.short_dirty.len() == m.short_n {
+                    self.embed_rows.clear();
+                    for slot in 0..m.short_n as u32 {
+                        self.embed_rows.extend_from_slice(row(slot));
+                    }
+                    g.upload(m.short_e, &self.embed_rows)?;
+                } else {
+                    for &slot in &m.short_dirty {
+                        g.upload(m.short_e + (slot as usize * hb) as u64, row(slot))?;
+                    }
+                }
+                g.upload(m.g_short_pos, &m.short_pos)?;
+            }
             m.short_dirty.clear();
         }
         if self.mtp_on && self.mtp.is_some() {
@@ -1394,7 +1525,7 @@ impl Model {
         let mb = lim.max_blocks_per_seq() as u32;
         let bs = lim.block_size as u32;
         let chain = self.chain_mode;
-        if !chain {
+        if !chain && self.embed != 0 {
             unsafe {
                 g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
             }
@@ -1457,7 +1588,8 @@ impl Model {
                         s.next as *const u32,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed as *const u16,
+                        (if self.embed != 0 { self.embed } else { m.short_e }) as *const u16,
+                        m.g_short_pos as *const u32,
                         s.proj as *mut u16,
                         hd,
                         eps,
@@ -1481,7 +1613,8 @@ impl Model {
                         self.final_norm as *const u16,
                         m.pre_h as *const u16,
                         m.pre_e as *const u16,
-                        self.embed as *const u16,
+                        (if self.embed != 0 { self.embed } else { m.short_e }) as *const u16,
+                        m.g_short_pos as *const u32,
                         s.next as *const u32,
                         s.tok as *const u32,
                         s.proj as *mut u16,
@@ -1796,6 +1929,7 @@ impl Model {
                             c.rot_dim() as u32,
                             c.rope_parameters.rope_theta as f32,
                             eps,
+                            self.kv8 as u32,
                         )
                     }
                     .map_err(de)?;
@@ -1831,7 +1965,7 @@ impl Model {
                                 LaunchConfig {
                                     grid_dim: (s.dec_tiles as u32, hkv, ns),
                                     block_dim: (32 * s.dec_warps as u32, 1, 1),
-                                    shared_mem_bytes: attn_decode_tq_smem(s.dec_warps),
+                                    shared_mem_bytes: attn_decode_tq_smem(s.dec_warps, self.kv8),
                                 },
                                 s.q as *const u16,
                                 l.k_cache as *const u16,
@@ -1849,6 +1983,7 @@ impl Model {
                                 scale,
                                 s.attn_part as *mut f32,
                                 s.attn_ml as *mut f32,
+                                self.kv8 as u32,
                             )
                         }
                         .map_err(de)?;
@@ -1896,6 +2031,8 @@ impl Model {
                                 h,
                                 hkv,
                                 scale,
+                                self.attn_nbuf,
+                                self.kv8 as u32,
                             )
                         }
                         .map_err(de)?;

@@ -1,3 +1,45 @@
+# Direction and roadmap (agreed 2026-11-18)
+
+**Target:** the moment of "this should not run on this hardware", at good speed: high-quality
+models on constrained machines, using the whole machine (VRAM, RAM, SSD) and the structure of
+the model to move bytes to where they fit. Speed stays a requirement, not a trade.
+**Edge to build on:** many agents on one box (session cache, checkpoints, exact speculation),
+which is where the engine is measurably ahead of llama.cpp and, on bandwidth-limited hardware,
+of vLLM. **Scope:** Qwen models for the moment. Other models are added opportunistically while
+they reuse the existing kernels and scheduler; the day one "requires significant rework" is a
+decision point, not a default yes. Keep the code lean: fastest path only, trim the rest.
+The competitors are Strata, llama.cpp and gufo; vLLM is the server baseline. Do not rebuild
+Strata: where it is already good (one user, largest model on a gaming PC), measure before
+building.
+
+1. **Why vLLM is ahead at 32 agents on the B200** (795 against 739 turns/min; our TPOT goes
+   2.4 -> 4.6 ms from 16 to 32 agents, vLLM's stays near 3.0): one per-op profile at 32 agents.
+2. **Low-bit weights (4-bit) with their own kernel**, quality measured first (others report
+   plain 4-bit dense at +9% perplexity against +0.2% for 8-bit). Goal: the 9B on an 8 GB card
+   (an RTX 3070 laptop is the test machine). Also what expert weights need later.
+3. **Parked sessions in host RAM, then on SSD**: evicted sessions and restarts resume from the
+   longest exact prefix instead of re-running prefill. Safetensors `main` has a prefetch
+   engine (still changing) for the disk tier.
+4. **8-bit attention cache** (then 8-bit keys / 4-bit values): halves the bytes decode attention
+   reads and the cache's memory.
+5. **Larger models, opportunistically.** Qwen3.8-27B if it has the 9B's layout. Then a
+   mixture-of-experts model of the same family (Qwen3.6-35B-A3B: Strata, llama.cpp and vLLM
+   all run it) with the experts tiered across VRAM and RAM, then Qwen3.8-Flash-Next (also
+   hyper-connections, sparse attention, a 51 GB n-gram table on disk). Known lessons: one
+   preallocated expert slot pool with routing remapped to slots so the grouped GEMM is
+   unchanged; LRU is within 3 points of the optimal cache policy; router read-ahead wastes
+   about 40% of its reads; the fastest design keeps all experts in pinned host RAM, the hot
+   ones in VRAM, and computes misses on the CPU.
+6. **Strata under the multi-agent replay**, on a model and machine it supports, before building
+   anything it already does. llama.cpp is in `scripts/baseline_llamacpp.sh`.
+7. **Draft lengths on a bandwidth-limited device.** Chained MTP drafts (`AQ_MTP_K=3`) and
+   lookup drafts (`--spec-k 4`, the total budget) give 4.22 tokens per decode pass on the
+   traces. On the B200 budget 8 with 3 / 5 / 7 chained drafts gives 4.38 / 4.51 / 4.54 tokens
+   per pass and 435 / 428 / 425 turns/min at 16 agents against 433 (budget 16: 412). Chaining
+   was +10% on the Spark, so repeat there or on the laptop before changing defaults.
+8. **Research: zml `attnd`** ("sparse logarithmic attention, on CPU, over UDP"). Only the
+   announcement was read; the mechanism is in its video.
+
 # Update 2026-11-16: branch `mythos-review` (main has everything up to the Docker/CI commits; FP8 is branch-only)
 
 Everything below this section describes main as of 2026-11-13. Since then all work has gone to
@@ -391,6 +433,240 @@ one-pass row x column scaling measured worse (0.059);
 (b) dequantize each weight to a bf16 scratch buffer and use the bf16 GEMM: clean quality and
 half the memory, but ~2.3x the decode weight traffic; (c) our own tensor-core GEMM reading
 int8 weights. `AQ_QSIM` and the `qsim` kernel are diagnostics to delete once this is settled.
+
+### int8-weight GEMM kernel (`gemm_i8w`, 2026-11-16, B200 only)
+
+With `AQ_QUANT=int8`, GEMMs of at most 96 rows (`AQ_I8_KERNEL_M`, 0 = off) on weights of at least
+6144 rows (`AQ_I8_KERNEL_MIN_N`) run in a kernel that feeds the weight bytes to the integer tensor
+cores (`mma.m16n8k32` s8), with no bf16 copy of the weight. Activations become two int8 digit
+planes with one f32 scale per 32-wide block (`quant_x16`); each 32-block partial sum is scaled by
+the weight block scale and the activation block scale and accumulated in f32. Everything else
+keeps the expansion path (int8 to bf16 1024 rows at a time, then the bf16 GEMM).
+
+Dead ends: converting int8 to bf16 per weight inside the kernel (compute-bound, 0.23–0.25 ms at
+16 rows); one activation scale per row (one large element in a row cost logits rel_l2 1.14 at a
+decode position; per-block scales fixed it).
+
+One 24576 x 4096 weight, ms: bf16 GEMM 0.044 / 0.045 / 0.047 at 16 / 64 / 128 rows, expansion
+0.347 flat, kernel 0.076 / 0.134 / 0.247 (0.370 at 256, 0.688 at 512: it costs per row, hence
+the row cap).
+
+Decode steps of `aq-serve` under the trace replay (16 agents, us per call, kernel / expansion):
+gate_up 106 / 262, gdn_in 82 / 153, qkv 65 / 92, but down 205 / 81, gdn_out 81 / 52, o 62 / 41.
+On 4096-row weights the kernel launches 32 blocks on 148 SMs and expanding them is cheap, hence
+the minimum weight size; with it the decode step is 5.3 ms against 7.8 ms. The 6144 threshold
+was measured on the B200 only; a 48-SM device probably wants a lower one.
+
+Trace replay, 9B, B200, 4 minutes per point (turns/min, tok/s, TPOT p50 ms):
+
+| | 16 agents | 32 agents |
+|---|---|---|
+| int8, kernel (cap 128) | 363.8 / 955 / 4.8 | 356.0 / 931 / 20.4 |
+| int8, kernel (cap 96) | 362.5 / 949 / 4.9 | 373.5 / 1008 / 18.7 |
+| int8, kernel (cap 64) | 363.0 / 950 / 5.1 | 363.5 / 941 / 20.1 |
+| int8, expansion only (two runs) | 324.0 / 866 / 6.9 and 322.8 / 865 / 6.8 | 383.5 / 1004 / 18.4 and 368.8 / 976 / 18.9 |
+| bf16 | 437.8 / 1158 / 2.3 | 424.8 / 1176 / 16.6 |
+
+12% more turns at 16 agents; at 32 agents (saturated) the runs differ by less than the
+expansion path's own run-to-run spread. bf16 stays the fast tier on the B200; int8 is for memory.
+The point of the kernel is bandwidth-limited devices, where it reads half the bytes of the bf16
+GEMM; that has not been measured (no Spark access since 2026-11-16).
+
+Quality, kernel / expansion, teacher-forced on the three trace references (mean KL, nats):
+a 4.17e-3 / 3.87e-3, b 1.42e-3 / 1.65e-3, c 3.04e-3 / 3.93e-3; top-1 253 / 254, 252 / 253,
+254 / 255 of 256. `aq-check` passes with `AQ_QUANT=int8` on the three 9B references; the exact
+gate is 30/30 with the fault leg failing as it must.
+
+### Three engines on one B200, and state-slot starvation (2026-11-17)
+
+Qwen3.5-9B, trace replay, one GPU per run, 4 minutes per point, zero errors everywhere.
+vLLM 0.33 on the 16-bit checkpoint (`scripts/trace_sweep.sh vllm`); llama.cpp 1.0.0-dev
+(build 12478) through `scripts/baseline_llamacpp.sh`: CUDA, all layers on the GPU, one slot per
+agent with 33792 tokens of context each, f16 GGUF converted from the same checkpoint,
+`-b 4096 -ub 2048` (the best of six settings). `trace_bench.py` counts tokens from `token_ids`
+(vLLM, aq-serve), `tokens` (llama.cpp) or one per text chunk.
+
+turns/min, tok/s, TTFT p50 / p99 ms, TPOT p50 ms:
+
+| Agents | aqwenator bf16 | vLLM, MTP speculation (3) | vLLM, no speculation | llama.cpp |
+|---|---|---|---|---|
+| 1 | 28.2 / 76 / 42 / 205 / 1.6 | 27.5 / 71 / 118 / 172 / 1.5 | 24.2 / 57 / 102 / 169 / 4.1 | 20.5 / 51 / 98 / 475 / 6.6 |
+| 4 | 114.8 / 323 / 43 / 166 / 1.6 | 105.8 / 294 / 132 / 623 / 1.6 | 91.8 / 247 / 114 / 217 / 4.4 | 51.2 / 138 / 361 / 1254 / 15.4 |
+| 16 | 432.8 / 1140 / 52 / 571 / 2.4 | 384.5 / 1007 / 217 / 399 / 3.0 | 313.0 / 836 / 165 / 287 / 7.2 | 80.2 / 185 / 921 / 8089 / 68.8 |
+
+On this card the lead over vLLM is 13% of turns at 16 agents (9% at 4, 3% at 1), against
+60–75% on the Spark, and vLLM has the lower TTFT p99 at 1 and 16 agents. At 1 and 4 agents the
+replay bounds turns per minute for the fast engines. Other llama.cpp settings at 16 agents: f16
+defaults 79.0 / 175, bf16 defaults 78.5 / 175, `--spec-type ngram-mod` 75.5 / 165,
+`--spec-type draft-mtp` 63.2 / 137 (TTFT p50 3100), Q8_0 63.2 / 135 (TTFT p50 3441). Its
+settings come from its help text; nobody who tunes llama.cpp for a living has looked at them.
+Strata and gufo were not run: Strata lists only Qwen3.8-Flash-Next and Qwen3.6-35B-A3B, gufo
+runs on Strix Halo only.
+
+32 agents, with the slot reserve below (turns/min, tok/s, TTFT p50 / p99 ms, TPOT p50 ms):
+vLLM with MTP speculation 795.2 / 2105 / 124 / 273 / 3.1, aqwenator 738.5 / 1945 / 67 / 405 / 4.6,
+vLLM without speculation 576.2 / 1553 / 117 / 322 / 8.8, llama.cpp 79.5 / 112 / 1453 / 17016 /
+227.7. vLLM is ahead at this load on this card.
+
+**State-slot starvation.** Every 32-agent number before 2026-11-17 was taken with it. Running
+and parked sessions and their checkpoints each hold one of `--max-seqs` state slots (128 in the
+sweeps), and checkpoints, taps and forks were skipped when no slot was free. With a KV pool
+large enough that nothing is evicted for memory, parked entries filled the slots; a turn then
+consumed the checkpoint it resumed from without leaving a new one, and the session's next turn
+re-read about 16k tokens. A smaller pool hid it because memory pressure evicted stale entries.
+32 agents, B200, bf16 (turns/min, tok/s, TTFT p50 / p99 ms, prompt tokens re-read):
+
+| KV pool, slots | before | with the slot reserve |
+|---|---|---|
+| 48 GB, 128 | 481.3 / 1270 / 152 / 3475 / 6.1M | 738.5 / 1945 / 67 / 405 / 3.1M |
+| 120 GB, 128 | 447.2 / 1201 / 154 / 3876 / 6.1M | 739.2 / 1943 / 68 / 406 / 3.1M |
+| 24 GB, 128 | 750.0 / 1968 / 64 / 384 / 3.1M | |
+| 48 GB, 256 | 752.0 / 1971 / 63 / 371 / 3.1M | |
+
+The fix (`Engine::reserve_slots`) evicts the least-recently-used parked entry before admission
+until an eighth of the slots is free. 16 agents (434.0) and 4 agents (113.8) are unchanged;
+gate 31/31. The eighth was reasoned, not swept. The B200 is therefore not saturated at 16
+agents, and the Spark's 32-agent points (same 128 slots) are probably low for the same reason.
+
+### 32 agents on the B200: where the time goes; prefill attention; low-bit weights (2026-11-18)
+
+**Profile at 32 agents** (bf16, `AQ_PROFILE=decode|prefill` under the replay). Steps that carry
+prefill are about half of the GPU time (1699 steps of 46.6 ms against 6569 decode-only steps of
+10.9 ms), and decoding sequences wait through them: that is the TPOT gap to vLLM. In those
+steps `attn_prefill` is 50% (2.5–3.0 ms per call for about 1000 new tokens over 20k keys),
+`attn_dec` 10%, `gemm_gate_up` 10%. In decode-only steps `attn_dec` is 43%. By the rates in
+the ceilings table, prefill attention runs at about 6% of the card's GEMM rate and 7% of its
+bandwidth bound.
+
+- Tile width is not it: `AQ_ATTN_QT` 1 / 2 / 4 gives 758 / 746 / 748 turns/min and 2.30 / 2.47 /
+  2.52 ms per call. Twice the blocks of half the warps take the same time.
+- **Second K/V buffer pair** in `attention_tc` (the next tile is requested before the current
+  one is waited for; on by default where the device allows the shared memory, 128 KiB for the
+  9B; `AQ_ATTN_PIPE=0` turns it off; the GB10's 100 KiB keeps one pair): 2.56 against 2.95 ms
+  per call (-13%), 755.0 / 756.8 against 741.8 / 739.8 turns/min in an ABAB run, TTFT p50 64
+  against 71 ms. Gate 31/31. vLLM is still ahead at this load (795).
+- What is left: the kernel has one warp per (16 tokens, head) and each scans the whole context
+  serially, so 1000 tokens are about 1000 warps on 148 SMs, each bound by its own dependency
+  chain. More warps per SM needs the key range split across blocks with a combine pass, as
+  the decode kernel does. Not done.
+
+**Low-bit weights, quality only** (teacher-forced mean KL in nats against transformers, the
+three 20k-token trace references of 256 positions; rounding-only schemes emulated on the int8
+grid, one scale per 32 weights; top-1 agreement in brackets):
+
+| Scheme | KL |
+|---|---|
+| 8-bit | 0.002–0.004 (99%) |
+| 6-bit uniform | 0.015–0.045 (96–99%) |
+| 5-bit uniform | 0.11–0.14 (90–95%) |
+| 4-bit uniform | 0.12–0.21 (91–95%) |
+| 4-bit, NF4 levels | 0.15–0.19 |
+| 4-bit uniform, scale clipped to 0.9 … 0.6 of the block maximum | 0.13–0.36 … 0.8–1.3 |
+| 2-bit uniform | 0.5–1.0 (75–86%) |
+| `Intel/Qwen3.5-9B-int4-AutoRound` (calibrated, one scale per 128), dequantized to bf16 | 0.08–0.14 (91–94%) |
+
+4-bit on one group at a time (uniform): g 0.06, o 0.06, q 0.04–0.15, a 0.02–0.04, u 0.07–0.14,
+d 0.03–0.05; NF4 halves the MLP's error (u+d 0.05–0.08 against 0.10–0.13) but not the whole
+model's. No group is the culprit, so mixing 4-bit and 8-bit groups does not rescue it. The
+error grows with context: AutoRound is 0.005 on the short reference and 0.022 at 16k (plain
+rounding 0.013 and 0.038; 32 positions each). About 0.12 nats is the price of 4 bits on this
+model on agent traces, calibrated or not; 6-bit rounding is at the fp8 tier's level.
+The embedding table and the output head are separate 2 GB tensors (not tied).
+Plan for an 8 GB card: load the AutoRound format directly (4.125 bits per weight, 3.6 GB of
+layer weights), 8-bit head, embedding table in host RAM (it is only gathered from), about 7 GB
+with a 1.5 GB KV pool. That budget is arithmetic on tensor sizes, not a measured load.
+
+### 4-bit weights from a pre-quantized checkpoint (2026-11-18)
+
+`scripts/convert_autoround.py <quantized dir> <original dir> <out dir>` turns a 4-bit AutoRound /
+GPTQ checkpoint (packing `auto_round:auto_gptq`, symmetric, group size 128; tested with
+`Intel/Qwen3.5-9B-int4-AutoRound`) into `<name>.weight.q4` (uint8 `[out, in / 2]`, two codes per
+byte, value = code - 8) and `<name>.weight.q4s` (f32 `[out, in / 128]`), plus everything else
+as it was (the MTP head comes from the original checkpoint, which the quantized one lacks).
+`gemm_weight` uses those tensors when a checkpoint has them (`Fmt::Int4`); nothing is selected
+by environment. `Gpu::gemm` expands 1024 rows at a time with `dequant_i4g` into the int8 path's
+buffer and runs the bf16 GEMM, as the int8 expansion does. No quantizer of our own.
+
+9B: 8.52 GiB on disk, of which the embedding table and the output head are 2 GB each in bf16.
+Quality is the checkpoint's: mean KL 0.147 / 0.079 / 0.129 on the three trace references (the
+same checkpoint dequantized to bf16 offline gives 0.142 / 0.079 / 0.127), top-1 235 / 232 /
+241 of 256. `aq-check` on the short reference passes: greedy 32/32 identical to the
+reference, batched, resumed and speculative paths identical to the single path. Exact gate
+with this build: see the commit. B200 replay (turns/min, tok/s, TPOT p50 ms): 4 agents 91.2 /
+247 / 4.9, 16 agents 334.0 / 881 / 6.4 (bf16 114.8 and 432.8; int8 with its kernel 362.5).
+
+**8-bit head, embedding table in host memory.** A 4-bit checkpoint leaves the embedding table
+and the output head in bf16 (2 GB each for the 9B, not tied). With such a checkpoint the head
+is stored as int8 with a scale per 32 (`quant_i8b`) as soon as it has been uploaded, and the
+embedding table is not uploaded at all: the checkpoint stays mapped, each step copies the rows
+of its tokens to `x` (there is no `embed` kernel then), and the draft head keeps the rows of
+its shortlist on the device (`short_e`, with a token-to-slot map; `mtp_prep` and
+`mtp_chain_prep` read a token outside the shortlist as zeros, which can only cost a rejected
+draft). The main path therefore uses the exact bf16 embeddings. Quality is unchanged (0.146 /
+0.078 / 0.129 on the traces), as is the replay (1 / 4 / 16 agents: 23.8 / 91.8 / 331.0
+turns/min); gate 31/31.
+
+Device memory of `aq-serve` with the 4-bit 9B on a B200: what the engine allocates (its load
+lines report it) and what `nvidia-smi` shows, which adds about 0.73 GiB of CUDA context and
+libraries on that card:
+
+| Settings | Allocated | Device |
+|---|---|---|
+| 8 slots, 1 GB KV pool, `--max-tokens 8192` (1.5 GiB of scratch) | 8.44 GiB | 9.4 GB |
+| the same with `--max-tokens 1024` | 7.23 GiB | 8.1 GB |
+| 4 slots, 1 GB pool, `--max-tokens 1024` | 6.97 GiB | 7.9 GB |
+| the same without the MTP head (`AQ_MTP=0`) | 6.01 GiB | 6.9 GB |
+| 4 slots, 0.5 GB pool, `--max-tokens 512`, `--max-ctx 16384`, no MTP head | 5.43 GiB | 6.3 GB |
+
+The weights are 5.5 GiB with the draft head (layers 3.6, head 1.0, draft head with its two
+shortlists 0.9) and 4.6 without. With the embedding table on the device in 8 bits each row
+above was 0.75 GiB larger. Whether the third row fits an 8 GB card depends on that card's
+context size and on whether it drives a display; not measured on one yet. Next reduction: an
+8-bit KV cache.
+
+**Direct kernel.** `gemm_i8w` has a 4-bit mode (`w4`): a ring slot holds the tile's packed
+codes as stored (128 rows x 32 bytes) and the rows' f32 group scales; when a chunk is used
+each thread unpacks its 16 bytes to int8 (flip bit 3, extend it through the high nibble) into
+one shared operand tile, then the MMAs run as for int8. Shared memory is
+`8192 + 4 * (4608 + ceil(m / 16) * 2176)` bytes, less than the int8 mode, whose request is now
+sized from the row cap (and the cap lowered to what the device allows) instead of a constant
+that exceeded the GB10's 100 KiB. The minimum weight size for the kernel is now 32 rows per SM
+(`AQ_I8_KERNEL_MIN_N` overrides), the same choices as before on the B200.
+B200 replay, kernel on / off (turns/min; TPOT p50 ms): 1 agent 24.8 / 22.0 (3.8 / 5.6), 4
+agents 96.0 / 84.0 (4.1 / 6.0), 16 agents 339.0 / 309.8 (6.3 / 7.7), both runs with the decode
+profile on. us per call: gate_up 175 / 247, gdn_in 101 / 145, lm_head (int8) 279 / 685; the
+int8 mode does gate_up in 100 and the bf16 GEMM in 45, so on this card the unpack is the cost.
+Quality is the same either way (0.147 / 0.078 / 0.127 against 0.146 / 0.078 / 0.129).
+What it is for is a bandwidth-limited card, where it reads 0.5 bytes per weight against about
+4.5 for the expansion; not measured on one yet.
+
+### 8-bit KV cache (`AQ_KV=int8`, 2026-11-18)
+
+Opt-in, not exact. A key's or a value's row is 272 bytes (256 int8 and its f32 scale, the
+row's largest magnitude / 127) instead of 512, so a pool holds 1.88 times the tokens.
+`attn_prep` writes the rows; `attention_tc` and `attn_decode_tq` request them as stored into a
+staging area (`kv_tile8_cp_async`) and expand a tile to the bf16 tiles their MMAs already read
+(`kv_tile8_unpack`). In `attention_tc` the staging area doubles as the second buffer: the next
+tile is fetched while the current one is used. The reference kernels (`AQ_ATTN_NAIVE`,
+`AQ_ATTN_TILE`) do not read it. A prefill tile is 32 keys and a page 16, so it is requested as
+two halves like the bf16 tile; the first version requested 32 keys at once, read past the page
+whenever two pages were not adjacent, and was caught by the prompt-checkpoint check. The gate
+now has an `AQ_KV=int8` leg.
+
+Quality is at the bf16 noise floor: mean KL 0.0025 / 0.0013 / 0.0016 on the trace references
+(bf16 cache, same build: 0.0020 / 0.0022 / 0.0011), top-1 255 / 255 / 256 of 256; with the
+4-bit checkpoint 0.145 / 0.076 / 0.124, as without it. `aq-check` passes on the three 9B
+references.
+
+B200 replay, bf16 weights (turns/min, 8-bit / bf16 cache): 4 agents 108.0 / 114.8, 16 agents
+358.8 / 430.2, 32 agents 486.5 / 713.0. Slower on this card: the expansion is compute, and
+the staging area leaves room for one sub-tile instead of two within 100 KiB. It is for memory
+and for bandwidth-limited devices, where decode attention reads half the bytes; not measured
+on one.
+
+Device memory with the 4-bit 9B, 4 slots, `--max-tokens 1024` on a B200 (0.73 GiB of it is
+the CUDA context): 8-bit cache with a 0.5 GB pool (about 27k tokens with the draft head's
+layer) 7.36 GB, the same without the draft head 6.38 GB; a 1 GB pool 7.86 GB.
 
 # Handoff: aqwenator state as of 2026-11-13
 

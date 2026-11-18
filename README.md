@@ -7,6 +7,10 @@ agentic workloads (many long multi-turn sessions) on a single GPU, down to a DGX
 
 Outputs are checked token for token against `transformers` (`aq-check`).
 
+The aim is good models at good speed on hardware that should not be able to run them, with
+many agents sharing one box. The focus is Qwen models for the moment; other models get added
+when they fit the existing kernels.
+
 ## Numbers
 
 Qwen3.5-9B, replay of recorded OpenHands trajectories, 10 minutes per run, DGX Spark:
@@ -35,6 +39,41 @@ turns/min and 131 tok/s on this replay (TTFT 1052 / 3739 ms).
 
 `fp8` is the fast one and changes about 3% of greedy tokens; `int8` is near the bf16 noise
 floor and trades speed for memory.
+
+### 4-bit weights (pre-quantized checkpoint)
+
+A 4-bit AutoRound / GPTQ checkpoint is loaded as it is after one conversion (needs `torch`
+and `safetensors`, and both checkpoints on disk):
+
+```sh
+hf download Qwen/Qwen3.5-9B
+hf download Intel/Qwen3.5-9B-int4-AutoRound
+python scripts/convert_autoround.py <Intel/Qwen3.5-9B-int4-AutoRound dir> <Qwen/Qwen3.5-9B dir> ~/models/qwen35-9b-int4
+```
+
+The engine multiplies the 4-bit codes directly, stores the output head in 8 bits and leaves
+the embedding table in host memory. For a small card, give it few sessions, a small attention
+cache and short prefill chunks:
+
+```sh
+docker run --gpus all -p 8000:8000 -v ~/models:/models:ro \
+  ghcr.io/<owner>/aqwenator /models/qwen35-9b-int4 \
+  --max-seqs 4 --max-running 2 --kv-gb 1 --max-tokens 1024
+```
+
+| 9B, 4-bit, settings above | Engine allocates |
+|---|---|
+| with the draft head | 7.0 GiB |
+| with the draft head, `-e AQ_KV=int8 --kv-gb 0.5` (about the same context) | 6.5 GiB |
+| without the draft head (`-e AQ_MTP=0`) | 6.0 GiB |
+
+plus the CUDA context (0.7 GiB on a B200). `-e AQ_KV=int8` stores the attention cache in 8
+bits: the same `--kv-gb` then holds 1.9 times the context, at no measurable cost in quality. Measured on a B200 only so far, where it does 339
+turns/min at 16 agents (bf16: 433); an 8 GB card has not been tried yet.
+
+Quality is the checkpoint's: on 20k-token agent traces about 92% of greedy tokens agree with
+the bf16 model (KL 0.08–0.15 nats), against 99% for the 8-bit tiers. That is the price of 4
+bits on this model, calibrated or not; the engine adds nothing to it.
 
 Method, more machines and the history are in [docs/HANDOFF.md](docs/HANDOFF.md).
 
