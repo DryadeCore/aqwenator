@@ -1117,8 +1117,8 @@ pub mod kernels {
     }
 
     /// Grouped expert GEMM over the jobs of `moe_bucket`, with `w` `[256][n][k]` bf16,
-    /// or with `scale` not null the 4-bit codes and scales `dequant_i4g` reads (expanded to
-    /// the same bf16 values as they are staged), and a 3-stage `cp.async` ring in shared memory, each stage holding
+    /// or with `scale` not null the 4-bit codes and scales `dequant_i4g` reads (staged as
+    /// codes, expanded to the same bf16 values before use), and a 3-stage `cp.async` ring in shared memory, each stage holding
     /// 64 columns of K for 128 weight rows and the job's (up to 64) gathered rows.
     ///
     /// `fused` != 0, the gate/up product (`n = 2 * inter`): the input row of list entry `p` is
@@ -1130,13 +1130,15 @@ pub mod kernels {
     /// grid = (n / 128, max_jobs).
     ///
     /// Requires n % 128 == 0 and k % 64 == 0.
-    /// block = (256), dynamic shared memory = 3 * 27648 + 256 bytes.
+    /// block = (256), dynamic shared memory = 3 * (27648 + 4608) + 256 bytes.
     #[kernel]
     pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32) {
-        use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
+        use cuda_device::async_copy::{cp_async_ca_4, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
         const S: usize = 3;
         const LD: usize = 72;
         const STAGE: usize = (128 + 64) * LD * 2;
+        // 4-bit staging of a chunk: 32 bytes of codes then one scale for each of 128 rows.
+        const QSTAGE: usize = 128 * 32 + 128 * 4;
         let job = thread::blockIdx_y() as usize;
         let je = unsafe { *jobs.add(2 * job + 1) };
         let mc = (je >> 16) as usize;
@@ -1164,32 +1166,28 @@ pub mod kernels {
         }
         thread::sync_threads();
         let chunks = k / 64;
+        let qst = unsafe { sm.add(S * STAGE + 256) };
+        // Weight row of shared row r: fused, warp r / 16 has gate rows then up rows of its 8
+        // outputs; otherwise the block's 128 rows in order.
+        let wrow = |r: usize| if fused { ((r % 16) / 8) * (n / 2) + bx * 64 + (r / 16) * 8 + r % 8 } else { bx * 128 + r };
         let issue = |c: usize| {
             let sb = unsafe { sm.add((c % S) * STAGE) } as *mut u16;
             let kc = c * 64;
             unsafe {
-                // Weights: 128 rows x 8 pieces, four per thread.
-                #[unroll]
-                for u in 0..4 {
-                    let i = tid + 256 * u;
-                    let (r, cc) = (i / 8, i % 8);
-                    // Shared row r: fused, warp r / 16 has gate rows then up rows of its 8
-                    // outputs; otherwise the block's 128 rows in order.
-                    let wr = if fused { ((r % 16) / 8) * (n / 2) + bx * 64 + (r / 16) * 8 + r % 8 } else { bx * 128 + r };
-                    let (dst, col) = (sb.add(r * LD + cc * 8), kc + cc * 8);
-                    if w4 {
-                        let v = *(qbase.add((wr * k + col) / 2) as *const u32);
-                        let sc = *sbase.add(wr * (k / 128) + col / 128);
-                        let mut packed = [0u32; 4];
-                        #[unroll]
-                        for b in 0..4 {
-                            let c0 = ((v >> (8 * b)) & 15) as f32 - 8.0;
-                            let c1 = ((v >> (8 * b + 4)) & 15) as f32 - 8.0;
-                            packed[b] = pk(c0 * sc, c1 * sc);
-                        }
-                        *(dst as *mut U32x4) = U32x4::new(packed);
-                    } else {
-                        cp_async_cg_16(dst as *mut u32, wbase.add(wr * k + col) as *const u32);
+                if w4 {
+                    let qs = qst.add((c % S) * QSTAGE);
+                    let r = tid / 2;
+                    cp_async_cg_16(qs.add(tid * 16) as *mut u32, qbase.add((wrow(r) * k + kc) / 2 + (tid % 2) * 16) as *const u32);
+                    if tid < 128 {
+                        cp_async_ca_4(qs.add(128 * 32 + tid * 4) as *mut u32, sbase.add(wrow(tid) * (k / 128) + kc / 128) as *const u32);
+                    }
+                } else {
+                    // Weights: 128 rows x 8 pieces, four per thread.
+                    #[unroll]
+                    for u in 0..4 {
+                        let i = tid + 256 * u;
+                        let (r, cc) = (i / 8, i % 8);
+                        cp_async_cg_16(sb.add(r * LD + cc * 8) as *mut u32, wbase.add(wrow(r) * k + kc + cc * 8) as *const u32);
                     }
                 }
                 let xs = sb.add(128 * LD);
@@ -1231,6 +1229,25 @@ pub mod kernels {
             }
             let ws = unsafe { sm.add((c % S) * STAGE) } as *const u16;
             let xs = unsafe { ws.add(128 * LD) };
+            if w4 {
+                let qs = unsafe { qst.add((c % S) * QSTAGE) };
+                #[unroll]
+                for u in 0..4 {
+                    let i = tid + 256 * u;
+                    let (r, cc) = (i / 8, i % 8);
+                    let v = unsafe { *(qs.add(r * 32 + cc * 4) as *const u32) };
+                    let sc = unsafe { *(qs.add(128 * 32 + r * 4) as *const f32) };
+                    let mut packed = [0u32; 4];
+                    #[unroll]
+                    for b in 0..4 {
+                        let c0 = ((v >> (8 * b)) & 15) as f32 - 8.0;
+                        let c1 = ((v >> (8 * b + 4)) & 15) as f32 - 8.0;
+                        packed[b] = pk(c0 * sc, c1 * sc);
+                    }
+                    unsafe { *(ws.add(r * LD + cc * 8) as *mut U32x4) = U32x4::new(packed) };
+                }
+                thread::sync_threads();
+            }
             #[unroll]
             for ks in 0..4 {
                 let b0 = unsafe { frag_b(ws, LD, wp * 16, ks * 16, g, t) };

@@ -451,7 +451,7 @@ const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 
 /// Row stride of the router logits: 256 experts, the shared expert's gate, padding.
 const MOE_ROUTER_LD: usize = 264;
 /// Shared memory of a `moe_gemm` block.
-const MOE_GEMM_SMEM: u32 = 3 * 27648 + 256;
+const MOE_GEMM_SMEM: u32 = 3 * (27648 + 4608) + 256;
 
 /// Most jobs `moe_bucket` can produce for `t` tokens: full ones and a partial one per expert.
 fn moe_max_jobs(t: usize) -> usize {
