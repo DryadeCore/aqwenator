@@ -53,16 +53,23 @@ hf download Intel/Qwen3.5-9B-int4-AutoRound
 python scripts/convert_autoround.py <quantized dir> <original dir> ~/models/qwen35-9b-int4
 ```
 
-The original checkpoint is needed for the draft head, which the quantized one lacks. With
-such a checkpoint the engine also:
+The original checkpoint is needed for the draft head, which the quantized one lacks.
+`Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound` converts the same way (20 GiB; its router and
+shared expert stay bf16). With such a checkpoint the engine also:
 
-- multiplies the 4-bit codes directly in `gemm_i8w` (0.5 bytes read per weight);
+- multiplies the 4-bit codes directly in `gemm_i8w` (0.5 bytes read per weight), and
+  expands those of the experts inside `moe_gemm`;
 - stores the output head in 8 bits;
 - leaves the embedding table in host memory and uploads only the rows a step needs.
 
 Quality is the checkpoint's. About 0.12 nats is the price of 4 bits on this model on agent
 traces, calibrated or not, and the error grows with context length (0.005 on a short prompt,
 0.022 at 16k tokens).
+
+The 4-bit 35B is checked against transformers running the same weights expanded to bf16:
+mean KL 0.002 to 0.005 nats on the three reference prompts, the range the bf16 model has
+against its own reference. What the 4 bits cost against the original model has not been
+measured yet.
 
 ### Fitting a small card
 

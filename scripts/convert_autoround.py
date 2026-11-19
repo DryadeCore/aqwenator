@@ -1,14 +1,16 @@
 """Convert a 4-bit AutoRound / GPTQ checkpoint (packing `auto_round:auto_gptq`, symmetric,
 group size 128) into the layout aqwenator loads: for every quantized linear `<name>.weight`,
 `<name>.weight.q4` (uint8 [out, in / 2], two 4-bit codes per byte, low nibble first, value =
-code - 8) and `<name>.weight.q4s` (float32 [out, in / 128], one scale per 128 inputs). Tensors
-the quantized checkpoint lacks (the MTP head) are taken from the original checkpoint.
+code - 8) and `<name>.weight.q4s` (float32 [out, in / 128], one scale per 128 inputs). Experts
+stored one by one are stacked the way the original checkpoint has them: `experts.gate_up_proj`
+and `experts.down_proj`, with the same two suffixes. Tensors the quantized checkpoint lacks
+(the MTP head) are taken from the original checkpoint.
 
     python scripts/convert_autoround.py <quantized dir> <original dir> <out dir>
 
 e.g. Intel/Qwen3.5-9B-int4-AutoRound and Qwen/Qwen3.5-9B (their snapshot directories).
 """
-import glob, json, os, shutil, sys
+import glob, json, os, re, shutil, sys
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -40,6 +42,7 @@ def unpack(p, axis):  # 8 4-bit codes per int32 along `axis`
 
 quant, orig = index(qdir), index(odir)
 tensors, layers = {}, 0
+experts = {}  # "<layer>.mlp.experts" -> {(expert, projection): (codes, scales)}
 for k, h in quant.items():
     if k.endswith(".qweight"):
         base = k[: -len(".qweight")]
@@ -50,11 +53,19 @@ for k, h in quant.items():
         scales = quant[base + ".scales"].get_tensor(base + ".scales").float().t().contiguous()  # [out, groups]
         n_out, n_in = codes.shape
         assert n_in % 128 == 0 and scales.shape == (n_out, n_in // 128), f"{base}: shape {codes.shape}, scales {scales.shape}"
-        tensors[base + ".weight.q4"] = codes[:, 0::2] | (codes[:, 1::2] << 4)
-        tensors[base + ".weight.q4s"] = scales
+        q4 = codes[:, 0::2] | (codes[:, 1::2] << 4)
+        if m := re.fullmatch(r"(.*\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj", base):
+            experts.setdefault(m[1], {})[int(m[2]), m[3]] = (q4, scales)
+        else:
+            tensors[base + ".weight.q4"], tensors[base + ".weight.q4s"] = q4, scales
         layers += 1
     elif not k.endswith((".qzeros", ".scales", ".g_idx")):
         tensors[k] = h.get_tensor(k)
+for prefix, parts in experts.items():
+    for name, projs in (("gate_up_proj", ("gate", "up")), ("down_proj", ("down",))):
+        for j, suffix in enumerate((".q4", ".q4s")):
+            stacked = [torch.cat([parts[e, p][j] for p in projs]) for e in range(len(parts) // 3)]
+            tensors[f"{prefix}.{name}{suffix}"] = torch.stack(stacked)
 missing = [k for k in orig if k not in tensors and k + ".q4" not in tensors]
 for k in missing:
     tensors[k] = orig[k].get_tensor(k)

@@ -23,17 +23,18 @@ shape.
 
 `qwen3_5_moe` replaces the MLP with 256 experts of width 512, 8 per token, plus a shared
 expert behind a sigmoid gate. Qwen3.6-35B-A3B is 67 GiB in bf16, of which the experts are
-about 64.
+about 64; from a [4-bit checkpoint](quantization.md#4-bit-checkpoints) it loads in 18 GiB.
 
 Per layer, with nothing going back to the host:
 
 1. A router GEMM gives 256 expert logits and the shared expert's gate logit per token.
 2. `moe_route` takes the softmax, keeps the top 8 and renormalizes them.
 3. `moe_bucket` groups the step's (token, expert) rows by expert into jobs of up to 64 rows.
-   The shared expert is treated as expert 256 and takes every token.
 4. `moe_gemm` runs each job against its expert's weights on tensor cores: once for gate/up,
-   with SiLU and the product in its epilogue, once for down.
-5. `moe_combine` scales and adds the 8 rows of each token, then the shared expert's.
+   with SiLU and the product in its epilogue, once for down. 4-bit experts are expanded as
+   they are staged in shared memory.
+5. The shared expert takes every token, so it runs as a dense MLP.
+6. `moe_combine` scales and adds the 8 rows of each token, then the shared expert's.
 
 The launch grid is the same whatever the routing (unused jobs return at once), so steps are
 still captured as graphs.

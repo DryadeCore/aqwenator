@@ -35,12 +35,11 @@ pub struct Layer {
     // mlp
     gate_up: Weight,
     down: Weight,
-    // mixture of experts (0 for a dense MLP, and gate_up and down are then unused): router
-    // rows then the shared expert's gate row, and the experts' stacked weights with the shared
-    // expert last
+    // mixture of experts (0 for a dense MLP; gate_up and down are then the shared expert's):
+    // router rows then the shared expert's gate row, and the experts' stacked weights
     router: u64,
-    ex_gate_up: u64,
-    ex_down: u64,
+    ex_gate_up: Weight,
+    ex_down: Weight,
     // per-slot state pools
     delta_state: u64,
     conv_state: u64,
@@ -412,9 +411,9 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         moe_logits: gpu.alloc(mt * MOE_ROUTER_LD * 2)?,
         moe_idx: gpu.alloc(mt * 8)?,
         moe_w: gpu.alloc(mt * 8 * 4)?,
-        moe_list: gpu.alloc(mt * 9 * 4)?,
+        moe_list: gpu.alloc(mt * 8 * 4)?,
         moe_jobs: gpu.alloc(if mt > 0 { moe_max_jobs(mt) * 8 } else { 0 })?,
-        moe_act: gpu.alloc(mt * 9 * cfg.moe_intermediate_size * 2)?,
+        moe_act: gpu.alloc(mt * 8 * cfg.moe_intermediate_size * 2)?,
         moe_out: gpu.alloc(mt * 9 * hd * 2)?,
         q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
         logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
@@ -451,32 +450,28 @@ const MOE_ROUTER_LD: usize = 264;
 /// Shared memory of a `moe_gemm` block.
 const MOE_GEMM_SMEM: u32 = 3 * 27648 + 256;
 
-/// Most jobs `moe_bucket` can produce for `t` tokens: full ones, a partial one per expert, and
-/// the shared expert's.
+/// Most jobs `moe_bucket` can produce for `t` tokens: full ones and a partial one per expert.
 fn moe_max_jobs(t: usize) -> usize {
-    (9 * t).div_ceil(64) + 257
+    (8 * t).div_ceil(64) + 256
 }
 
-/// The MLP weights of layer `n(..)`: gate/up and down for a dense MLP, or router and stacked
-/// experts (the shared expert, which has their shape, as expert 256).
+/// The MLP weights of layer `n(..)`: gate/up and down (the shared expert's in a mixture of
+/// experts), then router and stacked experts (0 for a dense MLP).
 #[allow(clippy::type_complexity)]
-fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<(Weight, Weight, u64, u64, u64)> {
+fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<(Weight, Weight, u64, Weight, Weight)> {
     let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
+    let mlp = |s: &str| n(&format!("{}.{s}", if cfg.moe() { "mlp.shared_expert" } else { "mlp" }));
+    let gate_up = gemm_weight(gpu, ck, &[mlp("gate_proj.weight"), mlp("up_proj.weight")], 0, h, fmt.0)?;
+    let down = gemm_weight(gpu, ck, &[mlp("down_proj.weight")], 0, inter, fmt.1)?;
     if !cfg.moe() {
-        return Ok((
-            gemm_weight(gpu, ck, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], 0, h, fmt.0)?,
-            gemm_weight(gpu, ck, &[n("mlp.down_proj.weight")], 0, inter, fmt.1)?,
-            0,
-            0,
-            0,
-        ));
+        return Ok((gate_up, down, 0, Weight::default(), Weight::default()));
     }
     Ok((
-        Weight::default(),
-        Weight::default(),
+        gate_up,
+        down,
         concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (MOE_ROUTER_LD - 257) * h * 2)?,
-        concat_bf16(gpu, ck, &[n("mlp.experts.gate_up_proj"), n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])?,
-        concat_bf16(gpu, ck, &[n("mlp.experts.down_proj"), n("mlp.shared_expert.down_proj.weight")])?,
+        gemm_weight(gpu, ck, &[n("mlp.experts.gate_up_proj")], 0, h, Fmt::Bf16)?,
+        gemm_weight(gpu, ck, &[n("mlp.experts.down_proj")], 0, cfg.moe_intermediate_size, Fmt::Bf16)?,
     ))
 }
 
@@ -573,7 +568,7 @@ impl Model {
         // A 4-bit checkpoint is for small devices, and its embedding table and output head
         // are still bf16: the head is stored in 8 bits and the table stays in host memory (a
         // step uploads its tokens' rows; the draft head keeps its shortlist's).
-        let small_tables = ck.has(&format!("{P}layers.0.mlp.gate_proj.weight.q4")) && cfg.hidden_size % 32 == 0;
+        let small_tables = ["gate_proj.weight", "experts.gate_up_proj"].iter().any(|n| ck.has(&format!("{P}layers.0.mlp.{n}.q4"))) && cfg.hidden_size % 32 == 0;
         let tied = cfg.tied() || !ck.has("lm_head.weight");
         let embed_name = format!("{P}embed_tokens.weight");
         let mut small_head = None;
@@ -758,7 +753,7 @@ impl Model {
         gpu.sync()?;
         gpu.flush_uploads()?;
         let mut lm_head = small_head.unwrap_or(Weight::bf16(head_table));
-        if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4) {
+        if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4 || l.ex_gate_up.fmt == Fmt::Int4) {
             anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
             gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
             anyhow::ensure!(mtp.as_ref().is_none_or(|m| m.short_n > 0), "the embedding table is in host memory: the draft head needs its shortlist (AQ_MTP_SHORT)");
@@ -1030,12 +1025,9 @@ impl Model {
                     (c.hidden_size, c.num_attention_heads * c.head_dim, s.mix, s.delta, l.o_proj),
                 ],
             };
-            let mlp = if l.router != 0 {
-                vec![(MOE_ROUTER_LD, c.hidden_size, s.h, s.moe_logits, Weight::bf16(l.router))]
-            } else {
-                vec![(2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up), (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down)]
-            };
-            for (n, k, x, y, wt) in w.into_iter().chain(mlp) {
+            let mlp = [(2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up), (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down)];
+            let router = (l.router != 0).then_some((MOE_ROUTER_LD, c.hidden_size, s.h, s.moe_logits, Weight::bf16(l.router)));
+            for (n, k, x, y, wt) in w.into_iter().chain(mlp).chain(router) {
                 if seen.insert((n, k)) {
                     shapes.push((n, k, x, y));
                     for &m in &ms {
@@ -2147,19 +2139,21 @@ impl Model {
             }
             .map_err(de)?;
             mark!("norm");
-            if l.ex_gate_up == 0 {
-                let inter = c.intermediate_size;
-                g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
-                mark!("gemm_gate_up");
-                let nvec = (t * inter / 8) as u32;
-                unsafe {
-                    g.k.silu_mul(&st, cfg((nvec.div_ceil(256), 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32, t as u32)
-                }
-                .map_err(de)?;
-                mark!("silu_mul");
-                g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, s.delta, CUDA_R_16BF)?;
-                mark!("gemm_down");
-            } else {
+            let moe = l.router != 0;
+            let inter = c.intermediate_size;
+            // The shared expert of a mixture is the dense MLP, written after the experts' rows.
+            let mlp_out = if moe { s.moe_out + (8 * t * c.hidden_size * 2) as u64 } else { s.delta };
+            g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
+            mark!("gemm_gate_up");
+            let nvec = (t * inter / 8) as u32;
+            unsafe {
+                g.k.silu_mul(&st, cfg((nvec.div_ceil(256), 1, 1), 256), s.proj as *const u16, s.mix as *mut u16, inter as u32, t as u32)
+            }
+            .map_err(de)?;
+            mark!("silu_mul");
+            g.gemm(t, cap, c.hidden_size, inter, s.mix, l.down, mlp_out, CUDA_R_16BF)?;
+            mark!("gemm_down");
+            if moe {
                 let ei = c.moe_intermediate_size as u32;
                 let jobs = moe_max_jobs(t) as u32;
                 let (tu, ld) = (t as u32, MOE_ROUTER_LD as u32);
@@ -2172,12 +2166,12 @@ impl Model {
                 mark!("moe_route");
                 let (list, jl) = (s.moe_list as *const u32, s.moe_jobs as *const u32);
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, tu, 1)
+                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32)
                         .map_err(de)?;
                 }
                 mark!("moe_gate_up");
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, tu, 0)
+                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down.p as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, 0, l.ex_down.scale as *const f32)
                         .map_err(de)?;
                 }
                 mark!("moe_down");

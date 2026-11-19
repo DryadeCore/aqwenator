@@ -1050,12 +1050,11 @@ pub mod kernels {
     }
 
     /// Group the rows of a step's expert GEMMs by expert. Row `token * 8 + selection` is that
-    /// token through its `selection`-th expert, and row `8 * T + token` is the token through
-    /// the shared expert (expert 256). `list` receives the rows expert after expert, and `jobs`
-    /// one entry per up to 64 rows of one expert: `[offset into list, expert | rows << 16]`.
+    /// token through its `selection`-th expert. `list` receives the rows expert after expert, and
+    /// `jobs` one entry per up to 64 rows of one expert: `[offset into list, expert | rows << 16]`.
     /// Entries past the last job get zero rows. Thread `e` scans every token's 8 bytes for
     /// expert `e` (at most one match).
-    /// grid = (1), block = (256). `max_jobs` >= ceil(9 * T / 64) + 257.
+    /// grid = (1), block = (256). `max_jobs` >= ceil(8 * T / 64) + 256.
     #[kernel]
     pub unsafe fn moe_bucket(idx: *const u64, n_tokens: u32, list: *mut u32, jobs: *mut u32, max_jobs: u32) {
         static mut CNT: SharedArray<u32, 256> = SharedArray::UNINIT;
@@ -1110,30 +1109,16 @@ pub mod kernels {
             }
             i += 1;
         }
-        // The shared expert takes every token, in order.
-        let mut i = tid;
-        while i < n_tokens {
-            unsafe { *list.add((8 * n_tokens + i) as usize) = 8 * n_tokens + i };
-            i += 256;
-        }
-        let mut i = tid;
-        while i * jr < n_tokens {
-            let mc = if n_tokens - i * jr < jr { n_tokens - i * jr } else { jr };
-            unsafe {
-                *jobs.add(2 * (total + i) as usize) = 8 * n_tokens + i * jr;
-                *jobs.add(2 * (total + i) as usize + 1) = 256 | (mc << 16);
-            }
-            i += 256;
-        }
-        let mut i = total + n_tokens.div_ceil(jr) + tid;
+        let mut i = total + tid;
         while i < max_jobs {
             unsafe { *jobs.add(2 * i as usize + 1) = 0 };
             i += 256;
         }
     }
 
-    /// Grouped expert GEMM over the jobs of `moe_bucket`, with `w` `[257][n][k]` bf16 (the
-    /// shared expert last) and a 3-stage `cp.async` ring in shared memory, each stage holding
+    /// Grouped expert GEMM over the jobs of `moe_bucket`, with `w` `[256][n][k]` bf16,
+    /// or with `scale` not null the 4-bit codes and scales `dequant_i4g` reads (expanded to
+    /// the same bf16 values as they are staged), and a 3-stage `cp.async` ring in shared memory, each stage holding
     /// 64 columns of K for 128 weight rows and the job's (up to 64) gathered rows.
     ///
     /// `fused` != 0, the gate/up product (`n = 2 * inter`): the input row of list entry `p` is
@@ -1147,7 +1132,7 @@ pub mod kernels {
     /// Requires n % 128 == 0 and k % 64 == 0.
     /// block = (256), dynamic shared memory = 3 * 27648 + 256 bytes.
     #[kernel]
-    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, n_tokens: u32, fused: u32) {
+    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32) {
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
         const S: usize = 3;
         const LD: usize = 72;
@@ -1162,7 +1147,7 @@ pub mod kernels {
         let jo = unsafe { *jobs.add(2 * job) } as usize;
         let sm = DynamicSharedArray::<u8, 16>::get_raw();
         let rid = unsafe { sm.add(S * STAGE) } as *mut u32;
-        let (n, k, ldx, nt) = (n as usize, k as usize, ldx as usize, n_tokens as usize);
+        let (n, k, ldx) = (n as usize, k as usize, ldx as usize);
         let fused = fused != 0;
         let tid = thread::threadIdx_x() as usize;
         let lane = tid % 32;
@@ -1172,6 +1157,8 @@ pub mod kernels {
         let bx = thread::blockIdx_x() as usize;
         let mtc = mc.div_ceil(16);
         let wbase = unsafe { w.add(e * n * k) };
+        let w4 = !scale.is_null();
+        let (qbase, sbase) = unsafe { (w.cast::<u8>().add(e * n * k / 2), scale.add(e * n * (k / 128))) };
         if tid < 64 {
             unsafe { *rid.add(tid) = if tid < mc { *list.add(jo + tid) } else { 0 } };
         }
@@ -1189,7 +1176,21 @@ pub mod kernels {
                     // Shared row r: fused, warp r / 16 has gate rows then up rows of its 8
                     // outputs; otherwise the block's 128 rows in order.
                     let wr = if fused { ((r % 16) / 8) * (n / 2) + bx * 64 + (r / 16) * 8 + r % 8 } else { bx * 128 + r };
-                    cp_async_cg_16(sb.add(r * LD + cc * 8) as *mut u32, wbase.add(wr * k + kc + cc * 8) as *const u32);
+                    let (dst, col) = (sb.add(r * LD + cc * 8), kc + cc * 8);
+                    if w4 {
+                        let v = *(qbase.add((wr * k + col) / 2) as *const u32);
+                        let sc = *sbase.add(wr * (k / 128) + col / 128);
+                        let mut packed = [0u32; 4];
+                        #[unroll]
+                        for b in 0..4 {
+                            let c0 = ((v >> (8 * b)) & 15) as f32 - 8.0;
+                            let c1 = ((v >> (8 * b + 4)) & 15) as f32 - 8.0;
+                            packed[b] = pk(c0 * sc, c1 * sc);
+                        }
+                        *(dst as *mut U32x4) = U32x4::new(packed);
+                    } else {
+                        cp_async_cg_16(dst as *mut u32, wbase.add(wr * k + col) as *const u32);
+                    }
                 }
                 let xs = sb.add(128 * LD);
                 let mut i = tid;
@@ -1198,13 +1199,7 @@ pub mod kernels {
                     let dst = xs.add(r * LD + cc * 8) as *mut u32;
                     if r < mc {
                         let p = *rid.add(r) as usize;
-                        let row = if !fused {
-                            p
-                        } else if p < 8 * nt {
-                            p / 8
-                        } else {
-                            p - 8 * nt
-                        };
+                        let row = if fused { p / 8 } else { p };
                         cp_async_cg_16(dst, x.add(row * ldx + kc + cc * 8) as *const u32);
                     } else {
                         cp_async_cg_zfill_16(dst, x as *const u8, 0);
