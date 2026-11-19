@@ -773,7 +773,7 @@ impl Model {
         let mut lim = limits;
         // The MTP draft head is used whenever the checkpoint has one (AQ_MTP=0 turns it off).
         // It adds one attention layer's KV to every page.
-        let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ck.has("mtp.layers.0.self_attn.q_proj.weight");
+        let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ["", ".q4"].iter().any(|q| ck.has(&format!("mtp.layers.0.self_attn.q_proj.weight{q}")));
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
             let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * kv_row;
@@ -868,10 +868,10 @@ impl Model {
                 dt_bias: 0,
                 gnorm: 0,
                 out_proj: Weight::default(),
-                qkv: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")])?),
+                qkv: gemm_weight(&mut gpu, &ck, &[sa("q_proj.weight"), sa("k_proj.weight"), sa("v_proj.weight")], 0, h, Fmt::Bf16)?,
                 q_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?,
                 k_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?,
-                o_proj: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?),
+                o_proj: gemm_weight(&mut gpu, &ck, &[sa("o_proj.weight")], 0, cfg.num_attention_heads * cfg.head_dim, Fmt::Bf16)?,
                 gate_up: m.gate_up,
                 down: m.down,
                 router: m.router,
