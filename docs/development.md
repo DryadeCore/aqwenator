@@ -55,6 +55,7 @@ Environment:
 |---|---|
 | `AQ_QUANT=fp8\|int8` | Weight tier ([quantization](quantization.md)) |
 | `AQ_KV=int8` | 8-bit attention cache |
+| `AQ_EXPERT_GB=N` | 4-bit mixture-of-experts checkpoints: keep only N GiB of experts on the device (the least recently used ones are replaced), the rest in page-locked host memory. Outputs do not change |
 | `AQ_MTP=0` | Do not load the draft head |
 | `AQ_MTP_K`, `AQ_MTP_SHORT` | Chained drafts (3), draft shortlist size (32768) |
 | `AQ_BG_PREFILL=N` | Background prefill lane |

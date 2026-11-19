@@ -495,6 +495,14 @@ impl Gpu {
         unsafe { memory::memcpy_htod_async(dst, src.as_ptr(), std::mem::size_of_val(src), self.stream.cu_stream()) }.map_err(de)
     }
 
+    /// The same from page-locked memory, which the driver reads when the copy runs.
+    ///
+    /// # Safety
+    /// `src` must be valid for `len` bytes until the copy has run.
+    pub unsafe fn upload_raw(&self, dst: u64, src: *const u8, len: usize) -> Result<()> {
+        unsafe { memory::memcpy_htod_async(dst, src, len, self.stream.cu_stream()) }.map_err(de)
+    }
+
     pub fn alloc_upload<T>(&mut self, src: &[T]) -> Result<u64> {
         let p = self.alloc(std::mem::size_of_val(src))?;
         self.sync()?;
