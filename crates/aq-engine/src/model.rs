@@ -36,10 +36,13 @@ pub struct Layer {
     gate_up: Weight,
     down: Weight,
     // mixture of experts (0 for a dense MLP; gate_up and down are then the shared expert's):
-    // router rows then the shared expert's gate row, and the experts' stacked weights
+    // router rows then the shared expert's gate row, and where `moe_gemm` finds the experts:
+    // expert e's weights are `ex_slots[e] * ex_stride` bytes past these
     router: u64,
     ex_gate_up: Weight,
     ex_down: Weight,
+    ex_slots: u64,
+    ex_stride: [u32; 2],
     // per-slot state pools
     delta_state: u64,
     conv_state: u64,
@@ -461,21 +464,81 @@ fn moe_max_jobs(t: usize) -> usize {
 /// The MLP weights of layer `n(..)`: gate/up and down (the shared expert's in a mixture of
 /// experts), then router and stacked experts (0 for a dense MLP).
 #[allow(clippy::type_complexity)]
-fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<(Weight, Weight, u64, Weight, Weight)> {
+/// 4-bit experts on the device, one fixed-size record each: gate/up codes, their scales,
+/// down codes, their scales.
+struct ExpertPool {
+    p: u64,
+    /// Byte offsets of a record's four parts, then its size.
+    off: [usize; 5],
+    used: usize,
+}
+
+impl ExpertPool {
+    fn new(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, prefixes: &[String]) -> Result<Self> {
+        let (h, ei) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        let parts = [ei * h, 2 * ei * (h / 128) * 4, h * ei / 2, h * (ei / 128) * 4];
+        let mut off = [0; 5];
+        for i in 0..4 {
+            off[i + 1] = off[i] + parts[i];
+        }
+        let layers = prefixes.iter().filter(|p| ck.has(&format!("{p}mlp.experts.gate_up_proj.q4"))).count();
+        anyhow::ensure!(layers == 0 || (h % 128 == 0 && ei % 128 == 0), "4-bit experts need widths that are multiples of 128");
+        Ok(Self { p: gpu.alloc_uninit(layers * cfg.num_experts * off[4])?, off, used: 0 })
+    }
+
+    /// Queue one layer's experts into the next free records; their slots.
+    fn load(&mut self, gpu: &mut Gpu, ck: &Checkpoint, ne: usize, experts: &str) -> Result<Vec<u32>> {
+        for (i, name) in ["gate_up_proj.q4", "gate_up_proj.q4s", "down_proj.q4", "down_proj.q4s"].iter().enumerate() {
+            let v = ck.get(&format!("{experts}.{name}"))?;
+            let part = self.off[i + 1] - self.off[i];
+            anyhow::ensure!(v.bytes.len() == ne * part, "{experts}.{name}: unexpected 4-bit layout");
+            for e in 0..ne {
+                let dst = self.p + ((self.used + e) * self.off[4] + self.off[i]) as u64;
+                // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
+                unsafe { gpu.queue_upload(dst, &v.bytes[e * part..][..part], v.direct.map(|(f, at)| (f, at + (e * part) as u64)))? };
+            }
+        }
+        self.used += ne;
+        Ok((self.used - ne..self.used).map(|s| s as u32).collect())
+    }
+}
+
+/// A layer's MLP weights and, for a mixture, its router and experts.
+struct Mlp {
+    gate_up: Weight,
+    down: Weight,
+    router: u64,
+    ex_gate_up: Weight,
+    ex_down: Weight,
+    ex_slots: u64,
+    ex_stride: [u32; 2],
+}
+
+fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, pool: &mut ExpertPool, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<Mlp> {
     let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
     let mlp = |s: &str| n(&format!("{}.{s}", if cfg.moe() { "mlp.shared_expert" } else { "mlp" }));
     let gate_up = gemm_weight(gpu, ck, &[mlp("gate_proj.weight"), mlp("up_proj.weight")], 0, h, fmt.0)?;
     let down = gemm_weight(gpu, ck, &[mlp("down_proj.weight")], 0, inter, fmt.1)?;
+    let mut m = Mlp { gate_up, down, router: 0, ex_gate_up: Weight::default(), ex_down: Weight::default(), ex_slots: 0, ex_stride: [0; 2] };
     if !cfg.moe() {
-        return Ok((gate_up, down, 0, Weight::default(), Weight::default()));
+        return Ok(m);
     }
-    Ok((
-        gate_up,
-        down,
-        concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (MOE_ROUTER_LD - 257) * h * 2)?,
-        gemm_weight(gpu, ck, &[n("mlp.experts.gate_up_proj")], 0, h, Fmt::Bf16)?,
-        gemm_weight(gpu, ck, &[n("mlp.experts.down_proj")], 0, cfg.moe_intermediate_size, Fmt::Bf16)?,
-    ))
+    let (ne, ei) = (cfg.num_experts, cfg.moe_intermediate_size);
+    m.router = concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (MOE_ROUTER_LD - 257) * h * 2)?;
+    let slots: Vec<u32> = if ck.has(&n("mlp.experts.gate_up_proj.q4")) {
+        let at = |i: usize| pool.p + pool.off[i] as u64;
+        m.ex_gate_up = Weight { p: at(0), scale: at(1), fmt: Fmt::Int4 };
+        m.ex_down = Weight { p: at(2), scale: at(3), fmt: Fmt::Int4 };
+        m.ex_stride = [pool.off[4] as u32; 2];
+        pool.load(gpu, ck, ne, &n("mlp.experts"))?
+    } else {
+        m.ex_gate_up = gemm_weight(gpu, ck, &[n("mlp.experts.gate_up_proj")], 0, h, Fmt::Bf16)?;
+        m.ex_down = gemm_weight(gpu, ck, &[n("mlp.experts.down_proj")], 0, ei, Fmt::Bf16)?;
+        m.ex_stride = [(2 * ei * h * 2) as u32, (h * ei * 2) as u32];
+        (0..ne as u32).collect()
+    };
+    m.ex_slots = gpu.alloc_upload(&slots)?;
+    Ok(m)
 }
 
 /// Upload several bf16 matrices concatenated along rows into one buffer.
@@ -624,12 +687,14 @@ impl Model {
         }
         let kv_bytes = (lim.num_blocks() + 1) * lim.block_size * cfg.num_key_value_heads * kv_row;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let pooled: Vec<String> = (0..cfg.num_hidden_layers).map(|l| format!("{P}layers.{l}.")).chain(want_mtp.then(|| "mtp.layers.0.".into())).collect();
+        let mut pool = ExpertPool::new(&mut gpu, &ck, &cfg, &pooled)?;
         // Seconds spent allocating and zeroing recurrent state and KV pages (not weights).
         let mut state_s = 0.0f64;
         for l in 0..cfg.num_hidden_layers {
             let n = |s: &str| format!("{P}layers.{l}.{s}");
             let kind = cfg.kind(l);
-            let (gate_up, down, router, ex_gate_up, ex_down) = mlp_weights(&mut gpu, &ck, &cfg, &n, (q('u'), q('d')))?;
+            let m = mlp_weights(&mut gpu, &ck, &cfg, &mut pool, &n, (q('u'), q('d')))?;
             let mut layer = Layer {
                 kind,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
@@ -644,11 +709,13 @@ impl Model {
                 q_norm: 0,
                 k_norm: 0,
                 o_proj: Weight::default(),
-                gate_up,
-                down,
-                router,
-                ex_gate_up,
-                ex_down,
+                gate_up: m.gate_up,
+                down: m.down,
+                router: m.router,
+                ex_gate_up: m.ex_gate_up,
+                ex_down: m.ex_down,
+                ex_slots: m.ex_slots,
+                ex_stride: m.ex_stride,
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: 0,
@@ -695,7 +762,7 @@ impl Model {
         let mtp = if want_mtp {
             let n = |s: &str| format!("mtp.layers.0.{s}");
             let sa = |s: &str| n(&format!("self_attn.{s}"));
-            let (gate_up, down, router, ex_gate_up, ex_down) = mlp_weights(&mut gpu, &ck, &cfg, &n, (Fmt::Bf16, Fmt::Bf16))?;
+            let m = mlp_weights(&mut gpu, &ck, &cfg, &mut pool, &n, (Fmt::Bf16, Fmt::Bf16))?;
             let layer = Layer {
                 kind: LayerKind::Full,
                 in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
@@ -710,11 +777,13 @@ impl Model {
                 q_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("q_norm.weight"))?)?,
                 k_norm: gpu.alloc_upload(&ck.bf16_vec(&sa("k_norm.weight"))?)?,
                 o_proj: Weight::bf16(concat_bf16(&mut gpu, &ck, &[sa("o_proj.weight")])?),
-                gate_up,
-                down,
-                router,
-                ex_gate_up,
-                ex_down,
+                gate_up: m.gate_up,
+                down: m.down,
+                router: m.router,
+                ex_gate_up: m.ex_gate_up,
+                ex_down: m.ex_down,
+                ex_slots: m.ex_slots,
+                ex_stride: m.ex_stride,
                 delta_state: 0,
                 conv_state: 0,
                 k_cache: gpu.alloc(kv_bytes)?,
@@ -2176,12 +2245,12 @@ impl Model {
                 }
                 let (list, jl) = (s.moe_list as *const u32, s.moe_jobs as *const u32);
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32)
+                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[0])
                         .map_err(de)?;
                 }
                 mark!("moe_gate_up");
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down.p as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, 0, l.ex_down.scale as *const f32)
+                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down.p as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, 0, l.ex_down.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[1])
                         .map_err(de)?;
                 }
                 mark!("moe_down");

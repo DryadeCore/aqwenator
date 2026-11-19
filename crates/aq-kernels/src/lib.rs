@@ -1116,10 +1116,11 @@ pub mod kernels {
         }
     }
 
-    /// Grouped expert GEMM over the jobs of `moe_bucket`, with `w` `[256][n][k]` bf16,
-    /// or with `scale` not null the 4-bit codes and scales `dequant_i4g` reads (staged as
-    /// codes, expanded to the same bf16 values before use), and a 3-stage `cp.async` ring in shared memory, each stage holding
-    /// 64 columns of K for 128 weight rows and the job's (up to 64) gathered rows.
+    /// Grouped expert GEMM over the jobs of `moe_bucket`. Expert `e`'s `[n][k]` weights are
+    /// `slots[e] * stride` bytes past `w`: bf16, or with `scale` not null the 4-bit codes and
+    /// (as far past `scale`) scales `dequant_i4g` reads, staged as codes and expanded to the
+    /// same bf16 values before use. A 3-stage `cp.async` ring in shared memory, each stage
+    /// holding 64 columns of K for 128 weight rows and the job's (up to 64) gathered rows.
     ///
     /// `fused` != 0, the gate/up product (`n = 2 * inter`): the input row of list entry `p` is
     /// its token's row of `x`, a block owns 64 of the `inter` outputs (each warp 8 gate rows
@@ -1132,7 +1133,7 @@ pub mod kernels {
     /// Requires n % 128 == 0 and k % 64 == 0.
     /// block = (256), dynamic shared memory = 3 * (27648 + 4608) + 256 bytes.
     #[kernel]
-    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32) {
+    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32, slots: *const u32, stride: u32) {
         use cuda_device::async_copy::{cp_async_ca_4, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
         const S: usize = 3;
         const LD: usize = 72;
@@ -1158,9 +1159,10 @@ pub mod kernels {
         let t = lane % 4;
         let bx = thread::blockIdx_x() as usize;
         let mtc = mc.div_ceil(16);
-        let wbase = unsafe { w.add(e * n * k) };
+        let at = unsafe { *slots.add(e) } as usize * stride as usize;
         let w4 = !scale.is_null();
-        let (qbase, sbase) = unsafe { (w.cast::<u8>().add(e * n * k / 2), scale.add(e * n * (k / 128))) };
+        let qbase = unsafe { w.cast::<u8>().add(at) };
+        let (wbase, sbase) = (qbase.cast::<u16>(), unsafe { scale.cast::<u8>().add(at) }.cast::<f32>());
         if tid < 64 {
             unsafe { *rid.add(tid) = if tid < mc { *list.add(jo + tid) } else { 0 } };
         }
