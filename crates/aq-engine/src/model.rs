@@ -301,6 +301,9 @@ pub struct Model {
     /// Logits buffer of the last step that sampled, whichever lane ran it.
     last_logits: u64,
     pub use_graphs: bool,
+    /// AQ_MOE_ROUTES=<file> (debug): every forward appends, per mixture-of-experts layer,
+    /// `[layer u32][tokens u32]` then each token's 8 experts, one per byte.
+    routes: Option<std::fs::File>,
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
     cur_tiles: usize,
@@ -867,7 +870,8 @@ impl Model {
             load: LoadStats { open_s, upload_s, weight_bytes },
             prof: Prof::from_env(),
             graphs: Default::default(),
-            use_graphs: std::env::var("AQ_NO_GRAPHS").is_err(),
+            use_graphs: std::env::var("AQ_NO_GRAPHS").is_err() && std::env::var("AQ_MOE_ROUTES").is_err(),
+            routes: std::env::var("AQ_MOE_ROUTES").ok().map(std::fs::File::create).transpose()?,
             cur_chunks: 0,
             cur_tiles: 0,
             cur_splits: 1,
@@ -2164,6 +2168,12 @@ impl Model {
                     g.k.moe_bucket(&st, cfg((1, 1, 1), 256), s.moe_idx as *const u64, tu, s.moe_list as *mut u32, s.moe_jobs as *mut u32, jobs).map_err(de)?;
                 }
                 mark!("moe_route");
+                if let Some(f) = self.routes.as_mut() {
+                    use std::io::Write;
+                    let idx: Vec<u64> = g.download(s.moe_idx, t)?;
+                    let head = [li as u32, tu].into_iter().flat_map(u32::to_le_bytes);
+                    f.write_all(&head.chain(idx.into_iter().flat_map(u64::to_le_bytes)).collect::<Vec<u8>>())?;
+                }
                 let (list, jl) = (s.moe_list as *const u32, s.moe_jobs as *const u32);
                 unsafe {
                     g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32)
