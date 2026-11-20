@@ -10,6 +10,10 @@
 //! - `AQ_EXPERT_RAM_GB=<GiB>` smaller than that too: host memory also holds the least
 //!   recently used ones, read from the checkpoint with direct I/O when needed.
 //!
+//! When paging, each layer is also told which experts the next one will probably select (its
+//! router run one layer early, `AQ_EXPERT_AHEAD` of them per token, 8 unless set, 0 = none), and
+//! uploads those that host memory holds while the current layer computes.
+//!
 //! Outputs do not depend on what the tiers hold.
 
 use crate::config::TextConfig;
@@ -43,13 +47,16 @@ impl Lru {
     }
 
     /// Give each of `ids` (records without a slot) the slot of a least recently used record
-    /// not used at `tick`. There must be that many.
+    /// not used at `tick`; the last ones get none when there are not that many.
     fn place(&mut self, ids: &[usize], tick: u64) -> Vec<u32> {
         let mut free: Vec<u32> = (0..self.owner.len() as u32).filter(|&s| self.stamp[s as usize] != tick).collect();
         if !ids.is_empty() && ids.len() < free.len() {
             free.select_nth_unstable_by_key(ids.len() - 1, |&s| self.stamp[s as usize]);
         }
         free.truncate(ids.len());
+        for &id in &ids[free.len()..] {
+            self.slot[id] = NONE;
+        }
         for (&id, &s) in ids.iter().zip(&free) {
             if self.owner[s as usize] != NONE {
                 self.slot[self.owner[s as usize] as usize] = NONE;
@@ -96,8 +103,11 @@ pub struct ExpertPool {
     host: usize,
     disk: Option<Disk>,
     tick: u64,
-    /// Since the last report: experts needed, uploaded, read from disk, and forwards.
-    stats: [usize; 4],
+    /// Experts named ahead per token (0 = none).
+    pub ahead: u32,
+    /// Since the last report: experts needed, uploaded when needed, read from disk, forwards,
+    /// uploaded ahead.
+    stats: [usize; 5],
 }
 
 impl ExpertPool {
@@ -114,7 +124,7 @@ impl ExpertPool {
         anyhow::ensure!(n == 0 || (h % 128 == 0 && ei % 128 == 0), "4-bit experts need widths that are multiples of 128");
         let budget = |var: &str, unit: usize| std::env::var(var).ok().and_then(|v| v.parse::<f64>().ok()).map_or(n, |g| (g * GIB) as usize / unit).min(n);
         let cap = budget("AQ_EXPERT_GB", rec);
-        let mut pool = Self { p: gpu.alloc_uninit(cap * rec)?, off, used: 0, dev: Lru::default(), host: 0, disk: None, tick: 0, stats: [0; 4] };
+        let mut pool = Self { p: gpu.alloc_uninit(cap * rec)?, off, used: 0, dev: Lru::default(), host: 0, disk: None, tick: 0, ahead: 0, stats: [0; 5] };
         if cap == n {
             return Ok(pool);
         }
@@ -125,6 +135,7 @@ impl ExpertPool {
         };
         floor(cap, "AQ_EXPERT_GB", rec)?;
         pool.dev = Lru::new(cap, n);
+        pool.ahead = std::env::var("AQ_EXPERT_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8).min(16);
         let stride = rec.next_multiple_of(ALIGN) + ALIGN;
         let ram = budget("AQ_EXPERT_RAM_GB", stride);
         let host_bytes = if ram < n {
@@ -187,8 +198,11 @@ impl ExpertPool {
 
     /// Bring the experts a layer's tokens selected (`idx`, 0xffff where unused; the layer's
     /// first record is `base`) onto the device over the least recently used ones, and queue
-    /// the layer's slot table. Nothing queued may still read the pool.
-    pub fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64) -> Result<()> {
+    /// the layer's slot table. Nothing queued may still read the pool. `next` is a guess of
+    /// the following layer's selection (its first record, then as `idx`): those are uploaded
+    /// on the side stream, to be there when that layer is paged.
+    pub fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64, next: Option<(u32, &[u16])>) -> Result<()> {
+        gpu.side_sync()?;
         self.tick += 1;
         let (tick, rec) = (self.tick, self.off[4]);
         let mut miss = Vec::new();
@@ -243,17 +257,52 @@ impl ExpertPool {
             // used at this tick is replaced before the caller's next synchronization.
             unsafe { gpu.upload_raw(self.p + (s as usize * rec) as u64, src as *const u8, rec)? };
         }
-        gpu.upload(table, &self.dev.slot[base as usize..][..ne])
+        gpu.upload(table, &self.dev.slot[base as usize..][..ne])?;
+        let Some((nbase, guess)) = next else { return Ok(()) };
+        let mut ahead = Vec::new();
+        for id in guess.iter().filter(|&&e| e != 0xffff).map(|&e| (nbase + e as u32) as usize) {
+            match self.dev.slot[id] {
+                NONE if self.disk.as_ref().is_none_or(|d| d.lru.slot[id] != NONE) => {
+                    self.dev.slot[id] = PENDING;
+                    ahead.push(id);
+                }
+                // Already there: keep it there.
+                s if s < PENDING => self.dev.stamp[s as usize] = tick,
+                _ => {}
+            }
+        }
+        let slots = self.dev.place(&ahead, tick);
+        self.stats[4] += slots.len();
+        for (&id, &s) in ahead.iter().zip(&slots) {
+            let src = match self.disk.as_mut() {
+                Some(d) => {
+                    let hs = d.lru.slot[id] as usize;
+                    d.lru.stamp[hs] = tick;
+                    self.host + hs * d.stride + d.head[hs]
+                }
+                None => self.host + id * rec,
+            };
+            // SAFETY: as above; the next call waits for the side stream before anything else.
+            unsafe { gpu.upload_raw_side(self.p + (s as usize * rec) as u64, src as *const u8, rec)? };
+        }
+        Ok(())
     }
 
     /// Count a forward; every 512, report what the tiers had to move.
     pub fn report(&mut self) {
         self.stats[3] += 1;
         if self.stats[3] == 512 {
-            let [need, up, read, n] = self.stats;
+            let [need, up, read, n, ahead] = self.stats;
             let mib = |c: usize| (c * self.off[4]) as f64 / n as f64 / (1 << 20) as f64;
-            eprintln!("experts: {} needed per forward, {:.1}% uploaded ({:.0} MiB per forward), {:.0} MiB per forward read from the checkpoint", need / n, 100.0 * up as f64 / need.max(1) as f64, mib(up), mib(read));
-            self.stats = [0; 4];
+            eprintln!(
+                "experts: {} needed per forward, {:.1}% uploaded when needed ({:.0} MiB per forward), {:.0} MiB per forward uploaded ahead, {:.0} read from the checkpoint",
+                need / n,
+                100.0 * up as f64 / need.max(1) as f64,
+                mib(up),
+                mib(ahead),
+                mib(read)
+            );
+            self.stats = [0; 5];
         }
     }
 }

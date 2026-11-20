@@ -44,6 +44,8 @@ pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     /// The active lane's stream; everything enqueued by this struct goes here.
     pub stream: Arc<Stream>,
+    /// For copies that should overlap what `stream` runs (`upload_raw_side`).
+    side: Arc<Stream>,
     /// One stream + cuBLASLt workspace per lane (lane 0 = main; lane 1 = decode, created by
     /// `add_lane` for decode/prefill co-execution).
     streams: Vec<Arc<Stream>>,
@@ -208,6 +210,7 @@ impl Gpu {
         let ctx = CudaContext::new(ordinal).map_err(de)?;
         ctx.bind_to_thread().map_err(de)?;
         let stream = ctx.new_stream().map_err(de)?;
+        let side = ctx.new_stream().map_err(de)?;
         let k = aq_kernels::kernels::load(&ctx).map_err(de)?;
         let ws = unsafe { memory::malloc_sync(WORKSPACE_BYTES) }.map_err(de)?;
         let lt = CublasLt::new(ws, WORKSPACE_BYTES)?;
@@ -215,6 +218,7 @@ impl Gpu {
             ctx,
             streams: vec![stream.clone()],
             stream,
+            side,
             workspaces: vec![ws],
             lane: 0,
             k,
@@ -501,6 +505,19 @@ impl Gpu {
     /// `src` must be valid for `len` bytes until the copy has run.
     pub unsafe fn upload_raw(&self, dst: u64, src: *const u8, len: usize) -> Result<()> {
         unsafe { memory::memcpy_htod_async(dst, src, len, self.stream.cu_stream()) }.map_err(de)
+    }
+
+    /// `upload_raw` on the side stream: the copy overlaps the compute stream's work and is
+    /// ordered with nothing on it. `side_sync` returns once every such copy has run.
+    ///
+    /// # Safety
+    /// As `upload_raw`; and nothing may read `dst` before `side_sync`.
+    pub unsafe fn upload_raw_side(&self, dst: u64, src: *const u8, len: usize) -> Result<()> {
+        unsafe { memory::memcpy_htod_async(dst, src, len, self.side.cu_stream()) }.map_err(de)
+    }
+
+    pub fn side_sync(&self) -> Result<()> {
+        self.side.synchronize().map_err(de)
     }
 
     pub fn alloc_upload<T>(&mut self, src: &[T]) -> Result<u64> {

@@ -57,6 +57,7 @@ Environment:
 | `AQ_KV=int8` | 8-bit attention cache |
 | `AQ_EXPERT_GB=N` | 4-bit mixture-of-experts checkpoints: keep only N GiB of experts on the device (the least recently used ones are replaced), the rest in page-locked host memory. Outputs do not change |
 | `AQ_EXPERT_RAM_GB=N` | With `AQ_EXPERT_GB`: keep only N GiB of experts in host memory too, and read the others from the checkpoint with direct I/O |
+| `AQ_EXPERT_AHEAD=N` | With `AQ_EXPERT_GB`: experts per token uploaded ahead for the next layer (8; 0 = none) |
 | `AQ_MTP=0` | Do not load the draft head |
 | `AQ_MTP_K`, `AQ_MTP_SHORT` | Chained drafts (3), draft shortlist size (32768) |
 | `AQ_BG_PREFILL=N` | Background prefill lane |

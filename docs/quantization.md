@@ -88,9 +88,40 @@ Device memory of the 4-bit 9B with those settings, measured on a B200 (the CUDA 
 | `-e AQ_KV=int8 --kv-gb 0.5` (about 27k tokens of context) | 7.4 GB |
 | the same without the draft head (`-e AQ_MTP=0`) | 6.4 GB |
 
-An 8 GB card has not been tried yet. What has: the second row under an RTX 30 card's limits
-on the B200 (`AQ_DEVICE_GB=7.0 AQ_SMEM_KB=99`), where it passes `aq-check` and serves with
-6.5 GiB allocated.
+On an RTX 3070 laptop (8 GB) the second row loads and serves: 6.5 GiB allocated by the
+engine, 6.9 GB in use on the card, about 43 generated tokens per second for one request.
+
+### A model larger than the card
+
+The experts of a 4-bit mixture-of-experts checkpoint need not all be on the device. With
+`AQ_EXPERT_GB=N` the device keeps N GiB of them, the least recently used ones being
+replaced, and the others wait in page-locked host memory; with `AQ_EXPERT_RAM_GB` host
+memory is a cache too and the rest is read from the checkpoint file with direct I/O. A
+token uses 8 of a layer's 256 experts, so most steps find most of what they need. Each
+layer also runs the next layer's router on its own input, which names three quarters of
+the experts that layer will select, and uploads those while it computes
+(`AQ_EXPERT_AHEAD`, experts named per token, 8 by default). Outputs are those of the model
+with every expert on the device.
+
+The 4-bit Qwen3.6-35B-A3B (18 GiB with everything on the device) on the same 8 GB laptop:
+
+```sh
+docker run --gpus all -p 8000:8000 -v ~/models:/models:ro -e AQ_EXPERT_GB=4.2 -e AQ_MTP=0 \
+  ghcr.io/<owner>/aqwenator /models/qwen36-35b-a3b-int4 \
+  --max-seqs 2 --max-running 1 --kv-gb 0.5 --max-ctx 8192 --spec-k 0
+```
+
+| Expert pool | Drafts | Device memory | Tokens per second, one request |
+|---|---|---|---|
+| 4.2 GiB | off, no draft head | 7.6 GB | 30 |
+| 3 GiB | off, no draft head | 6.3 GB | 26 |
+| 3.8 GiB | on | 7.4 GB | 25 |
+
+That machine uploads at 6.7 GiB/s and is bound by it: drafts, which pay on a B200, cost
+more uploads than they save steps here. On a B200 with a 3 GiB pool the model keeps
+about three quarters of its speed (40 against 48 tokens per second without drafts). Reading
+experts from the checkpoint is much slower for now (15 tokens per second on a B200 with
+4 GiB of host memory): each layer waits for its reads.
 
 ## 8-bit attention cache
 
