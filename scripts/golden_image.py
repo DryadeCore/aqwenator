@@ -59,6 +59,13 @@ def main():
         gen = model.generate(**kw, max_new_tokens=args.greedy, do_sample=False)
         greedy = gen[0, ids.shape[1] :]
         t["greedy_ids"] = greedy.to(torch.int32).cpu()
+        # Teacher forcing over prompt + greedy[:-1]: the reference's margin at every generated
+        # position, to tell a near-tie from a real difference.
+        full = torch.cat([ids[0], greedy[:-1]])[None]
+        tf_kw = dict(kw, input_ids=full, attention_mask=torch.ones_like(full))
+        if "mm_token_type_ids" in kw:
+            tf_kw["mm_token_type_ids"] = torch.cat([kw["mm_token_type_ids"], torch.zeros_like(greedy[None, :-1])], 1)
+        t["tf_logits"] = model(**tf_kw, use_cache=False, logits_to_keep=len(greedy)).logits[0].float().cpu().contiguous()
     os.makedirs(os.path.dirname(os.path.expanduser(args.out)) or ".", exist_ok=True)
     save_file(t, os.path.expanduser(args.out), metadata={"model": args.model, "image": args.size})
     n_img = int((ids[0] == model.config.image_token_id).sum())

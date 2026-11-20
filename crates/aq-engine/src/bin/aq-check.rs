@@ -187,11 +187,11 @@ fn main() -> Result<()> {
         anyhow::ensure!(gh * gw == n_img && img[n_img - 1] as usize == at + n_img - 1, "image tokens are not one span");
         let rows = b.rows.clone();
         let mut eng = Engine::new(m, vec![]);
-        let run = |eng: &mut Engine, rows: &[u16], id: u64| -> Result<(Vec<u32>, usize)> {
+        let run = |eng: &mut Engine, rows: &[u16], id: u64, n: usize| -> Result<(Vec<u32>, usize)> {
             let mut prompt = ids.clone();
             prompt.splice(at..at + n_img, eng.image_ids(rows, gh, gw)?);
             let images = vec![Image { at, h: gh, w: gw, rows: std::sync::Arc::new(rows.to_vec()) }];
-            eng.add(Request { id, prompt, max_new_tokens: greedy_ref.len(), ignore_eos: true, images })?;
+            eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: true, images })?;
             let (mut out, mut cached) = (Vec::new(), 0);
             while eng.has_work() {
                 for e in eng.step()? {
@@ -201,20 +201,52 @@ fn main() -> Result<()> {
             }
             Ok((out, cached))
         };
-        let (cold, _) = run(&mut eng, &rows, 1)?;
-        let agree = cold.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
-        let (warm, hit) = run(&mut eng, &rows, 2)?;
+        // Each run either follows the reference or leaves it where the reference itself hesitates
+        // (teacher-forced top-2 margin below the near-tie bound).
+        let tf = as_f32("tf_logits")?;
+        let v = tf.len() / greedy_ref.len();
+        let follows = |seq: &[u32]| -> (usize, Option<f32>) {
+            let k = seq.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
+            let margin = (k < seq.len().min(greedy_ref.len())).then(|| {
+                let row = &tf[k * v..(k + 1) * v];
+                let (mut a, mut b) = (f32::MIN, f32::MIN);
+                for &x in row {
+                    (a, b) = if x > a { (x, a) } else { (a, b.max(x)) };
+                }
+                a - b
+            });
+            (k, margin)
+        };
+        let show = |(k, m): (usize, Option<f32>)| m.map_or(format!("all {k} tokens as the reference"), |m| format!("the reference for {k} tokens, then a margin of {m:.3}"));
+        let nr = greedy_ref.len();
+        let (cold, _) = run(&mut eng, &rows, 1, nr)?;
+        let (warm, hit) = run(&mut eng, &rows, 2, nr)?;
+        // Where the resumed run leaves the cold one, our own top-2 margin there (the resumed
+        // path again, stopped at that token).
+        let own = match warm.iter().zip(&cold).position(|(a, b)| a != b) {
+            Some(d) => {
+                run(&mut eng, &rows, 4, d + 1)?;
+                let lg = eng.model.logits()?;
+                let (mut a, mut b) = (f32::MIN, f32::MIN);
+                for &x in &lg {
+                    (a, b) = if x > a { (x, a) } else { (a, b.max(x)) };
+                }
+                Some((d, a - b))
+            }
+            None => None,
+        };
         let mut other = rows.clone();
         other.reverse();
-        let (_, miss) = run(&mut eng, &other, 3)?;
+        let (_, miss) = run(&mut eng, &other, 3, nr)?;
         println!(
-            "image request: first {agree} of {} tokens as the reference; again: {hit} prompt tokens from the cache, output {}; another image: {miss} from the cache (image starts at {at})",
-            greedy_ref.len(),
-            if warm == cold { "identical" } else { "DIFFERENT" }
+            "image request: {}; again: {hit} prompt tokens from the cache, {}; another image: {miss} from the cache (image starts at {at})",
+            show(follows(&cold)),
+            own.map_or("output identical".to_string(), |(d, m)| format!("output leaves the cold run at token {d}, our margin there {m:.3}"))
         );
+        let ok = |s: &[u32]| follows(s).1.is_none_or(|m| m < near_tie) && own.is_none_or(|(_, m)| m < near_tie);
         // The prompt checkpoint sits on a chunk boundary inside the image here: a hit past the
         // image's start is a match on its ids.
-        anyhow::ensure!(agree > 0 && warm == cold && hit > at && miss <= at, "image request check FAILED");
+        anyhow::ensure!(ok(&cold) && ok(&warm) && hit > at && miss <= at, "image request check FAILED");
         println!("PASS");
         return Ok(());
     }
