@@ -119,6 +119,7 @@ async fn completions(State(app): State<Arc<App>>, Json(body): Json<CompletionReq
         prompt,
         max_new_tokens: body.max_tokens.unwrap_or(16),
         ignore_eos: body.ignore_eos.unwrap_or(false),
+        images: Vec::new(),
     };
     let (tx, rx) = mpsc::unbounded_channel();
     if app.submit.send(Submit { req, tx }).is_err() {

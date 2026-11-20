@@ -77,9 +77,25 @@ impl Engine {
             b.seq_slot_out.push(if e.draft.is_empty() { s.slot } else { s.spare.unwrap() });
             b.seq_tap.push(e.tap.map_or((0, 0), |(c, slot)| (((c - s.computed) / GDN_TC_CHUNK) as u32, slot)));
             for p in s.computed..upto {
-                b.tokens.push(if p < known { s.token_at(p) } else { e.draft[p - known] });
+                let mut tok = if p < known { s.token_at(p) } else { e.draft[p - known] };
+                if tok >> 31 != 0 {
+                    // An image token takes its row; a draft copied from one is no token (0),
+                    // and is rejected like any wrong draft.
+                    tok = match s.image_row(p) {
+                        Some(r) => {
+                            b.rows.extend_from_slice(r);
+                            0x8000_0000 | (b.rows.len() / r.len() - 1) as u32
+                        }
+                        None => 0,
+                    };
+                }
+                b.tokens.push(tok);
                 b.tok_pos.push(p as u32);
                 b.tok_seq.push(k as u32);
+                if !s.req.images.is_empty() || !b.rope_off.is_empty() {
+                    b.rope_off.resize((b.tokens.len() - 1) * 3, 0);
+                    b.rope_off.extend(s.rope_off(p));
+                }
             }
             let mut row = s.blocks.clone();
             row.resize(mb, 0);

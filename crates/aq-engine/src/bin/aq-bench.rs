@@ -113,7 +113,7 @@ fn main() -> Result<()> {
 
     // Cold start: first token of a short request right after load (includes module load,
     // cuBLASLt plan creation, first-touch of every kernel).
-    eng.add(Request { id: u64::MAX, prompt: vec![9707, 11, 1879, 0], max_new_tokens: 1, ignore_eos: true })?;
+    eng.add(Request { id: u64::MAX, prompt: vec![9707, 11, 1879, 0], max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
     while eng.has_work() {
         eng.step()?;
     }
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
             } else {
                 file_prompts[*next_id as usize % file_prompts.len()].clone()
             };
-            eng.add(Request { id: *next_id, prompt, max_new_tokens: a.output_len, ignore_eos: true })?;
+            eng.add(Request { id: *next_id, prompt, max_new_tokens: a.output_len, ignore_eos: true, images: Vec::new() })?;
             arrive.insert(*next_id, Instant::now());
             *next_id += 1;
             Ok(())

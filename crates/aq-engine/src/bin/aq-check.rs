@@ -12,7 +12,7 @@
 //! Exit status is non-zero on any real miss.
 
 use anyhow::{Context, Result};
-use aq_engine::engine::{Engine, Request};
+use aq_engine::engine::{Engine, Image, Request};
 use aq_engine::model::{Limits, Model};
 use aq_engine::weights::resolve_model;
 use std::time::Instant;
@@ -52,7 +52,7 @@ fn drift(eng: &mut Engine, prompt: &[u32], off: &[u32], same: usize) -> Result<(
             continue;
         }
         let l = same - back;
-        eng.add(Request { id: 398, prompt: prompt.to_vec(), max_new_tokens: l + 1, ignore_eos: true })?;
+        eng.add(Request { id: 398, prompt: prompt.to_vec(), max_new_tokens: l + 1, ignore_eos: true, images: Vec::new() })?;
         let mut got = Vec::new();
         while eng.has_work() {
             for e in eng.step()? {
@@ -61,7 +61,7 @@ fn drift(eng: &mut Engine, prompt: &[u32], off: &[u32], same: usize) -> Result<(
         }
         let dec = eng.model.logits()?;
         let p: Vec<u32> = prompt.iter().chain(&off[..l]).copied().collect();
-        eng.add(Request { id: 397, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+        eng.add(Request { id: 397, prompt: p, max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
         while eng.has_work() {
             eng.step()?;
         }
@@ -178,6 +178,43 @@ fn main() -> Result<()> {
         println!("image prompt ({} image tokens of {n}): layers worst rel_l2 {:.2e} (layer {}), logits rel_l2 {rel:.2e}, first token {first} (reference {})", img.len(), worst.0, worst.1, greedy_ref[0]);
         // With the offsets left at zero the layers are off by 4.7e-1 and the first token still agrees.
         anyhow::ensure!(first == greedy_ref[0] && rel < 0.05 && worst.0 < 0.1, "image reference check FAILED");
+
+        // Through the engine: the image as a request's span (merged grid: the patch grid / 2),
+        // generated to the end; then the same image again, which resumes past it from the
+        // session cache with the same output, and another image, which does not.
+        let (grid, at, n_img) = (as_u32("grid_thw")?, img[0] as usize, img.len());
+        let (gh, gw) = (grid[1] as usize / 2, grid[2] as usize / 2);
+        anyhow::ensure!(gh * gw == n_img && img[n_img - 1] as usize == at + n_img - 1, "image tokens are not one span");
+        let rows = b.rows.clone();
+        let mut eng = Engine::new(m, vec![]);
+        let run = |eng: &mut Engine, rows: &[u16], id: u64| -> Result<(Vec<u32>, usize)> {
+            let mut prompt = ids.clone();
+            prompt.splice(at..at + n_img, eng.image_ids(rows, gh, gw)?);
+            let images = vec![Image { at, h: gh, w: gw, rows: std::sync::Arc::new(rows.to_vec()) }];
+            eng.add(Request { id, prompt, max_new_tokens: greedy_ref.len(), ignore_eos: true, images })?;
+            let (mut out, mut cached) = (Vec::new(), 0);
+            while eng.has_work() {
+                for e in eng.step()? {
+                    out.push(e.token);
+                    cached = e.cached;
+                }
+            }
+            Ok((out, cached))
+        };
+        let (cold, _) = run(&mut eng, &rows, 1)?;
+        let agree = cold.iter().zip(&greedy_ref).take_while(|(a, b)| a == b).count();
+        let (warm, hit) = run(&mut eng, &rows, 2)?;
+        let mut other = rows.clone();
+        other.reverse();
+        let (_, miss) = run(&mut eng, &other, 3)?;
+        println!(
+            "image request: first {agree} of {} tokens as the reference; again: {hit} prompt tokens from the cache, output {}; another image: {miss} from the cache (image starts at {at})",
+            greedy_ref.len(),
+            if warm == cold { "identical" } else { "DIFFERENT" }
+        );
+        // The prompt checkpoint sits on a chunk boundary inside the image here: a hit past the
+        // image's start is a match on its ids.
+        anyhow::ensure!(agree > 0 && warm == cold && hit > at && miss <= at, "image request check FAILED");
         println!("PASS");
         return Ok(());
     }
@@ -346,7 +383,7 @@ fn main() -> Result<()> {
         println!("policy: {:?}", eng.policy);
     }
     for id in 0..3u64 {
-        eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+        eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true, images: Vec::new() })?;
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::new(); 3];
     while eng.has_work() {
@@ -365,7 +402,7 @@ fn main() -> Result<()> {
     let overlap_before = eng.overlap_steps;
     let cache_was = eng.session_cache;
     eng.session_cache = false; // full prefills, so the late arrivals really overlap with decode
-    eng.add(Request { id: 300, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+    eng.add(Request { id: 300, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true, images: Vec::new() })?;
     let mut st: Vec<Vec<u32>> = vec![Vec::new(); 3];
     let mut added = false;
     while eng.has_work() {
@@ -374,7 +411,7 @@ fn main() -> Result<()> {
         }
         if !added && st[0].len() >= 2 {
             for id in 301..303u64 {
-                eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true })?;
+                eng.add(Request { id, prompt: ids.clone(), max_new_tokens: greedy_ref.len(), ignore_eos: true, images: Vec::new() })?;
             }
             added = true;
         }
@@ -398,7 +435,7 @@ fn main() -> Result<()> {
         eng.session_cache = cached;
         let mut out = Vec::new();
         for (id, prompt, n) in [(100u64, ids.clone(), 9usize), (101, turn2.clone(), 16)] {
-            eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: true })?;
+            eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: true, images: Vec::new() })?;
             while eng.has_work() {
                 for e in eng.step()? {
                     if e.id == 101 {
@@ -431,7 +468,7 @@ fn main() -> Result<()> {
             eng.clear_cache();
             let before = eng.cache.reused_tokens;
             let mut out = vec![Vec::new(); 2];
-            eng.add(Request { id: 110, prompt: ids.clone(), max_new_tokens: 24, ignore_eos: true })?;
+            eng.add(Request { id: 110, prompt: ids.clone(), max_new_tokens: 24, ignore_eos: true, images: Vec::new() })?;
             let mut added = false;
             while eng.has_work() || !added {
                 for e in eng.step()? {
@@ -439,7 +476,7 @@ fn main() -> Result<()> {
                 }
                 let first_done = out[0].len() >= if overlap { 3 } else { 24 };
                 if !added && first_done {
-                    eng.add(Request { id: 111, prompt: turn2.clone(), max_new_tokens: 16, ignore_eos: true })?;
+                    eng.add(Request { id: 111, prompt: turn2.clone(), max_new_tokens: 16, ignore_eos: true, images: Vec::new() })?;
                     added = true;
                 }
             }
@@ -463,7 +500,7 @@ fn main() -> Result<()> {
                 let base = if k == 0 { &ids } else { &turn2 };
                 let p: Vec<u32> = base.iter().chain(&cold[k][..same]).copied().collect();
                 eng.clear_cache();
-                eng.add(Request { id: 119, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+                eng.add(Request { id: 119, prompt: p, max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
                 while eng.has_work() {
                     eng.step()?;
                 }
@@ -496,7 +533,7 @@ fn main() -> Result<()> {
             eng.session_cache = cached;
             let mut out = Vec::new();
             for (k, p) in prompts.iter().enumerate() {
-                eng.add(Request { id: 200 + k as u64, prompt: p.clone(), max_new_tokens: 12, ignore_eos: true })?;
+                eng.add(Request { id: 200 + k as u64, prompt: p.clone(), max_new_tokens: 12, ignore_eos: true, images: Vec::new() })?;
                 if k == 0 {
                     // Let the first one get going so the second sees it as a known sequence.
                     eng.step()?;
@@ -520,7 +557,7 @@ fn main() -> Result<()> {
         let mut tie = None;
         if same < cold.len() {
             let p: Vec<u32> = prompts[2].iter().chain(&cold[..same]).copied().collect();
-            eng.add(Request { id: 203, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+            eng.add(Request { id: 203, prompt: p, max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
             while eng.has_work() {
                 eng.step()?;
             }
@@ -564,7 +601,7 @@ fn main() -> Result<()> {
             eng.spec_k = 0;
             for len in [1usize, 8, 48] {
                 for r in 0..nrow {
-                    eng.add(Request { id: 500 + r as u64, prompt: prompts[1].clone(), max_new_tokens: len, ignore_eos: true })?;
+                    eng.add(Request { id: 500 + r as u64, prompt: prompts[1].clone(), max_new_tokens: len, ignore_eos: true, images: Vec::new() })?;
                 }
                 let mut out = vec![Vec::new(); nrow];
                 while eng.has_work() {
@@ -585,7 +622,7 @@ fn main() -> Result<()> {
         let mut run = |eng: &mut Engine, spec: usize, which: &[usize]| -> Result<Vec<Vec<u32>>> {
             eng.spec_k = spec;
             for &w in which {
-                eng.add(Request { id: 300 + w as u64, prompt: prompts[w].clone(), max_new_tokens: SPEC_TEST_LEN, ignore_eos: true })?;
+                eng.add(Request { id: 300 + w as u64, prompt: prompts[w].clone(), max_new_tokens: SPEC_TEST_LEN, ignore_eos: true, images: Vec::new() })?;
             }
             let mut out = vec![Vec::new(); 3];
             while eng.has_work() {
@@ -640,7 +677,7 @@ fn main() -> Result<()> {
                 // prompt + common prefix alone and look at its top-2 margin.
                 eng.spec_k = 0;
                 let p: Vec<u32> = prompts[w].iter().chain(&off[w][..same]).copied().collect();
-                eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+                eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
                 while eng.has_work() {
                     eng.step()?;
                 }
@@ -656,7 +693,7 @@ fn main() -> Result<()> {
                 // alone moves that gap by logits, and neither token is "the" greedy answer.
                 let mut ambiguous = None;
                 if a - b >= near_tie && same < on[w].len() {
-                    eng.add(Request { id: 398, prompt: prompts[w].clone(), max_new_tokens: same + 1, ignore_eos: true })?;
+                    eng.add(Request { id: 398, prompt: prompts[w].clone(), max_new_tokens: same + 1, ignore_eos: true, images: Vec::new() })?;
                     let mut got = Vec::new();
                     while eng.has_work() {
                         for e in eng.step()? {
@@ -720,7 +757,7 @@ fn main() -> Result<()> {
             let before = eng.spec.stop_in_draft;
             let run1 = |eng: &mut Engine, id: u64, prompt: Vec<u32>, n: usize, cache: bool, spec: usize| -> Result<(Vec<u32>, bool)> {
                 (eng.session_cache, eng.spec_k) = (cache, spec);
-                eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: false })?;
+                eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: false, images: Vec::new() })?;
                 let (mut out, mut stop) = (Vec::new(), false);
                 while eng.has_work() {
                     for e in eng.step()? {
@@ -808,7 +845,7 @@ fn main() -> Result<()> {
                     };
                     let id = if first { a as u64 } else { 3 + a as u64 };
                     prompts[id as usize] = p.clone();
-                    eng.add(Request { id: 300 + id, prompt: p, max_new_tokens: 8, ignore_eos: true })?;
+                    eng.add(Request { id: 300 + id, prompt: p, max_new_tokens: 8, ignore_eos: true, images: Vec::new() })?;
                 }
                 let _ = k;
                 while eng.has_work() {
@@ -837,7 +874,7 @@ fn main() -> Result<()> {
             }
             // Classify the divergence by the cold logits' top-2 margin at that position.
             let p: Vec<u32> = prompts[k].iter().chain(&cold[k][..same]).copied().collect();
-            eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true })?;
+            eng.add(Request { id: 399, prompt: p, max_new_tokens: 1, ignore_eos: true, images: Vec::new() })?;
             while eng.has_work() {
                 eng.step()?;
             }

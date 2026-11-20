@@ -30,12 +30,24 @@ use step::{Entry, sampled};
 pub use spec::SpecStats;
 pub use step::SMALL_PREFILL;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub id: u64,
     pub prompt: Vec<u32>,
     pub max_new_tokens: usize,
     pub ignore_eos: bool,
+    /// In prompt order; their tokens hold the ids `Engine::image_ids` gave them.
+    pub images: Vec<Image>,
+}
+
+/// An image in a prompt: `rows` (bf16, `[h * w][hidden]`, from `vision::Vision::encode`)
+/// stand for the prompt tokens `at..at + h * w`, a grid of `h x w` merged patches.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub at: usize,
+    pub h: usize,
+    pub w: usize,
+    pub rows: std::sync::Arc<Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +100,30 @@ struct Seq {
 }
 
 impl Seq {
+    /// How far each of the rotary positions (time, row, column) of token `p` is from `p`, as
+    /// wrapping u32: zero before any image; inside one, the image's first position plus the
+    /// token's row and column; after one, behind by its tokens less its longer side.
+    fn rope_off(&self, p: usize) -> [u32; 3] {
+        let mut shift = 0u32;
+        for im in self.req.images.iter().take_while(|im| im.at <= p) {
+            let n = im.h * im.w;
+            if p < im.at + n {
+                let k = (p - im.at) as u32;
+                let t = shift.wrapping_add(k).wrapping_neg();
+                return [t, t.wrapping_add(k / im.w as u32), t.wrapping_add(k % im.w as u32)];
+            }
+            shift += (n - im.h.max(im.w)) as u32;
+        }
+        [shift.wrapping_neg(); 3]
+    }
+
+    /// The supplied row of token `p`, if it is an image's.
+    fn image_row(&self, p: usize) -> Option<&[u16]> {
+        let im = self.req.images.iter().find(|im| (im.at..im.at + im.h * im.w).contains(&p))?;
+        let hid = im.rows.len() / (im.h * im.w);
+        Some(&im.rows[(p - im.at) * hid..(p - im.at + 1) * hid])
+    }
+
     fn known(&self) -> usize {
         self.req.prompt.len() + self.out.len()
     }
@@ -172,6 +208,10 @@ pub struct Engine {
     /// last token re-tokenizes once text follows it (`<think>\n` becomes `<think>\n\n`), so
     /// the next prompt extends the checkpoint but not the parked generation.
     pub prompt_checkpoints: bool,
+    /// `image_ids`: digest keys, the first id of each image seen, and the next free id.
+    image_keys: [std::collections::hash_map::RandomState; 2],
+    image_base: std::collections::HashMap<u128, u32>,
+    image_next: u32,
     /// AQ_TRACE=1: a `[step]` line per step and a `[req]` line per request at its first token.
     pub trace: bool,
     /// AQ_BG_PREFILL=tokens (0 = off): a prompt with at least this much left to prefill runs
@@ -223,6 +263,9 @@ impl Engine {
             last_decode: None,
             mixed_prefill_adaptive: None,
             prompt_checkpoints: std::env::var("AQ_NO_CKPT").is_err(),
+            image_keys: Default::default(),
+            image_base: Default::default(),
+            image_next: 0,
             trace: std::env::var("AQ_TRACE").as_deref() == Ok("1"),
             bg_prefill: 0,
             // AQ_SRPT=1: test hook, so aq-check can run its suite under the SRPT prefill order.
@@ -244,6 +287,32 @@ impl Engine {
         self.model.limits
     }
 
+    /// Prompt ids for an image of `h x w` merged patches with these `rows`: the same image
+    /// gets the same ids, a different one others, so the session cache tells images apart like
+    /// text. Keyed by a 128-bit digest under per-process random keys.
+    pub fn image_ids(&mut self, rows: &[u16], h: usize, w: usize) -> Result<Vec<u32>> {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let n = h * w;
+        let half = |k: &std::collections::hash_map::RandomState| {
+            let mut s = k.build_hasher();
+            (h, w, rows).hash(&mut s);
+            s.finish() as u128
+        };
+        let key = half(&self.image_keys[0]) << 64 | half(&self.image_keys[1]);
+        let base = match self.image_base.get(&key) {
+            Some(&b) => b,
+            None => {
+                // shortcut: ids are not recycled; 2^31 image tokens per process, then an error.
+                let b = self.image_next;
+                anyhow::ensure!(b as usize + n < 1 << 31, "image ids exhausted; restart the server");
+                self.image_next += n as u32;
+                self.image_base.insert(key, b);
+                b
+            }
+        };
+        Ok((0..n as u32).map(|k| 0x8000_0000 | (base + k)).collect())
+    }
+
     pub fn add(&mut self, req: Request) -> Result<()> {
         let lim = self.limits();
         if req.prompt.is_empty() || req.prompt.len() + req.max_new_tokens > lim.max_ctx {
@@ -260,6 +329,19 @@ impl Engine {
                 req.prompt.len() + req.max_new_tokens,
                 lim.num_blocks()
             );
+        }
+        // Image tokens are exactly the spans' tokens, and each span's rows fit the model.
+        let hid = self.model.cfg.hidden_size;
+        let mut end = 0;
+        for im in &req.images {
+            let n = im.h * im.w;
+            if im.at < end || im.at + n > req.prompt.len() || n == 0 || im.rows.len() != n * hid {
+                bail!("request {}: an image span does not fit its prompt or its rows", req.id);
+            }
+            end = im.at + n;
+        }
+        if req.prompt.iter().enumerate().any(|(p, &t)| (t >> 31 != 0) != req.images.iter().any(|im| (im.at..im.at + im.h * im.w).contains(&p))) {
+            bail!("request {}: image ids outside image spans, or an image span holding text", req.id);
         }
         self.model.mtp_note(req.prompt.iter().copied());
         self.waiting.push_back((req, Instant::now()));
