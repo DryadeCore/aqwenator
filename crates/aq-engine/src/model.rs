@@ -931,12 +931,7 @@ impl Model {
         let s = alloc_scratch(&mut gpu, &cfg, &lim, cc_gdn, mtp.as_ref().map(|m| m.head_width(&cfg)))?;
         gpu.sync()?;
         let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
-        let grp = cfg.num_attention_heads / cfg.num_key_value_heads;
-        // The tensor-core attention kernels take 1, 2, 4 or 8 query heads per KV head.
-        let fast_attn = 8 % grp == 0;
-        if !fast_attn {
-            eprintln!("attention: {grp} query heads per KV head, on the reference kernel (slow)");
-        }
+        let grp = cfg.num_attention_heads / cfg.num_key_value_heads / cfg.kv_share();
         // Sub-tiles per block: capped by 1024 threads and 100 KiB of shared memory (the most a
         // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
         let smem_max = gpu.max_smem_optin()? as u32;
@@ -1020,7 +1015,7 @@ impl Model {
             cur_tap: false,
             last_logits: 0,
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
-            ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1") || !fast_attn,
+            ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
             attn_nbuf: attn_nbuf as u32,
@@ -1571,7 +1566,7 @@ impl Model {
             let splits = need.next_power_of_two().min(DEC_TC_SLICES);
             // Warps per block: enough query slots (8 per warp) for the longest real decode
             // sequence, at most 16 rows; longer runs are cut into more tiles.
-            let rpw = 8 / (self.cfg.num_attention_heads / self.cfg.num_key_value_heads);
+            let rpw = 8 / (self.cfg.num_attention_heads / self.cfg.num_key_value_heads / self.cfg.kv_share());
             let longest = b.seq_len[..nd_seqs].iter().copied().max().unwrap_or(1).max(1) as usize;
             // At most 8 warps a block (8 query heads per KV head: one row per warp).
             let warps = longest.div_ceil(rpw).min(16 / rpw).min(8);
@@ -2189,6 +2184,8 @@ impl Model {
                 LayerKind::Full => {
                     let n = c.attn_proj_dim();
                     let (h, hkv) = (c.num_attention_heads as u32, c.num_key_value_heads as u32);
+                    // KV heads as the tensor-core kernels count them (see `TextConfig::kv_share`).
+                    let (share, hkv_tc) = (c.kv_share() as u32, c.num_key_value_heads as u32 * c.kv_share() as u32);
                     mark!("norm");
                     g.gemm(t, cap, n, c.hidden_size, s.h, l.qkv, s.proj, CUDA_R_16BF)?;
                     mark!("gemm_qkv");
@@ -2247,7 +2244,7 @@ impl Model {
                             g.k.attn_decode_tq(
                                 &st,
                                 LaunchConfig {
-                                    grid_dim: (s.dec_tiles as u32, hkv, ns),
+                                    grid_dim: (s.dec_tiles as u32, hkv_tc, ns),
                                     block_dim: (32 * s.dec_warps as u32, 1, 1),
                                     shared_mem_bytes: attn_decode_tq_smem(s.dec_warps, self.kv8),
                                 },
@@ -2263,11 +2260,12 @@ impl Model {
                                 mb,
                                 bs,
                                 h,
-                                hkv,
+                                hkv_tc,
                                 scale,
                                 s.attn_part as *mut f32,
                                 s.attn_ml as *mut f32,
                                 self.kv8 as u32,
+                                share,
                             )
                         }
                         .map_err(de)?;
@@ -2289,9 +2287,9 @@ impl Model {
                         mark!("attn_dec_combine");
                     }
                     if self.cur_tiles > 0 && !self.ref_attn && !self.tile_attn {
-                        let grp = (h / hkv) as u32;
+                        let grp = h / hkv_tc;
                         let launch = cuda_core::LaunchConfig {
-                            grid_dim: (self.cur_tiles as u32, hkv, 1),
+                            grid_dim: (self.cur_tiles as u32, hkv_tc, 1),
                             block_dim: (32 * grp * self.attn_qt as u32, 1, 1),
                             shared_mem_bytes: self.attn_tc_smem,
                         };
@@ -2313,10 +2311,11 @@ impl Model {
                                 mb,
                                 bs,
                                 h,
-                                hkv,
+                                hkv_tc,
                                 scale,
                                 self.attn_nbuf,
                                 self.kv8 as u32,
+                                share,
                             )
                         }
                         .map_err(de)?;

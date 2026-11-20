@@ -147,6 +147,13 @@ impl TextConfig {
         v.and_then(|v| v.as_u64().or_else(|| v.get(0)?.as_u64())).unwrap_or(0) as u32
     }
 
+    /// The tensor-core attention kernels take 1, 2, 4 or 8 query heads per KV head: a wider
+    /// group runs as this many narrower ones that read the same keys and values.
+    pub fn kv_share(&self) -> usize {
+        let g = self.num_attention_heads / self.num_key_value_heads.max(1);
+        (1..=g).find(|s| g % s == 0 && 8 % (g / s) == 0).unwrap_or(g)
+    }
+
     /// Mixture-of-experts MLPs (`qwen3_5_moe`).
     pub fn moe(&self) -> bool {
         self.num_experts > 0

@@ -17,9 +17,7 @@ vision tower of a checkpoint is ignored: text only.
 
 What the kernels assume, checked at load: 256-wide attention heads, 128-wide Gated DeltaNet
 heads, a width-4 convolution, and for a mixture-of-experts model at most 512 experts with at
-most 16 per token and a shared expert of the experts' shape. The tensor-core attention
-kernels take 1, 2, 4 or 8 query heads per KV head; another ratio runs on the reference
-kernel, which is slow.
+most 16 per token and a shared expert of the experts' shape.
 
 ## Qwen3.8-Flash-Next
 
@@ -31,7 +29,7 @@ stands here:
 | Four residual streams with a gated mix before each block | done |
 | n-gram embedding table (95 GiB, 16 rows read per token, never on the device) | done; read from the checkpoint's own shards, or from an extract of the rows some prompts need |
 | 512 experts, 10 per token | done, through the expert pool |
-| Attention with 12 query heads per KV head | reference kernel only |
+| Attention with 12 query heads per KV head | done: run as three groups of 4 on the same keys and values |
 | Sparse attention (the 512 best blocks of 4 tokens) | not yet: contexts over 2048 tokens are wrong |
 | Draft head | not loaded |
 

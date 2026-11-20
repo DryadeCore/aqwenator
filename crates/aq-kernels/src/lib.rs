@@ -2802,6 +2802,8 @@ pub mod kernels {
     ///
     /// Dynamic shared memory: `(QT * group * 16 + nbuf * 2 * 32) * 256 * 2` bytes (64 KiB for
     /// group 4, QT 1, one K/V buffer pair). grid = (n_tiles, n_kv), block = (32 * group * QT).
+    /// A group wider than a block can hold is split: `n_kv` is then `kv_share` times the
+    /// stored KV heads, each of its groups reading the keys and values of head `kv / kv_share`.
     #[kernel]
     pub unsafe fn attention_tc(
         q: *const u16,
@@ -2822,6 +2824,7 @@ pub mod kernels {
         scale: f32,
         nbuf: u32,
         kv8: u32,
+        kv_share: u32,
     ) {
         use cuda_device::DynamicSharedArray;
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all, cp_async_wait_group};
@@ -2844,6 +2847,8 @@ pub mod kernels {
         let h = n_heads as usize;
         let hkv = n_kv as usize;
         let grp = h / hkv;
+        // `n_kv` counts `kv_share` groups of query heads per stored KV head.
+        let (hkv_r, kv_r) = (hkv / kv_share as usize, kv / kv_share as usize);
         let nwarps = nthreads / 32;
         let head = kv * grp + warp_id % grp;
         // First token (within the tile) of this warp's 16-token sub-tile.
@@ -2869,8 +2874,8 @@ pub mod kernels {
         let stage = ks1 as *mut u8;
         if kv8 {
             unsafe {
-                kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
-                kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
+                kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv_r, kv_r, 0, n_keys, 16, tid, nthreads);
+                kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv_r, kv_r, 16, n_keys, 16, tid, nthreads);
                 cp_async_commit_group();
             }
         }
@@ -2914,8 +2919,8 @@ pub mod kernels {
         // context serially and is otherwise bound by one fetch latency per tile.
         if piped {
             unsafe {
-                kv_tile_cp_async(ks0, vs0, k_cache, v_cache, table, bs, hkv, kv, 0, n_keys, 16, tid, nthreads);
-                kv_tile_cp_async(ks0.add(16 * D), vs0.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, 16, n_keys, 16, tid, nthreads);
+                kv_tile_cp_async(ks0, vs0, k_cache, v_cache, table, bs, hkv_r, kv_r, 0, n_keys, 16, tid, nthreads);
+                kv_tile_cp_async(ks0.add(16 * D), vs0.add(16 * D), k_cache, v_cache, table, bs, hkv_r, kv_r, 16, n_keys, 16, tid, nthreads);
                 cp_async_commit_group();
             }
         }
@@ -2931,8 +2936,8 @@ pub mod kernels {
                 thread::sync_threads();
                 if kb + KT < n_keys {
                     unsafe {
-                        kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT, n_keys, 16, tid, nthreads);
-                        kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb + KT + 16, n_keys, 16, tid, nthreads);
+                        kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv_r, kv_r, kb + KT, n_keys, 16, tid, nthreads);
+                        kv_tile8_cp_async(stage.add(16 * KV8_ROW), stage.add((KT + 16) * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv_r, kv_r, kb + KT + 16, n_keys, 16, tid, nthreads);
                         cp_async_commit_group();
                     }
                 }
@@ -2942,8 +2947,8 @@ pub mod kernels {
                     let kn = if cur == 0 { ks1 } else { ks0 };
                     let vn = if cur == 0 { vs1 } else { vs0 };
                     unsafe {
-                        kv_tile_cp_async(kn, vn, k_cache, v_cache, table, bs, hkv, kv, nx, n_keys, 16, tid, nthreads);
-                        kv_tile_cp_async(kn.add(16 * D), vn.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, nx + 16, n_keys, 16, tid, nthreads);
+                        kv_tile_cp_async(kn, vn, k_cache, v_cache, table, bs, hkv_r, kv_r, nx, n_keys, 16, tid, nthreads);
+                        kv_tile_cp_async(kn.add(16 * D), vn.add(16 * D), k_cache, v_cache, table, bs, hkv_r, kv_r, nx + 16, n_keys, 16, tid, nthreads);
                         cp_async_commit_group();
                         cp_async_wait_group(1);
                     }
@@ -2952,8 +2957,8 @@ pub mod kernels {
                 }
             } else {
                 unsafe {
-                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, n_keys, 16, tid, nthreads);
-                    kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv, kv, kb + 16, n_keys, 16, tid, nthreads);
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv_r, kv_r, kb, n_keys, 16, tid, nthreads);
+                    kv_tile_cp_async(ks.add(16 * D), vs.add(16 * D), k_cache, v_cache, table, bs, hkv_r, kv_r, kb + 16, n_keys, 16, tid, nthreads);
                     cp_async_commit_group();
                     cp_async_wait_all();
                 }
@@ -3124,6 +3129,7 @@ pub mod kernels {
         part_acc: *mut f32,
         part_ml: *mut f32,
         kv8: u32,
+        kv_share: u32,
     ) {
         use cuda_device::DynamicSharedArray;
         use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_all};
@@ -3148,6 +3154,8 @@ pub mod kernels {
         let h = n_heads as usize;
         let hkv = n_kv as usize;
         let grp = h / hkv;
+        // `n_kv` counts `kv_share` groups of query heads per stored KV head.
+        let (hkv_r, kv_r) = (hkv / kv_share as usize, kv / kv_share as usize);
         let nwarps = nthreads / 32;
         let rpw = 8 / grp;
         let r0 = warp_id * rpw;
@@ -3206,7 +3214,7 @@ pub mod kernels {
                 // 8-bit cache: stage the tile as stored (after the P^T rows), then expand it.
                 let stage = unsafe { vs.add(KT * D).add(nwarps * 128) } as *mut u8;
                 unsafe {
-                    kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    kv_tile8_cp_async(stage, stage.add(KT * KV8_ROW), k_cache as *const u8, v_cache as *const u8, table, bs, hkv_r, kv_r, kb, k1, KT, tid, nthreads);
                     cp_async_commit_group();
                     cp_async_wait_all();
                 }
@@ -3214,7 +3222,7 @@ pub mod kernels {
                 unsafe { kv_tile8_unpack(stage, ks, vs, KT, tid, nthreads) };
             } else {
                 unsafe {
-                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv, kv, kb, k1, KT, tid, nthreads);
+                    kv_tile_cp_async(ks, vs, k_cache, v_cache, table, bs, hkv_r, kv_r, kb, k1, KT, tid, nthreads);
                     cp_async_commit_group();
                     cp_async_wait_all();
                 }
