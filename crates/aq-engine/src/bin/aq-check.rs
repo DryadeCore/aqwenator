@@ -14,7 +14,8 @@
 use anyhow::{Context, Result};
 use aq_engine::engine::{Engine, Request};
 use aq_engine::model::{Limits, Model};
-use aq_engine::weights::resolve_model;
+use aq_engine::vision::Vision;
+use aq_engine::weights::{Checkpoint, resolve_model};
 use std::time::Instant;
 
 const NEAR_TIE: f32 = 0.25;
@@ -164,6 +165,32 @@ fn main() -> Result<()> {
         b.rope_off = (0..n).flat_map(|r| (0..3).map(move |a| pos[a * n + r].wrapping_sub(r as u32))).collect();
         // The reference rows are bf16 values widened to f32.
         b.rows = ve.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+        // With the image's patches in the file, the tower runs too; its rows go through the
+        // language model after the reference's.
+        let mut ours_rows = Vec::new();
+        if g.names().contains(&"pixel_values") {
+            let (grid, px) = (as_u32("grid_thw")?, as_f32("pixel_values")?);
+            let px: Vec<u16> = px.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+            let vis = Vision::load(&mut m.gpu, &dir, &Checkpoint::open(&dir)?)?;
+            let t0 = Instant::now();
+            let mut dump = Vec::new();
+            ours_rows = vis.encode(&mut m.gpu, &px, grid[1] as usize, grid[2] as usize, Some(&mut dump))?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            for (i, ours) in dump.iter().enumerate() {
+                let Ok(r) = as_f32(&format!("vis.{i}")) else { break };
+                let ours: Vec<f32> = ours.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                let (rel, max) = rel_err(&ours, &r);
+                println!("vision block {i}: rel_l2 {rel:.2e}, max abs {max:.2e}");
+            }
+            let ours: Vec<f32> = ours_rows.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+            let (rel, max) = rel_err(&ours, &ve);
+            println!("vision tower ({} patches, {ms:.0} ms with the dump): rows rel_l2 {rel:.2e}, max abs {max:.2e}", grid[1] * grid[2]);
+            // bf16 alone moves the rows: the yardstick is the reference's own distance from f32.
+            let f32_ref = as_f32("vision_embeds_f32")?;
+            let ((ours32, _), (ref32, _)) = (rel_err(&ours, &f32_ref), rel_err(&ve, &f32_ref));
+            println!("vision tower against f32: ours rel_l2 {ours32:.2e}, reference (bf16) {ref32:.2e}");
+            anyhow::ensure!(ours32 < 1.5 * ref32, "vision tower check FAILED");
+        }
         m.reset_slot(0)?;
         let mut dump = Vec::new();
         let first = m.step(&b, Some(&mut dump))?[0];
@@ -178,6 +205,14 @@ fn main() -> Result<()> {
         println!("image prompt ({} image tokens of {n}): layers worst rel_l2 {:.2e} (layer {}), logits rel_l2 {rel:.2e}, first token {first} (reference {})", img.len(), worst.0, worst.1, greedy_ref[0]);
         // With the offsets left at zero the layers are off by 4.7e-1 and the first token still agrees.
         anyhow::ensure!(first == greedy_ref[0] && rel < 0.05 && worst.0 < 0.1, "image reference check FAILED");
+        if !ours_rows.is_empty() {
+            b.rows = ours_rows;
+            m.reset_slot(0)?;
+            let first = m.step(&b, None)?[0];
+            let (rel, _) = rel_err(&m.logits()?, &as_f32("logits_last")?);
+            println!("image prompt through our tower: logits rel_l2 {rel:.2e}, first token {first} (reference {})", greedy_ref[0]);
+            anyhow::ensure!(first == greedy_ref[0], "image prompt through our tower FAILED");
+        }
         println!("PASS");
         return Ok(());
     }

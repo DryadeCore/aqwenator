@@ -8,6 +8,7 @@ place), logits_last, greedy_ids, tf_logits.
 """
 
 import argparse
+import copy
 import os
 
 import numpy as np
@@ -48,6 +49,19 @@ def main():
         ve = feats.pooler_output if hasattr(feats, "pooler_output") else feats
         ve = torch.cat(list(ve)) if isinstance(ve, (list, tuple)) else ve
         t["vision_embeds"] = ve.float().cpu().contiguous()
+        # The tower's rows into its first block and out of each block, for aq-check to compare.
+        vis, acts = model.model.visual, []
+        hooks = [vis.blocks[0].register_forward_pre_hook(lambda m, a: acts.append(a[0]))]
+        hooks += [b.register_forward_hook(lambda m, a, o: acts.append(o)) for b in vis.blocks]
+        vis(inp["pixel_values"].to(model.dtype), grid_thw=inp["image_grid_thw"])
+        for h in hooks:
+            h.remove()
+        for i, a in enumerate(acts):
+            t[f"vis.{i}"] = a.float().cpu().contiguous()
+        # The same tower in f32: how far bf16 alone takes the rows, the yardstick for ours.
+        vis32 = copy.deepcopy(vis).float()
+        t["vision_embeds_f32"] = vis32(inp["pixel_values"].float(), grid_thw=inp["image_grid_thw"]).pooler_output.cpu().contiguous()
+        del vis32
         kw = {k: v for k, v in inp.items()}
         pos, _ = model.model.get_rope_index(ids, mm_token_type_ids=inp.get("mm_token_type_ids"), image_grid_thw=inp["image_grid_thw"], attention_mask=inp["attention_mask"])
         t["position_ids"] = pos[:, 0].to(torch.int32).cpu().contiguous()

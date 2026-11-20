@@ -33,6 +33,12 @@ fn rb(v: f32) -> f32 {
     bf16_to_f32(f32_to_bf16_rne(v))
 }
 
+/// One element of a linear layer's output as its module returns it: `bf16(x[i] + b[j])`.
+#[inline(always)]
+unsafe fn lin(x: *const f32, b: *const u16, i: usize, j: usize) -> f32 {
+    rb(unsafe { *x.add(i) } + bf16_to_f32(unsafe { *b.add(j) }))
+}
+
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + libm::expf(-x))
@@ -374,6 +380,134 @@ pub mod kernels {
         let mut i = thread::threadIdx_x() as usize;
         while i < h {
             unsafe { *out.add(t * h + i) = *src.add(i) };
+            i += thread::blockDim_x() as usize;
+        }
+    }
+
+    /// LayerNorm with bias over rows of `hidden`: `out = (x - mean) / sqrt(var + eps) * w + b`.
+    /// grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn layer_norm(x: *const u16, w: *const u16, b: *const u16, out: *mut u16, hidden: u32, eps: f32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let (h, step, tid) = (hidden as usize, thread::blockDim_x() as usize, thread::threadIdx_x() as usize);
+        let row = thread::blockIdx_x() as usize * h;
+        let mut sum = 0.0f32;
+        let mut i = tid;
+        while i < h {
+            sum += bf16_to_f32(unsafe { *x.add(row + i) });
+            i += step;
+        }
+        let mean = unsafe { block_sum(sum, red) } / hidden as f32;
+        let mut ss = 0.0f32;
+        i = tid;
+        while i < h {
+            let d = bf16_to_f32(unsafe { *x.add(row + i) }) - mean;
+            ss += d * d;
+            i += step;
+        }
+        let inv = 1.0 / libm::sqrtf(unsafe { block_sum(ss, red) } / hidden as f32 + eps);
+        i = tid;
+        while i < h {
+            let v = (bf16_to_f32(unsafe { *x.add(row + i) }) - mean) * inv;
+            unsafe { *out.add(row + i) = f32_to_bf16_rne(v * bf16_to_f32(*w.add(i)) + bf16_to_f32(*b.add(i))) };
+            i += step;
+        }
+    }
+
+    /// Vision attention inputs for one patch and head, from the qkv projection before its bias
+    /// (`qkv[patch][3][heads][hd]`): queries and keys rotated by the patch's row and column
+    /// (`pos[patch][2]`; of the `hd / 2` pairs `(i, i + hd / 2)`, the first half turn with the
+    /// row and the second with the column) into `q`, `k` `[heads][n][hd]`, and values transposed
+    /// into `vt` `[heads][hd][n]`, the shapes the two attention GEMMs take.
+    /// grid = (n, heads), block = (64).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn vis_qkv(qkv: *const f32, bias: *const u16, pos: *const u32, q: *mut u16, k: *mut u16, vt: *mut u16, n: u32, heads: u32, hd: u32, theta: f32) {
+        let (t, h) = (thread::blockIdx_x() as usize, thread::blockIdx_y() as usize);
+        let (n, hd, half) = (n as usize, hd as usize, hd as usize / 2);
+        let width = heads as usize * hd;
+        let mut i = thread::threadIdx_x() as usize;
+        while i < half {
+            let p = unsafe { *pos.add(t * 2 + i / (half / 2)) };
+            let ang = p as f32 * libm::powf(theta, -((i % (half / 2)) as f32) * 4.0 / hd as f32);
+            let (c, s) = (libm::cosf(ang), libm::sinf(ang));
+            let (lo, hi) = (h * hd + i, h * hd + i + half);
+            let mut part = 0;
+            while part < 2 {
+                let src = t * 3 * width + part * width;
+                let (a, b) = unsafe { (lin(qkv, bias, src + lo, part * width + lo), lin(qkv, bias, src + hi, part * width + hi)) };
+                let dst = unsafe { (if part == 0 { q } else { k }).add((h * n + t) * hd + i) };
+                unsafe {
+                    *dst = f32_to_bf16_rne(a * c - b * s);
+                    *dst.add(half) = f32_to_bf16_rne(b * c + a * s);
+                }
+                part += 1;
+            }
+            let src = t * 3 * width + 2 * width;
+            unsafe {
+                *vt.add((h * hd + i) * n + t) = f32_to_bf16_rne(lin(qkv, bias, src + lo, 2 * width + lo));
+                *vt.add((h * hd + i + half) * n + t) = f32_to_bf16_rne(lin(qkv, bias, src + hi, 2 * width + hi));
+            }
+            i += thread::blockDim_x() as usize;
+        }
+    }
+
+    /// `out[r, :] = softmax(s[r, :] * scale)` over rows of `n`. grid = (rows), block = (256).
+    #[kernel]
+    pub unsafe fn vis_softmax(s: *const f32, out: *mut u16, n: u32, scale: f32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let (n, step, tid) = (n as usize, thread::blockDim_x() as usize, thread::threadIdx_x() as usize);
+        let row = thread::blockIdx_x() as usize * n;
+        let mut mx = f32::NEG_INFINITY;
+        let mut i = tid;
+        while i < n {
+            mx = mx.max(unsafe { *s.add(row + i) });
+            i += step;
+        }
+        let mx = unsafe { block_max(mx, red) };
+        let mut sum = 0.0f32;
+        i = tid;
+        while i < n {
+            sum += libm::expf((unsafe { *s.add(row + i) } - mx) * scale);
+            i += step;
+        }
+        let inv = 1.0 / unsafe { block_sum(sum, red) };
+        i = tid;
+        while i < n {
+            unsafe { *out.add(row + i) = f32_to_bf16_rne(libm::expf((*s.add(row + i) - mx) * scale) * inv) };
+            i += step;
+        }
+    }
+
+    /// The end of a linear layer over rows of `cols`: `out = act(bf16(x + b))`, plus `res` if
+    /// `add` != 0. `act`: 0 none, 1 GELU in its tanh form, 2 GELU.
+    /// grid = (rows), block = (256).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn vis_affine(x: *const f32, b: *const u16, res: *const u16, out: *mut u16, cols: u32, act: u32, add: u32) {
+        let c = cols as usize;
+        let row = thread::blockIdx_x() as usize * c;
+        let mut i = thread::threadIdx_x() as usize;
+        while i < c {
+            let mut v = unsafe { lin(x, b, row + i, i) };
+            if act == 1 {
+                // tanh(z) = 1 - 2 / (exp(2z) + 1)
+                let z = 0.797_884_56 * (v + 0.044715 * v * v * v);
+                v = rb(v * (1.0 - 1.0 / (libm::expf(2.0 * z) + 1.0)));
+            } else if act == 2 {
+                // shortcut: erf by Abramowitz-Stegun 7.1.26 (error under 1.5e-7, below what bf16 holds).
+                let a = if v < 0.0 { -v } else { v } * core::f32::consts::FRAC_1_SQRT_2;
+                let t = 1.0 / (1.0 + 0.327_591_1 * a);
+                let poly = ((((1.061_405_4 * t - 1.453_152) * t + 1.421_413_8) * t - 0.284_496_74) * t + 0.254_829_6) * t;
+                let erf = 1.0 - poly * libm::expf(-a * a);
+                v = rb(0.5 * v * (1.0 + if v < 0.0 { -erf } else { erf }));
+            }
+            if add != 0 {
+                v += bf16_to_f32(unsafe { *res.add(row + i) });
+            }
+            unsafe { *out.add(row + i) = f32_to_bf16_rne(v) };
             i += thread::blockDim_x() as usize;
         }
     }

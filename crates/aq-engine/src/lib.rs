@@ -8,4 +8,5 @@ mod experts;
 pub mod gpu;
 pub mod model;
 mod ngram;
+pub mod vision;
 pub mod weights;
