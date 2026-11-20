@@ -699,7 +699,7 @@ impl Model {
             Ok(other) if !other.is_empty() => anyhow::bail!("AQ_QUANT={other}: expected fp8 or int8"),
             _ => Fmt::Bf16,
         };
-        anyhow::ensure!(quant == Fmt::Bf16 || !cfg.moe(), "AQ_QUANT does not cover mixture-of-experts models yet");
+        anyhow::ensure!(quant != Fmt::Fp8 || !cfg.moe(), "AQ_QUANT=fp8 does not cover mixture-of-experts models");
         let set = std::env::var("AQ_QUANT_SET").unwrap_or_else(|_| "goqaud".into());
         let q = |c: char| if set.contains(c) { quant } else { Fmt::Bf16 };
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
@@ -890,7 +890,7 @@ impl Model {
         gpu.flush_uploads()?;
         let mut lm_head = small_head.unwrap_or(Weight::bf16(head_table));
         if layers.iter().any(|l| l.gate_up.fmt == Fmt::Int4 || l.ex_gate_up.fmt == Fmt::Int4) {
-            anyhow::ensure!(quant == Fmt::Bf16, "AQ_QUANT does not apply to a pre-quantized checkpoint");
+            anyhow::ensure!(quant != Fmt::Fp8, "AQ_QUANT=fp8 does not apply to a pre-quantized checkpoint");
             gpu.enable_int8(inter.max(h).max(cfg.value_dim()).max(cfg.num_attention_heads * cfg.head_dim))?;
             anyhow::ensure!(mtp.as_ref().is_none_or(|m| m.short_n > 0), "the embedding table is in host memory: the draft head needs its shortlist (AQ_MTP_SHORT)");
             eprintln!("4-bit weights from the checkpoint (one scale per 128), 8-bit head, embedding table in host memory: not exact");

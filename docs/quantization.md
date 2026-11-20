@@ -13,7 +13,9 @@ token against transformers. Everything on this page is opt-in and not exact.
 
 Quality is measured teacher-forced against transformers on three turns of recorded agent
 traces (8k, 16k and 26k prompt tokens, 256 positions each) with the 9B; bf16's own figure is
-the noise floor of that comparison. The quantized tiers apply to dense models only.
+the noise floor of that comparison. `fp8` applies to dense models only; `int8` also takes
+the weights of a mixture-of-experts model outside its experts, alone or next to 4-bit
+experts (for Qwen3.8-Flash-Next, 2.3 GiB less on the device at the same quality).
 
 ## `fp8`
 
