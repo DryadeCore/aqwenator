@@ -306,7 +306,7 @@ pub struct Model {
     last_logits: u64,
     pub use_graphs: bool,
     /// AQ_MOE_ROUTES=<file> (debug): every forward appends, per mixture-of-experts layer,
-    /// `[layer u32][tokens u32]` then each token's 8 experts, one per byte.
+    /// `[layer u32][tokens u32][experts per token u32]` then each token's experts as u16.
     routes: Option<std::fs::File>,
     experts: ExpertPool,
     /// Prefill work lists of the step being run (set by `upload`).
@@ -363,6 +363,7 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
     let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
     let t = lim.max_rows();
     let mt = if cfg.moe() { t } else { 0 };
+    let ek = cfg.num_experts_per_tok;
     let sq = lim.max_seqs;
     let hvd = cfg.linear_num_value_heads * 128;
     let hq = cfg.num_attention_heads;
@@ -416,13 +417,13 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         conv: gpu.alloc(t * cfg.conv_dim() * 2)?,
         mix: gpu.alloc(t * mixw * 2)?,
         delta: gpu.alloc(t * hd * 2)?,
-        moe_logits: gpu.alloc(mt * MOE_ROUTER_LD * 2)?,
-        moe_idx: gpu.alloc(mt * 8)?,
-        moe_w: gpu.alloc(mt * 8 * 4)?,
-        moe_list: gpu.alloc(mt * 8 * 4)?,
-        moe_jobs: gpu.alloc(if mt > 0 { moe_max_jobs(mt) * 8 } else { 0 })?,
-        moe_act: gpu.alloc(mt * 8 * cfg.moe_intermediate_size * 2)?,
-        moe_out: gpu.alloc(mt * 9 * hd * 2)?,
+        moe_logits: gpu.alloc(mt * moe_router_ld(cfg) * 2)?,
+        moe_idx: gpu.alloc(mt * 32)?,
+        moe_w: gpu.alloc(mt * ek * 4)?,
+        moe_list: gpu.alloc(mt * ek * 4)?,
+        moe_jobs: gpu.alloc(if mt > 0 { moe_max_jobs(mt, cfg) * 8 } else { 0 })?,
+        moe_act: gpu.alloc(mt * ek * cfg.moe_intermediate_size * 2)?,
+        moe_out: gpu.alloc(mt * (ek + 1) * hd * 2)?,
         q: gpu.alloc(t * cfg.num_attention_heads * cfg.head_dim * 2)?,
         logits: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * cfg.vocab_size * 2)?,
         tok: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
@@ -453,14 +454,16 @@ const KV8_ROW: usize = 272;
 /// Padded batch sizes that get a captured decode graph.
 const DECODE_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512];
 
-/// Row stride of the router logits: 256 experts, the shared expert's gate, padding.
-const MOE_ROUTER_LD: usize = 264;
+/// Row stride of the router logits: the experts, the shared expert's gate, padding.
+fn moe_router_ld(cfg: &TextConfig) -> usize {
+    (cfg.num_experts + 1).next_multiple_of(8)
+}
 /// Shared memory of a `moe_gemm` block.
 const MOE_GEMM_SMEM: u32 = 3 * (27648 + 4608) + 256;
 
 /// Most jobs `moe_bucket` can produce for `t` tokens: full ones and a partial one per expert.
-fn moe_max_jobs(t: usize) -> usize {
-    (8 * t).div_ceil(64) + 256
+fn moe_max_jobs(t: usize, cfg: &TextConfig) -> usize {
+    (cfg.num_experts_per_tok * t).div_ceil(64) + cfg.num_experts
 }
 
 /// The MLP weights of layer `n(..)`: gate/up and down (the shared expert's in a mixture of
@@ -534,13 +537,13 @@ impl ExpertPool {
         Ok((self.used - ne) as u32)
     }
 
-    /// Bring the experts a layer's tokens selected (`idx`, one per byte; the layer's first
-    /// record is `base`) onto the device over the least recently used ones, and queue the
+    /// Bring the experts a layer's tokens selected (`idx`, 0xffff where unused; the layer's
+    /// first record is `base`) onto the device over the least recently used ones, and queue the
     /// layer's slot table. Nothing queued may still read the pool.
-    fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u64], table: u64) -> Result<()> {
+    fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64) -> Result<()> {
         self.tick += 1;
         let mut miss = Vec::new();
-        for id in idx.iter().flat_map(|v| v.to_le_bytes()).map(|e| (base + e as u32) as usize) {
+        for id in idx.iter().filter(|&&e| e != 0xffff).map(|&e| (base + e as u32) as usize) {
             match self.slot[id] {
                 NO_SLOT => {
                     self.slot[id] = NO_SLOT - 1;
@@ -616,7 +619,7 @@ fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, pool: &mut Expe
         return Ok(m);
     }
     let (ne, ei) = (cfg.num_experts, cfg.moe_intermediate_size);
-    m.router = concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (MOE_ROUTER_LD - 257) * h * 2)?;
+    m.router = concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (moe_router_ld(cfg) - ne - 1) * h * 2)?;
     let slots: Vec<u32> = if ck.has(&n("mlp.experts.gate_up_proj.q4")) {
         let at = |i: usize| pool.p + pool.off[i] as u64;
         m.ex_gate_up = Weight { p: at(0), scale: at(1), fmt: Fmt::Int4 };
@@ -1196,7 +1199,7 @@ impl Model {
                 ],
             };
             let mlp = [(2 * c.intermediate_size, c.hidden_size, s.h, s.proj, l.gate_up), (c.hidden_size, c.intermediate_size, s.mix, s.delta, l.down)];
-            let router = (l.router != 0).then_some((MOE_ROUTER_LD, c.hidden_size, s.h, s.moe_logits, Weight::bf16(l.router)));
+            let router = (l.router != 0).then_some((moe_router_ld(&c), c.hidden_size, s.h, s.moe_logits, Weight::bf16(l.router)));
             for (n, k, x, y, wt) in w.into_iter().chain(mlp).chain(router) {
                 if seen.insert((n, k)) {
                     shapes.push((n, k, x, y));
@@ -2312,7 +2315,7 @@ impl Model {
             let moe = l.router != 0;
             let inter = c.intermediate_size;
             // The shared expert of a mixture is the dense MLP, written after the experts' rows.
-            let mlp_out = if moe { s.moe_out + (8 * t * c.hidden_size * 2) as u64 } else { s.delta };
+            let mlp_out = if moe { s.moe_out + (c.num_experts_per_tok * t * c.hidden_size * 2) as u64 } else { s.delta };
             g.gemm(t, cap, 2 * inter, c.hidden_size, s.h, l.gate_up, s.proj, CUDA_R_16BF)?;
             mark!("gemm_gate_up");
             let nvec = (t * inter / 8) as u32;
@@ -2325,39 +2328,42 @@ impl Model {
             mark!("gemm_down");
             if moe {
                 let ei = c.moe_intermediate_size as u32;
-                let jobs = moe_max_jobs(t) as u32;
-                let (tu, ld) = (t as u32, MOE_ROUTER_LD as u32);
-                g.gemm(t, cap, MOE_ROUTER_LD, c.hidden_size, s.h, Weight::bf16(l.router), s.moe_logits, CUDA_R_16BF)?;
+                let jobs = moe_max_jobs(t, &c) as u32;
+                let (tu, ld) = (t as u32, moe_router_ld(&c) as u32);
+                let (ne, ek) = (c.num_experts as u32, c.num_experts_per_tok as u32);
+                g.gemm(t, cap, ld as usize, c.hidden_size, s.h, Weight::bf16(l.router), s.moe_logits, CUDA_R_16BF)?;
                 mark!("gemm_router");
                 unsafe {
-                    g.k.moe_route(&st, cfg((tu.div_ceil(8), 1, 1), 256), s.moe_logits as *const u16, ld, s.moe_idx as *mut u64, s.moe_w as *mut f32, tu).map_err(de)?;
-                    g.k.moe_bucket(&st, cfg((1, 1, 1), 256), s.moe_idx as *const u64, tu, s.moe_list as *mut u32, s.moe_jobs as *mut u32, jobs).map_err(de)?;
+                    g.k.moe_route(&st, cfg((tu.div_ceil(8), 1, 1), 256), s.moe_logits as *const u16, ld, s.moe_idx as *mut u16, s.moe_w as *mut f32, tu, ne, ek).map_err(de)?;
+                    g.k.moe_bucket(&st, cfg((1, 1, 1), ne), s.moe_idx as *const u64, tu, s.moe_list as *mut u32, s.moe_jobs as *mut u32, jobs, ne, ek).map_err(de)?;
                 }
                 mark!("moe_route");
                 let paged = self.experts.host != 0 && l.ex_gate_up.fmt == Fmt::Int4;
-                let idx: Vec<u64> = if paged || self.routes.is_some() { g.download(s.moe_idx, t)? } else { Vec::new() };
+                // Each token's selections, then 0xffff up to 16.
+                let idx: Vec<u16> = if paged || self.routes.is_some() { g.download(s.moe_idx, t * 16)? } else { Vec::new() };
                 if paged {
                     self.experts.page(g, l.ex_base, c.num_experts, &idx, l.ex_slots)?;
                     mark!("moe_page");
                 }
                 if let Some(f) = self.routes.as_mut() {
                     use std::io::Write;
-                    let head = [li as u32, tu].into_iter().flat_map(u32::to_le_bytes);
-                    f.write_all(&head.chain(idx.into_iter().flat_map(u64::to_le_bytes)).collect::<Vec<u8>>())?;
+                    let head = [li as u32, tu, ek].into_iter().flat_map(u32::to_le_bytes);
+                    let picks = idx.chunks(16).flat_map(|c| &c[..ek as usize]).flat_map(|e| e.to_le_bytes());
+                    f.write_all(&head.chain(picks).collect::<Vec<u8>>())?;
                 }
                 let (list, jl) = (s.moe_list as *const u32, s.moe_jobs as *const u32);
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[0])
+                    g.k.moe_gemm(&st, cfg_smem((ei / 64, jobs, 1), 256, MOE_GEMM_SMEM), s.h as *const u16, hd, l.ex_gate_up.p as *const u16, s.moe_act as *mut u16, list, jl, 2 * ei, hd, 1, l.ex_gate_up.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[0], ek)
                         .map_err(de)?;
                 }
                 mark!("moe_gate_up");
                 unsafe {
-                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down.p as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, 0, l.ex_down.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[1])
+                    g.k.moe_gemm(&st, cfg_smem((hd / 128, jobs, 1), 256, MOE_GEMM_SMEM), s.moe_act as *const u16, ei, l.ex_down.p as *const u16, s.moe_out as *mut u16, list, jl, hd, ei, 0, l.ex_down.scale as *const f32, l.ex_slots as *const u32, l.ex_stride[1], ek)
                         .map_err(de)?;
                 }
                 mark!("moe_down");
                 unsafe {
-                    g.k.moe_combine(&st, cfg((tu, 1, 1), 256), s.moe_out as *const u16, s.moe_w as *const f32, s.moe_logits as *const u16, ld, s.delta as *mut u16, hd, tu).map_err(de)?;
+                    g.k.moe_combine(&st, cfg((tu, 1, 1), 256), s.moe_out as *const u16, s.moe_w as *const f32, s.moe_logits as *const u16, ld, s.delta as *mut u16, hd, tu, ne, ek).map_err(de)?;
                 }
                 mark!("moe_combine");
             }

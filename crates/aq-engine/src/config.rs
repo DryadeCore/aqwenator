@@ -89,8 +89,8 @@ impl TextConfig {
         if self.hidden_size % 8 != 0 || self.hidden_size > 8192 || self.intermediate_size % 8 != 0 || self.vocab_size % 8 != 0 {
             bail!("vectorized kernels need hidden/intermediate/vocab multiples of 8 and hidden <= 8192");
         }
-        if self.moe() && (self.num_experts != 256 || self.num_experts_per_tok != 8 || self.moe_intermediate_size % 64 != 0 || self.shared_expert_intermediate_size != self.moe_intermediate_size || self.hidden_size % 128 != 0) {
-            bail!("expert kernels assume 256 experts, 8 per token, an expert width that is a multiple of 64 and also the shared expert's, and a hidden size that is a multiple of 128");
+        if self.moe() && (self.num_experts % 32 != 0 || self.num_experts > 512 || self.num_experts_per_tok > 16 || self.moe_intermediate_size % 64 != 0 || self.shared_expert_intermediate_size != self.moe_intermediate_size || self.hidden_size % 128 != 0) {
+            bail!("expert kernels assume at most 512 experts in multiples of 32, at most 16 per token, an expert width that is a multiple of 64 and also the shared expert's, and a hidden size that is a multiple of 128");
         }
         if self.intermediate_size == 0 {
             bail!("config has no MLP width");

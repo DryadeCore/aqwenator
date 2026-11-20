@@ -969,117 +969,144 @@ pub mod kernels {
         unsafe { *out.cast::<U32x4>().add(idx) = U32x4::new(packed) };
     }
 
-    /// Mixture-of-experts routing for one token per warp: softmax over the 256 router logits
-    /// (f32), the 8 largest, renormalized to sum to one and rounded to bf16 as the reference
-    /// does. The 8 are written in ascending expert order, the order the reference adds the
-    /// experts' outputs in: `idx[token]` holds them one per byte, lowest first.
-    /// grid = (ceil(T / 8)), block = (256).
+    /// Mixture-of-experts routing for one token per warp: softmax over the `ne` router logits
+    /// (f32), the `topk` largest, renormalized to sum to one and rounded to bf16 as the
+    /// reference does. They are written in ascending expert order, the order the reference
+    /// adds the experts' outputs in: `idx[token]` is 16 u16, the selections lowest first then
+    /// 0xffff, and `wout[token * topk + s]` their weights.
+    /// Requires ne % 32 == 0, ne <= 512 and topk <= 16. grid = (ceil(T / 8)), block = (256).
     #[kernel]
-    pub unsafe fn moe_route(logits: *const u16, ldl: u32, idx: *mut u64, wout: *mut f32, n_tokens: u32) {
+    pub unsafe fn moe_route(logits: *const u16, ldl: u32, idx: *mut u16, wout: *mut f32, n_tokens: u32, ne: u32, topk: u32) {
         let tid = thread::threadIdx_x() as usize;
         let lane = tid % 32;
         let tok = thread::blockIdx_x() as usize * 8 + tid / 32;
         if tok >= n_tokens as usize {
             return;
         }
-        let mut v = [0.0f32; 8];
+        let (per, k) = (ne as usize / 32, topk as usize);
+        let mut v = [f32::NEG_INFINITY; 16];
         let mut mx = f32::NEG_INFINITY;
         #[unroll]
-        for i in 0..8 {
-            v[i] = unsafe { ld(logits, tok * ldl as usize + lane * 8 + i) };
-            mx = mx.max(v[i]);
+        for i in 0..16 {
+            if i < per {
+                v[i] = unsafe { ld(logits, tok * ldl as usize + lane * per + i) };
+                mx = mx.max(v[i]);
+            }
         }
         let mx = warp_max(mx);
         let mut sum = 0.0f32;
         #[unroll]
-        for i in 0..8 {
-            sum += libm::expf(v[i] - mx);
+        for i in 0..16 {
+            if i < per {
+                sum += libm::expf(v[i] - mx);
+            }
         }
         let sum = warp_sum(sum);
-        let mut se = [0u32; 8];
-        let mut sp = [0.0f32; 8];
+        let mut se = [0u32; 16];
+        let mut sp = [0.0f32; 16];
         #[unroll]
-        for r in 0..8 {
-            let mut bv = f32::NEG_INFINITY;
-            let mut bi = 0usize;
-            #[unroll]
-            for i in 0..8 {
-                if v[i] > bv {
-                    bv = v[i];
-                    bi = i;
-                }
-            }
-            let top = warp_max(bv);
-            // The lowest expert index holding the maximum (indices are exact in f32).
-            let cand = if bv == top { (lane * 8 + bi) as f32 } else { 1.0e9 };
-            let e = -warp_max(-cand);
-            if cand == e {
+        for r in 0..16 {
+            if r < k {
+                let mut bv = f32::NEG_INFINITY;
+                let mut bi = 0usize;
                 #[unroll]
-                for i in 0..8 {
-                    if i == bi {
-                        v[i] = f32::NEG_INFINITY;
+                for i in 0..16 {
+                    if v[i] > bv {
+                        bv = v[i];
+                        bi = i;
                     }
                 }
+                let top = warp_max(bv);
+                // The lowest expert index holding the maximum (indices are exact in f32).
+                let cand = if bv == top { (lane * per + bi) as f32 } else { 1.0e9 };
+                let e = -warp_max(-cand);
+                if cand == e {
+                    #[unroll]
+                    for i in 0..16 {
+                        if i == bi {
+                            v[i] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                se[r] = e as u32;
+                sp[r] = libm::expf(top - mx) / sum;
             }
-            se[r] = e as u32;
-            sp[r] = libm::expf(top - mx) / sum;
         }
         if lane != 0 {
             return;
         }
         let mut tot = 0.0f32;
         #[unroll]
-        for r in 0..8 {
-            tot += sp[r];
-        }
-        // Rank of each selection by expert index: where it goes in the output.
-        let mut packed = 0u64;
-        #[unroll]
-        for r in 0..8 {
-            let mut rank = 0usize;
-            #[unroll]
-            for o in 0..8 {
-                if se[o] < se[r] {
-                    rank += 1;
-                }
+        for r in 0..16 {
+            if r < k {
+                tot += sp[r];
             }
-            packed |= (se[r] as u64) << (8 * rank);
-            unsafe { *wout.add(tok * 8 + rank) = rb(sp[r] / tot) };
         }
-        unsafe { *idx.add(tok) = packed };
+        #[unroll]
+        for r in 0..16 {
+            if r < k {
+                // Rank of the selection by expert index: where it goes in the output.
+                let mut rank = 0usize;
+                #[unroll]
+                for o in 0..16 {
+                    if o < k && se[o] < se[r] {
+                        rank += 1;
+                    }
+                }
+                unsafe {
+                    *idx.add(tok * 16 + rank) = se[r] as u16;
+                    *wout.add(tok * k + rank) = rb(sp[r] / tot);
+                }
+            } else {
+                unsafe { *idx.add(tok * 16 + r) = 0xffff };
+            }
+        }
     }
 
-    /// Group the rows of a step's expert GEMMs by expert. Row `token * 8 + selection` is that
-    /// token through its `selection`-th expert. `list` receives the rows expert after expert, and
-    /// `jobs` one entry per up to 64 rows of one expert: `[offset into list, expert | rows << 16]`.
-    /// Entries past the last job get zero rows. Thread `e` scans every token's 8 bytes for
-    /// expert `e` (at most one match).
-    /// grid = (1), block = (256). `max_jobs` >= ceil(8 * T / 64) + 256.
+    /// Group the rows of a step's expert GEMMs by expert. Row `token * topk + selection` is
+    /// that token through its `selection`-th expert. `list` receives the rows expert after
+    /// expert, and `jobs` one entry per up to 64 rows of one expert:
+    /// `[offset into list, expert | rows << 16]`. Entries past the last job get zero rows.
+    /// Thread `e` scans every token's selections (`moe_route`'s `idx`) for expert `e` (at most
+    /// one match).
+    /// grid = (1), block = (ne), ne <= 512. `max_jobs` >= ceil(topk * T / 64) + ne.
     #[kernel]
-    pub unsafe fn moe_bucket(idx: *const u64, n_tokens: u32, list: *mut u32, jobs: *mut u32, max_jobs: u32) {
-        static mut CNT: SharedArray<u32, 256> = SharedArray::UNINIT;
-        const LO: u64 = 0x0101_0101_0101_0101;
+    pub unsafe fn moe_bucket(idx: *const u64, n_tokens: u32, list: *mut u32, jobs: *mut u32, max_jobs: u32, ne: u32, topk: u32) {
+        static mut CNT: SharedArray<u32, 512> = SharedArray::UNINIT;
+        const LO: u64 = 0x0001_0001_0001_0001;
         let cnt = (&raw mut CNT).cast::<u32>();
         let tid = thread::threadIdx_x();
         let e = tid as usize;
         let n = n_tokens as usize;
+        let words = (topk as usize).div_ceil(4);
         let jr = 64u32;
-        // Bit 7 of the lowest byte of `idx[tok]` equal to `e` (bytes above it may be set too).
-        let hit = |tok: usize| {
-            let x = unsafe { *idx.add(tok) } ^ (e as u64 * LO);
-            x.wrapping_sub(LO) & !x & (LO << 7)
+        // 1 + the selection of `tok` that is expert `e`, or 0. Bit 15 of the lowest u16 of a
+        // word equal to `e` is set in `z` (bits above it may be set too).
+        let find = |tok: usize| {
+            let mut sel = 0u32;
+            let mut w = 0;
+            while w < words {
+                let x = unsafe { *idx.add(tok * 4 + w) } ^ (e as u64 * LO);
+                let z = x.wrapping_sub(LO) & !x & (LO << 15);
+                if z != 0 {
+                    // Bits below the lowest set one: 15 + 16 * (position in the word).
+                    sel = 1 + 4 * w as u32 + (((z & z.wrapping_neg()) - 1).count_ones() >> 4);
+                }
+                w += 1;
+            }
+            sel
         };
         let mut c = 0u32;
         let mut p = 0;
         while p < n {
-            c += (hit(p) != 0) as u32;
+            c += (find(p) != 0) as u32;
             p += 1;
         }
         unsafe { *cnt.add(e) = c };
         thread::sync_threads();
         let (mut off, mut joff, mut total) = (0u32, 0u32, 0u32);
         let mut o = 0;
-        while o < 256 {
+        while o < ne as usize {
             let co = unsafe { *cnt.add(o) };
             if o < e {
                 off += co;
@@ -1091,11 +1118,9 @@ pub mod kernels {
         let mut j = 0u32;
         let mut p = 0;
         while p < n {
-            let z = hit(p);
-            if z != 0 {
-                // Bits below the lowest set one: 7 + 8 * (byte position).
-                let k = ((z & z.wrapping_neg()) - 1).count_ones() >> 3;
-                unsafe { *list.add((off + j) as usize) = p as u32 * 8 + k };
+            let sel = find(p);
+            if sel != 0 {
+                unsafe { *list.add((off + j) as usize) = p as u32 * topk + sel - 1 };
                 j += 1;
             }
             p += 1;
@@ -1112,7 +1137,7 @@ pub mod kernels {
         let mut i = total + tid;
         while i < max_jobs {
             unsafe { *jobs.add(2 * i as usize + 1) = 0 };
-            i += 256;
+            i += ne;
         }
     }
 
@@ -1123,7 +1148,7 @@ pub mod kernels {
     /// holding 64 columns of K for 128 weight rows and the job's (up to 64) gathered rows.
     ///
     /// `fused` != 0, the gate/up product (`n = 2 * inter`): the input row of list entry `p` is
-    /// its token's row of `x`, a block owns 64 of the `inter` outputs (each warp 8 gate rows
+    /// its token's row of `x` (`p / topk`), a block owns 64 of the `inter` outputs (each warp 8 gate rows
     /// and the 8 up rows that go with them), and writes
     /// `y[p, i] = bf16(silu(gate_i)) * up_i` with gate and up rounded to bf16 first, as the
     /// reference does. grid = (inter / 64, max_jobs).
@@ -1133,7 +1158,7 @@ pub mod kernels {
     /// Requires n % 128 == 0 and k % 64 == 0.
     /// block = (256), dynamic shared memory = 3 * (27648 + 4608) + 256 bytes.
     #[kernel]
-    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32, slots: *const u32, stride: u32) {
+    pub unsafe fn moe_gemm(x: *const u16, ldx: u32, w: *const u16, y: *mut u16, list: *const u32, jobs: *const u32, n: u32, k: u32, fused: u32, scale: *const f32, slots: *const u32, stride: u32, topk: u32) {
         use cuda_device::async_copy::{cp_async_ca_4, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
         const S: usize = 3;
         const LD: usize = 72;
@@ -1199,7 +1224,7 @@ pub mod kernels {
                     let dst = xs.add(r * LD + cc * 8) as *mut u32;
                     if r < mc {
                         let p = *rid.add(r) as usize;
-                        let row = if fused { p / 8 } else { p };
+                        let row = if fused { p / topk as usize } else { p };
                         cp_async_cg_16(dst, x.add(row * ldx + kc + cc * 8) as *const u32);
                     } else {
                         cp_async_cg_zfill_16(dst, x as *const u8, 0);
@@ -1289,35 +1314,40 @@ pub mod kernels {
         }
     }
 
-    /// Mixture-of-experts output of one token: the 8 expert outputs (rows `token * 8 + s` of
-    /// `po`) scaled by their routing weights and added in order, then the shared expert's (row
-    /// `8 * T + token`) scaled by the sigmoid of its gate (column 256 of the router logits),
-    /// rounding to bf16 wherever the reference does.
-    /// Requires hidden % 8 == 0. grid = (T), block = (256).
+    /// Mixture-of-experts output of one token: the `topk` expert outputs (rows
+    /// `token * topk + s` of `po`) scaled by their routing weights and added in order, then the
+    /// shared expert's (row `topk * T + token`) scaled by the sigmoid of its gate (column `ne`
+    /// of the router logits), rounding to bf16 wherever the reference does.
+    /// Requires hidden % 8 == 0 and topk <= 16. grid = (T), block = (256).
     #[kernel]
-    pub unsafe fn moe_combine(po: *const u16, rw: *const f32, logits: *const u16, ldl: u32, out: *mut u16, hidden: u32, n_tokens: u32) {
+    pub unsafe fn moe_combine(po: *const u16, rw: *const f32, logits: *const u16, ldl: u32, out: *mut u16, hidden: u32, n_tokens: u32, ne: u32, topk: u32) {
         let nv = hidden as usize / 8;
+        let k = topk as usize;
         let tok = thread::blockIdx_x() as usize;
-        let gate = rb(sigmoid(unsafe { ld(logits, tok * ldl as usize + 256) }));
-        let mut wk = [0.0f32; 8];
+        let gate = rb(sigmoid(unsafe { ld(logits, tok * ldl as usize + ne as usize) }));
+        let mut wk = [0.0f32; 16];
         #[unroll]
-        for s in 0..8 {
-            wk[s] = unsafe { *rw.add(tok * 8 + s) };
+        for s in 0..16 {
+            if s < k {
+                wk[s] = unsafe { *rw.add(tok * k + s) };
+            }
         }
         let mut v = thread::threadIdx_x() as usize;
         while v < nv {
             let mut acc = [0.0f32; 8];
             #[unroll]
-            for s in 0..8 {
-                let pv = unsafe { *po.cast::<U32x4>().add((tok * 8 + s) * nv + v) }.to_array();
-                #[unroll]
-                for e in 0..4 {
-                    let (a0, a1) = cvt_f32x2_bf16x2(pv[e]);
-                    acc[2 * e] = rb(acc[2 * e] + rb(a0 * wk[s]));
-                    acc[2 * e + 1] = rb(acc[2 * e + 1] + rb(a1 * wk[s]));
+            for s in 0..16 {
+                if s < k {
+                    let pv = unsafe { *po.cast::<U32x4>().add((tok * k + s) * nv + v) }.to_array();
+                    #[unroll]
+                    for e in 0..4 {
+                        let (a0, a1) = cvt_f32x2_bf16x2(pv[e]);
+                        acc[2 * e] = rb(acc[2 * e] + rb(a0 * wk[s]));
+                        acc[2 * e + 1] = rb(acc[2 * e + 1] + rb(a1 * wk[s]));
+                    }
                 }
             }
-            let sv = unsafe { *po.cast::<U32x4>().add((8 * n_tokens as usize + tok) * nv + v) }.to_array();
+            let sv = unsafe { *po.cast::<U32x4>().add((k * n_tokens as usize + tok) * nv + v) }.to_array();
             let mut packed = [0u32; 4];
             #[unroll]
             for e in 0..4 {
