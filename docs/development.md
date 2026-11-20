@@ -63,6 +63,7 @@ Environment:
 | `AQ_BG_PREFILL=N` | Background prefill lane |
 | `AQ_PROFILE=1\|decode\|prefill` | Per-operation GPU time, printed periodically |
 | `AQ_TRACE=1` | Step and request logs |
+| `AQ_LAYERS=N` | Load the first N layers only; `aq-check` then prints each layer's error against the reference and stops |
 | `AQ_KINFO=1` | Registers and shared memory of every kernel |
 | `AQ_DEVICE_GB=N`, `AQ_SMEM_KB=N` | Refuse to allocate past N GiB, and to use more than N KB of shared memory per block: sizes a configuration for a smaller card |
 

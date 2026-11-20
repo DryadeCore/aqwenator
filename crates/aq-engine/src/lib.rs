@@ -7,4 +7,5 @@ pub mod engine;
 mod experts;
 pub mod gpu;
 pub mod model;
+mod ngram;
 pub mod weights;

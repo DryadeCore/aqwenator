@@ -47,6 +47,26 @@ pub struct TextConfig {
     pub output_gate_type: Option<String>,
     #[serde(default)]
     pub tie_word_embeddings: Option<bool>,
+    /// Residual streams (`qwen4_exp`: each block reads a gated mix of them and writes to all).
+    #[serde(default = "one_stream")]
+    pub hc_count: usize,
+    /// Rank of the gate that mixes the streams.
+    #[serde(default)]
+    pub hc_lowrank: usize,
+    /// Layers (counted from 1) that add an n-gram embedding to the streams, the longest
+    /// n-gram, and the table heads per n-gram size.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ngram_size: usize,
+    #[serde(default)]
+    pub heads_per_ngram: usize,
+    #[serde(default)]
+    eos_token_id: Option<serde_json::Value>,
+}
+
+fn one_stream() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +91,11 @@ impl TextConfig {
         if c.moe() {
             c.intermediate_size = c.shared_expert_intermediate_size;
         }
+        // AQ_LAYERS=N (debug): keep the first N layers, to bring a model up layer by layer.
+        if let Some(n) = std::env::var("AQ_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n < c.num_hidden_layers) {
+            c.num_hidden_layers = n;
+            c.layer_types.truncate(n);
+        }
         c.validate()?;
         Ok(c)
     }
@@ -79,9 +104,8 @@ impl TextConfig {
         if self.head_dim != 256 {
             bail!("attention kernel assumes head_dim 256, got {}", self.head_dim);
         }
-        let group = self.num_attention_heads / self.num_key_value_heads.max(1);
-        if self.num_attention_heads % self.num_key_value_heads.max(1) != 0 || 8 % group != 0 {
-            bail!("decode attention kernel needs a GQA group of 1, 2, 4 or 8 query heads per KV head");
+        if self.num_attention_heads % self.num_key_value_heads.max(1) != 0 {
+            bail!("query heads must be a multiple of KV heads");
         }
         if self.linear_key_head_dim != 128 || self.linear_value_head_dim != 128 {
             bail!("gated delta rule kernel assumes 128x128 heads");
@@ -101,6 +125,12 @@ impl TextConfig {
         if self.layer_types.len() != self.num_hidden_layers {
             bail!("layer_types length mismatch");
         }
+        if self.ple_layer_ids.len() > 1 || (!self.ple_layer_ids.is_empty() && self.hc_count < 2) {
+            bail!("at most one n-gram embedding layer, in a model with several residual streams");
+        }
+        if self.hc_count == 0 || self.hc_count > 8 || (self.hc_count > 1 && self.hc_lowrank == 0) {
+            bail!("gated residual kernels take 1 to 8 streams");
+        }
         Ok(())
     }
 
@@ -109,6 +139,12 @@ impl TextConfig {
             "full_attention" => LayerKind::Full,
             _ => LayerKind::Linear,
         }
+    }
+
+    /// End-of-sequence token (the first one if the config lists several).
+    pub fn eos(&self) -> u32 {
+        let v = self.eos_token_id.as_ref();
+        v.and_then(|v| v.as_u64().or_else(|| v.get(0)?.as_u64())).unwrap_or(0) as u32
     }
 
     /// Mixture-of-experts MLPs (`qwen3_5_moe`).

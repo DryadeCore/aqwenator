@@ -6,6 +6,7 @@
 
 use crate::config::{LayerKind, TextConfig};
 use crate::experts::ExpertPool;
+use crate::ngram::Ngram;
 use crate::cublaslt::CUDA_R_16BF;
 use crate::gpu::{Fmt, Gpu, Prof, Weight, cfg, cfg_smem, de};
 use cuda_core::LaunchConfig;
@@ -17,10 +18,43 @@ use std::time::Instant;
 
 const P: &str = "model.language_model.";
 
+/// A gated residual: the streams' norm weights, the low-rank gate that mixes them into a
+/// block's input, and (0 for the final one) the weights that spread the block's output.
+#[derive(Clone, Copy, Default)]
+struct Hc {
+    norm: u64,
+    down: u64,
+    up: u64,
+    inject: u64,
+}
+
+/// The n-gram embedding one layer adds to the streams before its attention block.
+struct Ple {
+    layer: usize,
+    table: Ngram,
+    key: u64,
+    value: u64,
+    norm_key: u64,
+    norm_query: u64,
+    norm_conv: u64,
+    conv_w: u64,
+    /// Per state slot: the conv's 9 last inputs, and the two tokens before the sequence's
+    /// next one.
+    state: u64,
+    before: Vec<[u32; 2]>,
+    rows: Vec<u8>,
+}
+
+/// Row stride of a gated residual's injection logits (one per stream, padding).
+const HC_INJ_LD: usize = 16;
+
 pub struct Layer {
     pub kind: LayerKind,
     in_norm: u64,
     post_norm: u64,
+    // with several residual streams, in place of the two norms
+    hc_attn: Hc,
+    hc_mlp: Hc,
     // gated delta net
     gdn_proj: Weight,
     conv_w: u64,
@@ -101,6 +135,14 @@ pub struct Scratch {
     tables: u64,
     hfinal: u64,
     x: u64,
+    // gated residual: normed streams, gate (low rank, then per stream), injection logits and weights
+    xn: u64,
+    hc_a: u64,
+    hc_b: u64,
+    hc_c: u64,
+    inj: u64,
+    /// This step's n-gram embeddings.
+    ple_e: u64,
     h: u64,
     proj: u64,
     conv: u64,
@@ -311,6 +353,9 @@ pub struct Model {
     /// `[layer u32][tokens u32][experts per token u32]` then each token's experts as u16.
     routes: Option<std::fs::File>,
     experts: ExpertPool,
+    ple: Option<Ple>,
+    /// The gated residual that mixes the streams into the output head's input.
+    final_hc: Hc,
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
     cur_tiles: usize,
@@ -365,6 +410,8 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
     let mixw = cfg.value_dim().max(cfg.num_attention_heads * cfg.head_dim).max(cfg.intermediate_size);
     let t = lim.max_rows();
     let mt = if cfg.moe() { t } else { 0 };
+    // Residual streams, and the same or 0 for buffers only a gated residual needs.
+    let (hcn, hcx) = (cfg.hc_count, if cfg.hc_count > 1 { cfg.hc_count } else { 0 });
     let ek = cfg.num_experts_per_tok;
     let sq = lim.max_seqs;
     let hvd = cfg.linear_num_value_heads * 128;
@@ -413,7 +460,13 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         rows: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * 4)?,
         tables: gpu.alloc((sq + 1) * lim.max_blocks_per_seq() * 4)?,
         hfinal: gpu.alloc(sq * MAX_DECODE_ROWS_PER_SEQ * hd * 2)?,
-        x: gpu.alloc(t * hd * 2)?,
+        x: gpu.alloc(t * hd * hcn * 2)?,
+        xn: gpu.alloc(t * hd * hcx * 2)?,
+        hc_a: gpu.alloc(t * cfg.hc_lowrank * 2)?,
+        hc_b: gpu.alloc(t * hd * hcx * 2)?,
+        hc_c: gpu.alloc(t * HC_INJ_LD * (hcx > 0) as usize * 2)?,
+        inj: gpu.alloc(t * hcx * 4)?,
+        ple_e: gpu.alloc(if cfg.ple_layer_ids.is_empty() { 0 } else { t * hd * 2 })?,
         h: gpu.alloc(t * hd * 2)?,
         proj: gpu.alloc(t * wide * 2)?,
         conv: gpu.alloc(t * cfg.conv_dim() * 2)?,
@@ -481,6 +534,17 @@ struct Mlp {
     ex_slots: u64,
     ex_stride: [u32; 2],
     ex_base: u32,
+}
+
+fn load_hc(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, prefix: &str, inject: bool) -> Result<Hc> {
+    let w = |s: &str| format!("{prefix}.{s}.weight");
+    let pad = (HC_INJ_LD - cfg.hc_count) * cfg.hc_count * cfg.hidden_size * 2;
+    Ok(Hc {
+        norm: concat_bf16(gpu, ck, &[w("hc_norm")])?,
+        down: concat_bf16(gpu, ck, &[w("input_mix_weight_down")])?,
+        up: concat_bf16(gpu, ck, &[w("input_mix_weight_up")])?,
+        inject: if inject { concat_bf16_padded(gpu, ck, &[w("block_inject_weight")], pad)? } else { 0 },
+    })
 }
 
 fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, pool: &mut ExpertPool, n: &dyn Fn(&str) -> String, fmt: (Fmt, Fmt)) -> Result<Mlp> {
@@ -619,7 +683,10 @@ impl Model {
             let e = concat_bf16(&mut gpu, &ck, &[embed_name.clone()])?;
             (e, if tied { e } else { concat_bf16(&mut gpu, &ck, &["lm_head.weight".to_string()])? })
         };
-        let final_norm = concat_bf16(&mut gpu, &ck, &one("norm.weight"))?;
+        let hc = cfg.hc_count > 1;
+        anyhow::ensure!(!hc || small_tables, "a model with several residual streams needs a 4-bit checkpoint for now");
+        let final_norm = if hc { 0 } else { concat_bf16(&mut gpu, &ck, &one("norm.weight"))? };
+        let final_hc = if hc { load_hc(&mut gpu, &ck, &cfg, &format!("{P}hyper_connection_mixer"), false)? } else { Hc::default() };
         // AQ_QUANT (not exact) stores the layers' GEMM weights in 8 bits:
         //   fp8   E4M3 weights and activations;
         //   int8  int8 weights with a scale per 32 values, bf16 activations.
@@ -650,7 +717,7 @@ impl Model {
         let mut lim = limits;
         // The MTP draft head is used whenever the checkpoint has one (AQ_MTP=0 turns it off).
         // It adds one attention layer's KV to every page.
-        let want_mtp = std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ["", ".q4"].iter().any(|q| ck.has(&format!("mtp.layers.0.self_attn.q_proj.weight{q}")));
+        let want_mtp = !hc && std::env::var("AQ_MTP").as_deref() != Ok("0") && ck.has("mtp.fc.weight") && ["", ".q4"].iter().any(|q| ck.has(&format!("mtp.layers.0.self_attn.q_proj.weight{q}")));
         if lim.kv_budget_bytes > 0 {
             let n_full = (0..cfg.num_hidden_layers).filter(|&l| cfg.kind(l) == LayerKind::Full).count() + want_mtp as usize;
             let page_bytes = n_full * 2 * lim.block_size * cfg.num_key_value_heads * kv_row;
@@ -668,8 +735,10 @@ impl Model {
             let m = mlp_weights(&mut gpu, &ck, &cfg, &mut pool, &n, (q('u'), q('d')))?;
             let mut layer = Layer {
                 kind,
-                in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
-                post_norm: concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])?,
+                in_norm: if hc { 0 } else { concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])? },
+                post_norm: if hc { 0 } else { concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])? },
+                hc_attn: if hc { load_hc(&mut gpu, &ck, &cfg, &n("attn_hyper_connection"), true)? } else { Hc::default() },
+                hc_mlp: if hc { load_hc(&mut gpu, &ck, &cfg, &n("mlp_hyper_connection"), true)? } else { Hc::default() },
                 gdn_proj: Weight::default(),
                 conv_w: 0,
                 a_log: 0,
@@ -731,14 +800,36 @@ impl Model {
             }
             layers.push(layer);
         }
+        let ple = match cfg.ple_layer_ids.first().filter(|&&l| l <= cfg.num_hidden_layers) {
+            Some(&l) => {
+                let n = |s: &str| format!("{P}layers.{}.ple.{s}", l - 1);
+                let table = Ngram::open(&ck, &cfg, n("ple_embedding."))?;
+                Some(Ple {
+                    layer: l - 1,
+                    before: vec![table.start(); lim.max_seqs + 1],
+                    table,
+                    key: concat_bf16(&mut gpu, &ck, &[n("key_proj.weight")])?,
+                    value: concat_bf16(&mut gpu, &ck, &[n("value_proj.weight")])?,
+                    norm_key: concat_bf16(&mut gpu, &ck, &[n("norm_key.weight")])?,
+                    norm_query: concat_bf16(&mut gpu, &ck, &[n("norm_query.weight")])?,
+                    norm_conv: concat_bf16(&mut gpu, &ck, &[n("norm_conv.weight")])?,
+                    conv_w: concat_bf16(&mut gpu, &ck, &[n("conv1d.weight")])?,
+                    state: gpu.alloc((lim.max_seqs + 1) * 9 * cfg.hc_count * cfg.hidden_size * 2)?,
+                    rows: Vec::new(),
+                })
+            }
+            None => None,
+        };
         let mtp = if want_mtp {
             let n = |s: &str| format!("mtp.layers.0.{s}");
             let sa = |s: &str| n(&format!("self_attn.{s}"));
             let m = mlp_weights(&mut gpu, &ck, &cfg, &mut pool, &n, (Fmt::Bf16, Fmt::Bf16))?;
             let layer = Layer {
                 kind: LayerKind::Full,
-                in_norm: concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])?,
-                post_norm: concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])?,
+                in_norm: if hc { 0 } else { concat_bf16(&mut gpu, &ck, &[n("input_layernorm.weight")])? },
+                post_norm: if hc { 0 } else { concat_bf16(&mut gpu, &ck, &[n("post_attention_layernorm.weight")])? },
+                hc_attn: if hc { load_hc(&mut gpu, &ck, &cfg, &n("attn_hyper_connection"), true)? } else { Hc::default() },
+                hc_mlp: if hc { load_hc(&mut gpu, &ck, &cfg, &n("mlp_hyper_connection"), true)? } else { Hc::default() },
                 gdn_proj: Weight::default(),
                 conv_w: 0,
                 a_log: 0,
@@ -841,6 +932,11 @@ impl Model {
         gpu.sync()?;
         let lane_events = vec![gpu.ctx.new_event().map_err(de)?];
         let grp = cfg.num_attention_heads / cfg.num_key_value_heads;
+        // The tensor-core attention kernels take 1, 2, 4 or 8 query heads per KV head.
+        let fast_attn = 8 % grp == 0;
+        if !fast_attn {
+            eprintln!("attention: {grp} query heads per KV head, on the reference kernel (slow)");
+        }
         // Sub-tiles per block: capped by 1024 threads and 100 KiB of shared memory (the most a
         // block may ask for on the GB10; 4 sub-tiles of a 4-head group need 160 KiB).
         let smem_max = gpu.max_smem_optin()? as u32;
@@ -914,6 +1010,8 @@ impl Model {
             graphs: Default::default(),
             use_graphs: std::env::var("AQ_NO_GRAPHS").is_err() && std::env::var("AQ_MOE_ROUTES").is_err() && !pool.paged(),
             experts: pool,
+            ple,
+            final_hc,
             routes: std::env::var("AQ_MOE_ROUTES").ok().map(std::fs::File::create).transpose()?,
             cur_chunks: 0,
             cur_tiles: 0,
@@ -922,7 +1020,7 @@ impl Model {
             cur_tap: false,
             last_logits: 0,
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
-            ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
+            ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1") || !fast_attn,
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
             attn_tc_smem,
             attn_nbuf: attn_nbuf as u32,
@@ -1093,6 +1191,11 @@ impl Model {
     /// Clear a slot's recurrent state before a new sequence uses it (KV pages are written
     /// before they are read and need no reset).
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
+        if let Some(p) = self.ple.as_mut() {
+            p.before[slot] = p.table.start();
+            let sz = 9 * self.cfg.hc_count * self.cfg.hidden_size * 2;
+            self.gpu.zero(p.state + (slot * sz) as u64, sz)?;
+        }
         let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;
         let csz = self.cfg.conv_dim() * 3 * 2;
         for l in &self.layers {
@@ -1125,6 +1228,11 @@ impl Model {
 
     /// Copy one slot's recurrent state (DeltaNet + conv) into another, on the stream.
     pub fn copy_slot(&mut self, dst: usize, src: usize) -> Result<()> {
+        if let Some(p) = self.ple.as_mut() {
+            p.before[dst] = p.before[src];
+            let sz = 9 * self.cfg.hc_count * self.cfg.hidden_size * 2;
+            unsafe { cuda_core::memory::memcpy_dtod_async(p.state + (dst * sz) as u64, p.state + (src * sz) as u64, sz, self.gpu.stream.cu_stream()) }.map_err(de)?;
+        }
         let dsz = self.cfg.linear_num_value_heads * 128 * 128 * 4;
         let csz = self.cfg.conv_dim() * 3 * 2;
         let st = self.gpu.stream.cu_stream();
@@ -1524,9 +1632,26 @@ impl Model {
             let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
             self.embed_rows.clear();
             for &tok in &b.tokens {
-                self.embed_rows.extend_from_slice(&table[tok as usize * hb..(tok as usize + 1) * hb]);
+                for _ in 0..self.cfg.hc_count {
+                    self.embed_rows.extend_from_slice(&table[tok as usize * hb..(tok as usize + 1) * hb]);
+                }
             }
             g.upload(s.x, &self.embed_rows)?;
+            if let Some(p) = self.ple.as_mut() {
+                p.rows.clear();
+                for (q, (&start, &len)) in b.seq_start.iter().zip(&b.seq_len).enumerate() {
+                    let toks = &b.tokens[start as usize..(start + len) as usize];
+                    let before = p.before[b.seq_slot[q] as usize];
+                    p.table.gather(ck, before, toks, &mut p.rows)?;
+                    // The two tokens before the next one, after `n` of this step's.
+                    let after = |n: usize| [1, 0].map(|k| if n > k { toks[n - 1 - k] } else { before[1 - (k - n)] });
+                    if let Some(&(chunks, slot)) = b.seq_tap.get(q).filter(|t| t.0 > 0) {
+                        p.before[slot as usize] = after(chunks as usize * 64);
+                    }
+                    p.before[*b.seq_slot_out.get(q).unwrap_or(&b.seq_slot[q]) as usize] = after(toks.len());
+                }
+                g.upload(s.ple_e, &p.rows)?;
+            }
         }
         g.upload(s.tok_pos, &b.tok_pos)?;
         g.upload(s.tok_seq, &b.tok_seq)?;
@@ -1637,24 +1762,47 @@ impl Model {
             mark!("embed");
         }
 
+        let hcn = c.hc_count as u32;
+        // Gated residual before a block: inject the previous block's output into the streams
+        // (`$add`), then mix them into the block's input `h` and keep the injection weights.
+        macro_rules! hc_gate {
+            ($hc:expr, $add:expr) => {{
+                let (hw, lr, tu) = (c.hidden_size * c.hc_count, c.hc_lowrank, t as u32);
+                unsafe { g.k.hc_norm(&st, cfg((tu, hcn, 1), 256), s.x as *mut u16, s.delta as *const u16, s.inj as *const f32, $hc.norm as *const u16, s.xn as *mut u16, hd, hcn, eps, $add as u32) }.map_err(de)?;
+                g.gemm(t, cap, lr, hw, s.xn, Weight::bf16($hc.down), s.hc_a, CUDA_R_16BF)?;
+                unsafe { g.k.silu_scaled(&st, cfg(((tu * lr as u32).div_ceil(256), 1, 1), 256), s.hc_a as *mut u16, tu * lr as u32, 1.0 / hcn as f32) }.map_err(de)?;
+                g.gemm(t, cap, hw, lr, s.hc_a, Weight::bf16($hc.up), s.hc_b, CUDA_R_16BF)?;
+                if $hc.inject != 0 {
+                    g.gemm(t, cap, HC_INJ_LD, hw, s.xn, Weight::bf16($hc.inject), s.hc_c, CUDA_R_16BF)?;
+                }
+                let c_ptr = if $hc.inject != 0 { s.hc_c } else { 0 };
+                unsafe { g.k.hc_mix(&st, cfg((tu, 1, 1), 256), s.xn as *const u16, s.hc_b as *const u16, c_ptr as *const u16, HC_INJ_LD as u32, s.h as *mut u16, s.inj as *mut f32, hd, hcn) }.map_err(de)?;
+            }};
+        }
         // Final norm, output head and argmax for the sampled rows, from the residual stream
         // (x + delta) as the last layer left it.
         macro_rules! head {
             ($norm:expr, $hfinal:expr, $logits:expr, $tok:expr, $w:expr, $width:expr) => {{
-                unsafe {
-                    g.k.final_norm_rows(
-                        &st,
-                        cfg((ns as u32, 1, 1), 256),
-                        s.x as *const u16,
-                        s.delta as *const u16,
-                        $norm as *const u16,
-                        $hfinal as *mut u16,
-                        s.rows as *const u32,
-                        hd,
-                        eps,
-                    )
+                if hcn > 1 {
+                    // No final norm: the last gated residual mixes the streams into the head's input.
+                    hc_gate!(self.final_hc, true);
+                    unsafe { g.k.take_rows(&st, cfg((ns as u32, 1, 1), 256), s.h as *const u16, s.rows as *const u32, $hfinal as *mut u16, hd) }.map_err(de)?;
+                } else {
+                    unsafe {
+                        g.k.final_norm_rows(
+                            &st,
+                            cfg((ns as u32, 1, 1), 256),
+                            s.x as *const u16,
+                            s.delta as *const u16,
+                            $norm as *const u16,
+                            $hfinal as *mut u16,
+                            s.rows as *const u32,
+                            hd,
+                            eps,
+                        )
+                    }
+                    .map_err(de)?;
                 }
-                .map_err(de)?;
                 mark!("final_norm");
                 g.gemm(ns, lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, $width, c.hidden_size, $hfinal, $w, $logits, CUDA_R_16BF)?;
                 mark!("gemm_lm_head");
@@ -1730,20 +1878,48 @@ impl Model {
                 g.gemm(t, cap, c.hidden_size, 2 * c.hidden_size, s.proj, Weight::bf16(m.fc), s.x, CUDA_R_16BF)?;
                 mark!("mtp_in");
             }
-            unsafe {
-                g.k.add_rmsnorm(
-                    &st,
-                    cfg((t as u32, 1, 1), 256),
-                    s.x as *mut u16,
-                    s.delta as *const u16,
-                    l.in_norm as *const u16,
-                    s.h as *mut u16,
-                    hd,
-                    eps,
-                    (li > 0 && li != nl) as u32,
-                )
+            let ple = self.ple.as_ref().filter(|p| p.layer == li && li < nl);
+            if let Some(p) = ple {
+                // The streams with the previous layer's output in, normed as the query; then
+                // the n-gram embedding, gated per stream, is added to them.
+                let (hw, tu) = (c.hidden_size * c.hc_count, t as u32);
+                let norm = |g: &Gpu, x: u64, w: u64, out: u64, add: bool| unsafe { g.k.hc_norm(&st, cfg((tu, hcn, 1), 256), x as *mut u16, s.delta as *const u16, s.inj as *const f32, w as *const u16, out as *mut u16, hd, hcn, eps, add as u32) }.map_err(de);
+                norm(g, s.x, p.norm_query, s.xn, li > 0)?;
+                g.gemm(t, cap, hw, c.hidden_size, s.ple_e, Weight::bf16(p.key), s.hc_b, CUDA_R_16BF)?;
+                norm(g, s.hc_b, p.norm_key, s.hc_b, false)?;
+                g.gemm(t, cap, c.hidden_size, c.hidden_size, s.ple_e, Weight::bf16(p.value), s.h, CUDA_R_16BF)?;
+                unsafe {
+                    g.k.ple_gate(&st, cfg((tu, hcn, 1), 256), s.hc_b as *const u16, s.xn as *mut u16, s.h as *const u16, hd, hcn).map_err(de)?;
+                }
+                norm(g, s.xn, p.norm_conv, s.hc_b, false)?;
+                unsafe {
+                    g.k.ple_conv(&st, cfg(((hw as u32).div_ceil(256), tu, 1), 256), s.hc_b as *const u16, s.xn as *const u16, p.conv_w as *const u16, s.x as *mut u16, p.state as *const u16, s.tok_seq as *const u32, s.seq_start as *const u32, s.seq_slot as *const u32, hw as u32).map_err(de)?;
+                    let keep = cfg(((hw as u32).div_ceil(256), nseq as u32, 1), 256);
+                    if self.cur_tap {
+                        g.k.ple_state(&st, keep, s.hc_b as *const u16, p.state as *mut u16, s.seq_start as *const u32, s.seq_tap_len as *const u32, s.seq_slot as *const u32, s.seq_tap_slot as *const u32, hw as u32).map_err(de)?;
+                    }
+                    g.k.ple_state(&st, keep, s.hc_b as *const u16, p.state as *mut u16, s.seq_start as *const u32, s.seq_len as *const u32, s.seq_slot as *const u32, s.seq_slot_out as *const u32, hw as u32).map_err(de)?;
+                }
+                mark!("ple");
             }
-            .map_err(de)?;
+            if hcn > 1 {
+                hc_gate!(l.hc_attn, li > 0 && li != nl && ple.is_none());
+            } else {
+                unsafe {
+                    g.k.add_rmsnorm(
+                        &st,
+                        cfg((t as u32, 1, 1), 256),
+                        s.x as *mut u16,
+                        s.delta as *const u16,
+                        l.in_norm as *const u16,
+                        s.h as *mut u16,
+                        hd,
+                        eps,
+                        (li > 0 && li != nl) as u32,
+                    )
+                }
+                .map_err(de)?;
+            }
 
             match l.kind {
                 LayerKind::Linear => {
@@ -2176,20 +2352,24 @@ impl Model {
                 }
             }
 
-            unsafe {
-                g.k.add_rmsnorm(
-                    &st,
-                    cfg((t as u32, 1, 1), 256),
-                    s.x as *mut u16,
-                    s.delta as *const u16,
-                    l.post_norm as *const u16,
-                    s.h as *mut u16,
-                    hd,
-                    eps,
-                    1,
-                )
+            if hcn > 1 {
+                hc_gate!(l.hc_mlp, true);
+            } else {
+                unsafe {
+                    g.k.add_rmsnorm(
+                        &st,
+                        cfg((t as u32, 1, 1), 256),
+                        s.x as *mut u16,
+                        s.delta as *const u16,
+                        l.post_norm as *const u16,
+                        s.h as *mut u16,
+                        hd,
+                        eps,
+                        1,
+                    )
+                }
+                .map_err(de)?;
             }
-            .map_err(de)?;
             mark!("norm");
             let moe = l.router != 0;
             let inter = c.intermediate_size;
@@ -2255,16 +2435,14 @@ impl Model {
             }
 
             if let Some(d) = dump.as_deref_mut().filter(|_| li < nl) {
-                let x: Vec<u16> = g.download(s.x, t * c.hidden_size)?;
-                let dl: Vec<u16> = g.download(s.delta, t * c.hidden_size)?;
-                d.push(
-                    x.iter()
-                        .zip(&dl)
-                        .map(|(&a, &b)| {
-                            bf16::from_f32(bf16::from_bits(a).to_f32() + bf16::from_bits(b).to_f32()).to_f32()
-                        })
-                        .collect(),
-                );
+                let (hs, nh) = (c.hidden_size, c.hc_count);
+                let x: Vec<u16> = g.download(s.x, t * hs * nh)?;
+                let dl: Vec<u16> = g.download(s.delta, t * hs)?;
+                let inj: Vec<f32> = if nh > 1 { g.download(s.inj, t * nh)? } else { vec![1.0; t] };
+                let f = |b: u16| bf16::from_bits(b).to_f32();
+                let r = |v: f32| bf16::from_f32(v).to_f32();
+                // The stream each layer leaves: the block's output injected with its weights.
+                d.push((0..t * hs * nh).map(|i| r(f(x[i]) + if nh > 1 { r(f(dl[i / (hs * nh) * hs + i % hs]) * inj[i / hs]) } else { f(dl[i]) })).collect());
             }
         }
         if self.experts.paged() {

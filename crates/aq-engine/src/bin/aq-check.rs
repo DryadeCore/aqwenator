@@ -165,11 +165,17 @@ fn main() -> Result<()> {
         let mut worst = (0f64, 0usize);
         for (l, ours) in dump.iter().enumerate().take(n_layers - 1) {
             let (rel, _) = rel_err(ours, &as_f32(&format!("hidden.{}", l + 1))?);
+            if std::env::var("AQ_LAYERS").is_ok() {
+                println!("layer {l}: rel_l2 {rel:.2e}");
+            }
             if rel > worst.0 {
                 worst = (rel, l);
             }
         }
         println!("layers: worst rel_l2 {:.2e} (layer {})", worst.0, worst.1);
+    }
+    if std::env::var("AQ_LAYERS").is_ok() {
+        return Ok(());
     }
     let lg = m.logits()?;
     let (rel, _) = rel_err(&lg, &as_f32("logits_last")?);

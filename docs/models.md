@@ -8,16 +8,37 @@ The focus is Qwen models for the moment; others are added when they fit the exis
 |---|---|---|
 | Qwen/Qwen3.5-0.8B | `qwen3_5` | In the correctness gate |
 | Qwen/Qwen3.5-9B | `qwen3_5` | In the correctness gate; the model most numbers are measured on |
-| Qwen/Qwen3.6-35B-A3B | `qwen3_5_moe` | In the correctness gate; bf16 only |
+| Qwen/Qwen3.6-35B-A3B | `qwen3_5_moe` | In the correctness gate in bf16; 4-bit checkpoints, also with the experts paged ([quantization](quantization.md)) |
+| Qwen/Qwen3.8-Flash-Next | `qwen4_exp` | First steps, 4-bit checkpoint only: see below |
 | Other dense `qwen3_5` checkpoints (up to 27B) | `qwen3_5` | Same layout, not run |
 
 The model is given as a Hugging Face id found in the local cache, or as a directory. The
 vision tower of a checkpoint is ignored: text only.
 
-What the kernels assume, checked at load: 256-wide attention heads, 1, 2, 4 or 8 query heads
-per KV head, 128-wide Gated DeltaNet heads, a width-4 convolution, and for a
-mixture-of-experts model 256 experts with 8 per token and a shared expert of the experts'
-shape.
+What the kernels assume, checked at load: 256-wide attention heads, 128-wide Gated DeltaNet
+heads, a width-4 convolution, and for a mixture-of-experts model at most 512 experts with at
+most 16 per token and a shared expert of the experts' shape. The tensor-core attention
+kernels take 1, 2, 4 or 8 query heads per KV head; another ratio runs on the reference
+kernel, which is slow.
+
+## Qwen3.8-Flash-Next
+
+180B parameters, 6B of them used per token. What it adds to the Qwen3.5 layout and where it
+stands here:
+
+| Part | State |
+|---|---|
+| Four residual streams with a gated mix before each block | done |
+| n-gram embedding table (95 GiB, 16 rows read per token, never on the device) | done; read from the checkpoint's own shards, or from an extract of the rows some prompts need |
+| 512 experts, 10 per token | done, through the expert pool |
+| Attention with 12 query heads per KV head | reference kernel only |
+| Sparse attention (the 512 best blocks of 4 tokens) | not yet: contexts over 2048 tokens are wrong |
+| Draft head | not loaded |
+
+With `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` converted (only its routed experts are
+4-bit) and every expert on the device, 71 GiB: against transformers on the same weights, a
+19-token prompt gives 32 of 32 greedy tokens and a mean KL of 0.005 nats teacher-forced.
+Running it with the experts paged has not been tried yet.
 
 ## Mixture of experts
 

@@ -376,6 +376,198 @@ pub mod kernels {
         }
     }
 
+    /// Gated residual over `hc` streams of `hidden` (rows of `x` are `[stream][hidden]`), first
+    /// half, for one token and stream: if `add` != 0 the previous block's output is injected,
+    /// `x = bf16(x + bf16(delta * inj[token, stream]))` in place; then
+    /// `out = rmsnorm(x) * (1 + w[stream])`, the norm taken over the stream.
+    /// Requires hidden % 8 == 0 and hidden <= 8192. grid = (T, hc), block = (256).
+    #[kernel]
+    pub unsafe fn hc_norm(x: *mut u16, delta: *const u16, inj: *const f32, w: *const u16, out: *mut u16, hidden: u32, hc: u32, eps: f32, add: u32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let tid = thread::threadIdx_x() as usize;
+        let nv = hidden as usize / 8;
+        let (tok, sm) = (thread::blockIdx_x() as usize, thread::blockIdx_y() as usize);
+        let row = (tok * hc as usize + sm) * nv;
+        let xv = unsafe { x.cast::<U32x4>().add(row) };
+        let dv = unsafe { delta.cast::<U32x4>().add(tok * nv) };
+        let wv = unsafe { w.cast::<U32x4>().add(sm * nv) };
+        let ov = unsafe { out.cast::<U32x4>().add(row) };
+        let gain = if add != 0 { unsafe { *inj.add(tok * hc as usize + sm) } } else { 0.0 };
+        let mut vals = [0.0f32; 32];
+        let mut ss = 0.0f32;
+        #[unroll]
+        for c in 0..4 {
+            let v = tid + c * 256;
+            if v < nv {
+                let xw = unsafe { *xv.add(v) }.to_array();
+                let dw = if add != 0 { unsafe { *dv.add(v) }.to_array() } else { [0u32; 4] };
+                let mut packed = [0u32; 4];
+                #[unroll]
+                for e in 0..4 {
+                    let (mut a0, mut a1) = cvt_f32x2_bf16x2(xw[e]);
+                    if add != 0 {
+                        let (d0, d1) = cvt_f32x2_bf16x2(dw[e]);
+                        a0 = rb(a0 + rb(d0 * gain));
+                        a1 = rb(a1 + rb(d1 * gain));
+                        packed[e] = pk(a0, a1);
+                    }
+                    vals[c * 8 + 2 * e] = a0;
+                    vals[c * 8 + 2 * e + 1] = a1;
+                    ss += a0 * a0 + a1 * a1;
+                }
+                if add != 0 {
+                    unsafe { *xv.add(v) = U32x4::new(packed) };
+                }
+            }
+        }
+        let total = unsafe { block_sum(ss, red) };
+        let inv = 1.0 / libm::sqrtf(total / hidden as f32 + eps);
+        #[unroll]
+        for c in 0..4 {
+            let v = tid + c * 256;
+            if v < nv {
+                let ww = unsafe { *wv.add(v) }.to_array();
+                let mut packed = [0u32; 4];
+                #[unroll]
+                for e in 0..4 {
+                    let (w0, w1) = cvt_f32x2_bf16x2(ww[e]);
+                    packed[e] = pk(vals[c * 8 + 2 * e] * inv * (1.0 + w0), vals[c * 8 + 2 * e + 1] * inv * (1.0 + w1));
+                }
+                unsafe { *ov.add(v) = U32x4::new(packed) };
+            }
+        }
+    }
+
+    /// `a[i] = bf16(silu(a[i] * scale))` for `n` values. grid = (ceil(n / 256)), block = (256).
+    #[kernel]
+    pub unsafe fn silu_scaled(a: *mut u16, n: u32, scale: f32) {
+        let i = thread::blockIdx_x() as usize * 256 + thread::threadIdx_x() as usize;
+        if i < n as usize {
+            unsafe { st(a, i, silu(ld(a, i) * scale)) };
+        }
+    }
+
+    /// Gated residual, second half, for one token: the block's input
+    /// `h[i] = mean over streams of bf16(bf16(sigmoid(b[s, i])) * xn[s, i])`, and, with `c` not
+    /// null, how much of the block's output each stream takes:
+    /// `inj[s] = 2 * bf16(sigmoid(c[s] / hc))` (`c` rows have stride `ldc`).
+    /// grid = (T), block = (256), hc <= 8.
+    #[kernel]
+    pub unsafe fn hc_mix(xn: *const u16, b: *const u16, c: *const u16, ldc: u32, h: *mut u16, inj: *mut f32, hidden: u32, hc: u32) {
+        let tid = thread::threadIdx_x() as usize;
+        let tok = thread::blockIdx_x() as usize;
+        let (hd, n) = (hidden as usize, hc as usize);
+        if !c.is_null() && tid < n {
+            unsafe { *inj.add(tok * n + tid) = 2.0 * rb(sigmoid(ld(c, tok * ldc as usize + tid) / hc as f32)) };
+        }
+        let mut i = tid;
+        while i < hd {
+            let mut acc = 0.0f32;
+            #[unroll]
+            for sm in 0..8 {
+                if sm < n {
+                    let at = (tok * n + sm) * hd + i;
+                    acc += rb(rb(sigmoid(unsafe { ld(b, at) })) * unsafe { ld(xn, at) });
+                }
+            }
+            unsafe { st(h, tok * hd + i, acc / hc as f32) };
+            i += 256;
+        }
+    }
+
+    /// n-gram embedding gate for one token and stream: with
+    /// `g = sum_i bf16(key[s, i] * q[s, i]) / sqrt(hidden)` and `g' = sign(g) * sqrt(max(|g|, 1e-6))`,
+    /// `q[s, i] = bf16(bf16(sigmoid(g')) * value[i])` in place (the stream's query is consumed).
+    /// grid = (T, hc), block = (256).
+    #[kernel]
+    pub unsafe fn ple_gate(key: *const u16, q: *mut u16, value: *const u16, hidden: u32, hc: u32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        let tid = thread::threadIdx_x() as usize;
+        let (tok, hd) = (thread::blockIdx_x() as usize, hidden as usize);
+        let row = (tok * hc as usize + thread::blockIdx_y() as usize) * hd;
+        let mut dot = 0.0f32;
+        let mut i = tid;
+        while i < hd {
+            dot += rb(unsafe { ld(key, row + i) * ld(q, row + i) });
+            i += 256;
+        }
+        let g = rb(rb(unsafe { block_sum(dot, red) }) / libm::sqrtf(hidden as f32));
+        let mag = rb(libm::sqrtf(if g.abs() > 1.0e-6 { g.abs() } else { 1.0e-6 }));
+        let gate = rb(sigmoid(if g > 0.0 { mag } else if g < 0.0 { -mag } else { 0.0 }));
+        let mut i = tid;
+        while i < hd {
+            unsafe { st(q, row + i, gate * ld(value, tok * hd + i)) };
+            i += 256;
+        }
+    }
+
+    /// n-gram embedding epilogue for one token: over each channel `c` of the streams,
+    /// `x[c] = bf16(x[c] + bf16(gv[c] + bf16(silu(conv[c]))))` where `conv` is a depthwise
+    /// causal convolution of `gvn` over the token's sequence, 4 taps 3 tokens apart
+    /// (`w[c][j]` weighs the token `3 * (3 - j)` back). Tokens before the step come from the
+    /// sequence's slot of `state`: the 9 rows of `gvn` before it, oldest first.
+    /// grid = (ceil(width / 256), T), block = (256).
+    #[kernel]
+    pub unsafe fn ple_conv(gvn: *const u16, gv: *const u16, w: *const u16, x: *mut u16, state: *const u16, tok_seq: *const u32, seq_start: *const u32, seq_slot: *const u32, width: u32) {
+        let c = thread::blockIdx_x() as usize * 256 + thread::threadIdx_x() as usize;
+        let tok = thread::blockIdx_y() as usize;
+        let wd = width as usize;
+        if c >= wd {
+            return;
+        }
+        let seq = unsafe { *tok_seq.add(tok) } as usize;
+        let back = tok - unsafe { *seq_start.add(seq) } as usize;
+        let past = unsafe { state.add(*seq_slot.add(seq) as usize * 9 * wd) };
+        let mut acc = 0.0f32;
+        #[unroll]
+        for j in 0..4 {
+            let d = 3 * (3 - j);
+            let v = if d <= back { unsafe { ld(gvn, (tok - d) * wd + c) } } else { unsafe { ld(past, (9 + back - d) * wd + c) } };
+            acc += unsafe { ld(w, c * 4 + j) } * v;
+        }
+        let y = rb(unsafe { ld(gv, tok * wd + c) } + rb(silu(rb(acc))));
+        unsafe { st(x, tok * wd + c, ld(x, tok * wd + c) + y) };
+    }
+
+    /// Keep the 9 rows of `gvn` that precede position `len[seq]` of each sequence (from its
+    /// slot `slot_in` of `state` where the step has fewer) in its slot `slot_out`, oldest
+    /// first. A sequence with `len` 0 is skipped.
+    /// grid = (ceil(width / 256), n_seq), block = (256).
+    #[kernel]
+    pub unsafe fn ple_state(gvn: *const u16, state: *mut u16, seq_start: *const u32, len: *const u32, slot_in: *const u32, slot_out: *const u32, width: u32) {
+        let c = thread::blockIdx_x() as usize * 256 + thread::threadIdx_x() as usize;
+        let seq = thread::blockIdx_y() as usize;
+        let wd = width as usize;
+        let n = unsafe { *len.add(seq) } as usize;
+        if c >= wd || n == 0 {
+            return;
+        }
+        let first = unsafe { *seq_start.add(seq) } as usize;
+        let (src, dst) = unsafe { (state.add(*slot_in.add(seq) as usize * 9 * wd), state.add(*slot_out.add(seq) as usize * 9 * wd)) };
+        // Row k of the result is n - 9 + k of the step: ascending k never reads a row already written.
+        let mut k = 0;
+        while k < 9 {
+            let v = if n + k >= 9 { unsafe { *gvn.add((first + n + k - 9) * wd + c) } } else { unsafe { *src.add((n + k) * wd + c) } };
+            unsafe { *dst.add(k * wd + c) = v };
+            k += 1;
+        }
+    }
+
+    /// `dst[r] = src[rows[r]]`, rows of `hidden` bf16 (a multiple of 8). grid = (R), block = (256).
+    #[kernel]
+    pub unsafe fn take_rows(src: *const u16, rows: *const u32, dst: *mut u16, hidden: u32) {
+        let r = thread::blockIdx_x() as usize;
+        let nv = hidden as usize / 8;
+        let from = unsafe { src.cast::<U32x4>().add(*rows.add(r) as usize * nv) };
+        let mut v = thread::threadIdx_x() as usize;
+        while v < nv {
+            unsafe { *dst.cast::<U32x4>().add(r * nv + v) = *from.add(v) };
+            v += 256;
+        }
+    }
+
     /// Zero-centered RMSNorm (`x * rsqrt(mean(x^2) + eps) * (1 + w)`), optionally fused with the
     /// residual add: if `add` != 0, first `x = bf16(x + delta)` in place.
     /// 16-byte loads (8 bf16 per thread per chunk); the row stays in registers between the
