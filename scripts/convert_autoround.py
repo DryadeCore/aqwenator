@@ -4,8 +4,9 @@ group size 128) into the layout aqwenator loads: for every quantized linear `<na
 code - 8) and `<name>.weight.q4s` (float32 [out, in / 128], one scale per 128 inputs). A
 layer's experts become `<layer>.mlp.experts.q4r` (uint8 [experts, record]), one record per
 expert so that it can be moved in one piece: the codes of its gate rows then up rows, their
-scales, the codes of its down rows, their scales. Tensors the quantized checkpoint lacks (the
-MTP head) are taken from the original checkpoint.
+scales, the codes of its down rows, their scales. Experts left in bf16 and stored one by one
+are stacked as the original checkpoint has them (`experts.gate_up_proj`, `experts.down_proj`).
+Tensors the quantized checkpoint lacks (the MTP head) are taken from the original checkpoint.
 
     python scripts/convert_autoround.py <quantized dir> <original dir> <out dir>
 
@@ -44,6 +45,8 @@ def unpack(p, axis):  # 8 4-bit codes per int32 along `axis`
 quant, orig = index(qdir), index(odir)
 tensors, layers = {}, 0
 experts = {}  # "<layer>.mlp.experts" -> {(expert, projection): (codes, scales)}
+dense = {}  # the same for experts left in bf16: {(expert, projection): weight}
+EXPERT = r"(.*\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj"
 for k, h in quant.items():
     if k.endswith(".qweight"):
         base = k[: -len(".qweight")]
@@ -55,13 +58,19 @@ for k, h in quant.items():
         n_out, n_in = codes.shape
         assert n_in % 128 == 0 and scales.shape == (n_out, n_in // 128), f"{base}: shape {codes.shape}, scales {scales.shape}"
         q4 = codes[:, 0::2] | (codes[:, 1::2] << 4)
-        if m := re.fullmatch(r"(.*\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj", base):
+        if m := re.fullmatch(EXPERT, base):
             experts.setdefault(m[1], {})[int(m[2]), m[3]] = (q4, scales)
         else:
             tensors[base + ".weight.q4"], tensors[base + ".weight.q4s"] = q4, scales
         layers += 1
+    elif m := re.fullmatch(EXPERT + r"\.weight", k):
+        dense.setdefault(m[1], {})[int(m[2]), m[3]] = h.get_tensor(k)
     elif not k.endswith((".qzeros", ".scales", ".g_idx")):
         tensors[k] = h.get_tensor(k)
+for prefix, parts in dense.items():
+    ne = len(parts) // 3
+    tensors[f"{prefix}.gate_up_proj"] = torch.stack([torch.cat([parts[e, "gate"], parts[e, "up"]]) for e in range(ne)])
+    tensors[f"{prefix}.down_proj"] = torch.stack([parts[e, "down"] for e in range(ne)])
 stacked = {f"{p}.{n}" for p in experts for n in ("gate_up_proj", "down_proj")}
 for prefix in list(experts):
     parts, records = experts.pop(prefix), []

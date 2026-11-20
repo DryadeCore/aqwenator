@@ -43,6 +43,12 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + libm::expf(-x))
 }
 
+/// The gate of a gated RMSNorm: `silu`, or `sigmoid` in models that say so.
+#[inline(always)]
+fn gate_act(z: f32, sigmoid_gate: u32) -> f32 {
+    if sigmoid_gate != 0 { sigmoid(z) } else { silu(z) }
+}
+
 /// torch.nn.functional.softplus with beta=1, threshold=20.
 #[inline(always)]
 fn softplus(x: f32) -> f32 {
@@ -1701,6 +1707,7 @@ pub mod kernels {
         n_k_heads: u32,
         n_v_heads: u32,
         eps: f32,
+        sigmoid_gate: u32,
     ) {
         const DK: usize = 128;
         const DV: usize = 128;
@@ -1824,7 +1831,7 @@ pub mod kernels {
                 let o = unsafe { *red2.add(c) };
                 let y = nw * rb(o / libm::sqrtf(var + eps));
                 let z = unsafe { ld(proj, t * ldp + z_off as usize + h * DV + c) };
-                unsafe { st(out, t * hv * DV + h * DV + c, y * silu(z)) };
+                unsafe { st(out, t * hv * DV + h * DV + c, y * gate_act(z, sigmoid_gate)) };
             }
             thread::sync_threads();
             t += 1;
@@ -1863,6 +1870,7 @@ pub mod kernels {
         n_k_heads: u32,
         n_v_heads: u32,
         eps: f32,
+        sigmoid_gate: u32,
     ) {
         const D: usize = 128;
         static mut QS: SharedArray<f32, 128> = SharedArray::UNINIT;
@@ -1954,7 +1962,7 @@ pub mod kernels {
             thread::sync_threads();
             let var = unsafe { *r2.add(0) + *r2.add(1) + *r2.add(2) + *r2.add(3) } / D as f32;
             let y = unsafe { *norm_w.add(j) } * rb(ob / libm::sqrtf(var + eps));
-            unsafe { st(out, t * hv * D + h * D + j, y * silu(z)) };
+            unsafe { st(out, t * hv * D + h * D + j, y * gate_act(z, sigmoid_gate)) };
             // qs/ks/r1/r2 are rewritten by the next token.
             thread::sync_threads();
             tt += 1;
@@ -2407,6 +2415,7 @@ pub mod kernels {
         n_decode: u32,
         n_v_heads: u32,
         eps: f32,
+        sigmoid_gate: u32,
     ) {
         const D: usize = 128;
         static mut R: SharedArray<f32, 4> = SharedArray::UNINIT;
@@ -2427,7 +2436,7 @@ pub mod kernels {
         let var = unsafe { *red.add(0) + *red.add(1) + *red.add(2) + *red.add(3) } / D as f32;
         let y = unsafe { *norm_w.add(j) } * rb(o / libm::sqrtf(var + eps));
         let z = unsafe { ld(proj, t * ld_proj as usize + z_off as usize + h * D + j) };
-        unsafe { st(out, t * hv * D + h * D + j, y * silu(z)) };
+        unsafe { st(out, t * hv * D + h * D + j, y * gate_act(z, sigmoid_gate)) };
     }
 
     /// Tiled causal GQA prefill attention with the output gate fused. One block per
@@ -3681,6 +3690,7 @@ pub mod kernels {
         out: *mut u16,
         n_v_heads: u32,
         eps: f32,
+        sigmoid_gate: u32,
     ) {
         const C: usize = 64;
         const D: usize = 128;
@@ -3819,8 +3829,8 @@ pub mod kernels {
                 if i < len {
                     let col = nt * 8 + 2 * t;
                     let z = zz[2 * nt + half];
-                    let y0 = unsafe { *nw.add(col) } * rb(o[nt][2 * half] * inv) * silu(bf16_to_f32((z & 0xffff) as u16));
-                    let y1 = unsafe { *nw.add(col + 1) } * rb(o[nt][2 * half + 1] * inv) * silu(bf16_to_f32((z >> 16) as u16));
+                    let y0 = unsafe { *nw.add(col) } * rb(o[nt][2 * half] * inv) * gate_act(bf16_to_f32((z & 0xffff) as u16), sigmoid_gate);
+                    let y1 = unsafe { *nw.add(col + 1) } * rb(o[nt][2 * half + 1] * inv) * gate_act(bf16_to_f32((z >> 16) as u16), sigmoid_gate);
                     unsafe { *(out.add((c0 + i) * hv * D + h * D + col) as *mut u32) = pk(y0, y1) };
                 }
             }

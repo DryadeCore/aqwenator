@@ -1605,6 +1605,7 @@ impl Model {
         let c = self.cfg.clone();
         let hd = c.hidden_size as u32;
         let eps = c.rms_norm_eps as f32;
+        let gdn_gate = (c.output_gate_type.as_deref() == Some("sigmoid")) as u32;
         let (s, g) = (&self.s, &mut self.gpu);
         let prof = &mut self.prof;
         macro_rules! mark {
@@ -1829,6 +1830,7 @@ impl Model {
                                 hk_u,
                                 hv_u,
                                 eps,
+                                gdn_gate,
                             )
                         }
                         .map_err(de)?;
@@ -1857,6 +1859,7 @@ impl Model {
                                 hk_u,
                                 hv_u,
                                 eps,
+                                gdn_gate,
                             )
                         }
                         .map_err(de)?;
@@ -1927,6 +1930,7 @@ impl Model {
                                 s.mix as *mut u16,
                                 hv_u,
                                 eps,
+                                gdn_gate,
                             )
                         }
                         .map_err(de)?;
@@ -1996,6 +2000,7 @@ impl Model {
                                 nd,
                                 hv_u,
                                 eps,
+                                gdn_gate,
                             )
                         }
                         .map_err(de)?;

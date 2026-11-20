@@ -42,6 +42,9 @@ pub struct TextConfig {
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
     pub rope_parameters: RopeParameters,
+    /// Gate of the gated delta layers' output norm: `silu` unless "sigmoid".
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
     #[serde(default)]
     pub tie_word_embeddings: Option<bool>,
 }
