@@ -55,11 +55,12 @@ def main():
     p.add_argument("--ids-file", help="JSON list of prompt token ids (e.g. one turn of a recorded trace)")
     p.add_argument("--no-hidden", action="store_true", help="skip per-layer hidden states (long prompts)")
     p.add_argument("--attn", default="eager", help="attention implementation (eager or sdpa)")
+    p.add_argument("--device-map", default="cuda", help="'auto' spreads a model over several GPUs")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map="cuda", attn_implementation=args.attn
+        args.model, dtype=torch.bfloat16, device_map=args.device_map, attn_implementation=args.attn
     ).eval()
     if args.ids_file:
         import json
