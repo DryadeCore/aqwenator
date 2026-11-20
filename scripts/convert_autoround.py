@@ -1,10 +1,11 @@
 """Convert a 4-bit AutoRound / GPTQ checkpoint (packing `auto_round:auto_gptq`, symmetric,
 group size 128) into the layout aqwenator loads: for every quantized linear `<name>.weight`,
 `<name>.weight.q4` (uint8 [out, in / 2], two 4-bit codes per byte, low nibble first, value =
-code - 8) and `<name>.weight.q4s` (float32 [out, in / 128], one scale per 128 inputs). Experts
-stored one by one are stacked the way the original checkpoint has them: `experts.gate_up_proj`
-and `experts.down_proj`, with the same two suffixes. Tensors the quantized checkpoint lacks
-(the MTP head) are taken from the original checkpoint.
+code - 8) and `<name>.weight.q4s` (float32 [out, in / 128], one scale per 128 inputs). A
+layer's experts become `<layer>.mlp.experts.q4r` (uint8 [experts, record]), one record per
+expert so that it can be moved in one piece: the codes of its gate rows then up rows, their
+scales, the codes of its down rows, their scales. Tensors the quantized checkpoint lacks (the
+MTP head) are taken from the original checkpoint.
 
     python scripts/convert_autoround.py <quantized dir> <original dir> <out dir>
 
@@ -61,12 +62,14 @@ for k, h in quant.items():
         layers += 1
     elif not k.endswith((".qzeros", ".scales", ".g_idx")):
         tensors[k] = h.get_tensor(k)
-for prefix, parts in experts.items():
-    for name, projs in (("gate_up_proj", ("gate", "up")), ("down_proj", ("down",))):
-        for j, suffix in enumerate((".q4", ".q4s")):
-            stacked = [torch.cat([parts[e, p][j] for p in projs]) for e in range(len(parts) // 3)]
-            tensors[f"{prefix}.{name}{suffix}"] = torch.stack(stacked)
-missing = [k for k in orig if k not in tensors and k + ".q4" not in tensors]
+stacked = {f"{p}.{n}" for p in experts for n in ("gate_up_proj", "down_proj")}
+for prefix in list(experts):
+    parts, records = experts.pop(prefix), []
+    for e in range(len(parts) // 3):
+        pieces = [torch.cat([parts[e, p][j] for p in projs]) for projs in (("gate", "up"), ("down",)) for j in (0, 1)]
+        records.append(torch.cat([t.contiguous().view(torch.uint8).flatten() for t in pieces]))
+    tensors[f"{prefix}.q4r"] = torch.stack(records)
+missing = [k for k in orig if k not in tensors and k + ".q4" not in tensors and k not in stacked]
 for k in missing:
     tensors[k] = orig[k].get_tensor(k)
 save_file(tensors, os.path.join(out, "model.safetensors"))

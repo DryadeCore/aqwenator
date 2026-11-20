@@ -181,7 +181,7 @@ impl Drop for Loader {
 ///
 /// # Safety
 /// `buf` must be valid for `cap` bytes.
-unsafe fn read_at_least(fd: std::os::fd::RawFd, buf: *mut u8, cap: usize, at: u64, need: usize) -> std::io::Result<()> {
+pub(crate) unsafe fn read_at_least(fd: std::os::fd::RawFd, buf: *mut u8, cap: usize, at: u64, need: usize) -> std::io::Result<()> {
     let mut got = 0;
     while got < need {
         match unsafe { libc::pread(fd, buf.add(got) as *mut c_void, cap - got, (at + got as u64) as libc::off_t) } {

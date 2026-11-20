@@ -5,6 +5,7 @@
 //! cache; gated-delta-net layers keep a fixed-size recurrent state per sequence slot.
 
 use crate::config::{LayerKind, TextConfig};
+use crate::experts::ExpertPool;
 use crate::cublaslt::CUDA_R_16BF;
 use crate::gpu::{Fmt, Gpu, Prof, Weight, cfg, cfg_smem, de};
 use cuda_core::LaunchConfig;
@@ -469,134 +470,6 @@ fn moe_max_jobs(t: usize, cfg: &TextConfig) -> usize {
 /// The MLP weights of layer `n(..)`: gate/up and down (the shared expert's in a mixture of
 /// experts), then router and stacked experts (0 for a dense MLP).
 #[allow(clippy::type_complexity)]
-/// 4-bit experts, one fixed-size record each: gate/up codes, their scales, down codes, their
-/// scales. All of them on the device, or with AQ_EXPERT_GB=<GiB> smaller than that a device
-/// pool of the least recently used ones, the rest in page-locked host memory.
-struct ExpertPool {
-    p: u64,
-    /// Byte offsets of a record's four parts, then its size.
-    off: [usize; 5],
-    used: usize,
-    /// Every record in load order when paging, else 0.
-    host: usize,
-    /// Expert in each device slot and the tick of its last use; device slot of each expert.
-    owner: Vec<u32>,
-    stamp: Vec<u64>,
-    slot: Vec<u32>,
-    tick: u64,
-    /// Experts needed and uploaded since the last report, and forwards.
-    stats: [usize; 3],
-}
-
-const NO_SLOT: u32 = u32::MAX;
-
-impl ExpertPool {
-    fn new(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, prefixes: &[String]) -> Result<Self> {
-        let (h, ei) = (cfg.hidden_size, cfg.moe_intermediate_size);
-        let parts = [ei * h, 2 * ei * (h / 128) * 4, h * ei / 2, h * (ei / 128) * 4];
-        let mut off = [0; 5];
-        for i in 0..4 {
-            off[i + 1] = off[i] + parts[i];
-        }
-        let n = cfg.num_experts * prefixes.iter().filter(|p| ck.has(&format!("{p}mlp.experts.gate_up_proj.q4"))).count();
-        anyhow::ensure!(n == 0 || (h % 128 == 0 && ei % 128 == 0), "4-bit experts need widths that are multiples of 128");
-        let budget = std::env::var("AQ_EXPERT_GB").ok().and_then(|v| v.parse::<f64>().ok());
-        let cap = budget.map_or(n, |g| (g * (1u64 << 30) as f64) as usize / off[4].max(1)).min(n);
-        let mut pool = Self { p: gpu.alloc_uninit(cap * off[4])?, off, used: 0, host: 0, owner: Vec::new(), stamp: Vec::new(), slot: Vec::new(), tick: 0, stats: [0; 3] };
-        if cap < n {
-            // A layer's experts must all fit while it runs.
-            anyhow::ensure!(cap >= cfg.num_experts, "AQ_EXPERT_GB: the pool must hold at least one layer's experts ({:.2} GiB)", (cfg.num_experts * off[4]) as f64 / (1u64 << 30) as f64);
-            pool.host = unsafe { cuda_core::memory::malloc_host(n * off[4]) }.map_err(de)? as usize;
-            pool.owner = vec![NO_SLOT; cap];
-            pool.stamp = vec![0; cap];
-            pool.slot = vec![NO_SLOT; n];
-            eprintln!("experts: {cap} of {n} on the device ({:.2} GiB), all in page-locked host memory ({:.2} GiB)", (cap * off[4]) as f64 / (1u64 << 30) as f64, (n * off[4]) as f64 / (1u64 << 30) as f64);
-        }
-        Ok(pool)
-    }
-
-    /// Load one layer's experts as the next records; the first one's index.
-    fn load(&mut self, gpu: &mut Gpu, ck: &Checkpoint, ne: usize, experts: &str) -> Result<u32> {
-        for (i, name) in ["gate_up_proj.q4", "gate_up_proj.q4s", "down_proj.q4", "down_proj.q4s"].iter().enumerate() {
-            let v = ck.get(&format!("{experts}.{name}"))?;
-            let part = self.off[i + 1] - self.off[i];
-            anyhow::ensure!(v.bytes.len() == ne * part, "{experts}.{name}: unexpected 4-bit layout");
-            for e in 0..ne {
-                let at = (self.used + e) * self.off[4] + self.off[i];
-                let src = &v.bytes[e * part..][..part];
-                if self.host != 0 {
-                    // SAFETY: the host buffer holds every record.
-                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (self.host + at) as *mut u8, part) };
-                } else {
-                    // SAFETY: `Model::load` flushes the queue while the checkpoint is still open.
-                    unsafe { gpu.queue_upload(self.p + at as u64, src, v.direct.map(|(f, o)| (f, o + (e * part) as u64)))? };
-                }
-            }
-        }
-        self.used += ne;
-        Ok((self.used - ne) as u32)
-    }
-
-    /// Bring the experts a layer's tokens selected (`idx`, 0xffff where unused; the layer's
-    /// first record is `base`) onto the device over the least recently used ones, and queue the
-    /// layer's slot table. Nothing queued may still read the pool.
-    fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64) -> Result<()> {
-        self.tick += 1;
-        let mut miss = Vec::new();
-        for id in idx.iter().filter(|&&e| e != 0xffff).map(|&e| (base + e as u32) as usize) {
-            match self.slot[id] {
-                NO_SLOT => {
-                    self.slot[id] = NO_SLOT - 1;
-                    miss.push(id);
-                }
-                s if s < NO_SLOT - 1 && self.stamp[s as usize] != self.tick => {
-                    self.stamp[s as usize] = self.tick;
-                    self.stats[0] += 1;
-                }
-                _ => {}
-            }
-        }
-        self.stats[0] += miss.len();
-        self.stats[1] += miss.len();
-        if !miss.is_empty() {
-            let mut free: Vec<u32> = (0..self.owner.len() as u32).filter(|&s| self.stamp[s as usize] != self.tick).collect();
-            if miss.len() < free.len() {
-                free.select_nth_unstable_by_key(miss.len() - 1, |&s| self.stamp[s as usize]);
-            }
-            for (&id, &s) in miss.iter().zip(&free) {
-                if self.owner[s as usize] != NO_SLOT {
-                    self.slot[self.owner[s as usize] as usize] = NO_SLOT;
-                }
-                self.owner[s as usize] = id as u32;
-                self.slot[id] = s;
-                self.stamp[s as usize] = self.tick;
-                let rec = self.off[4];
-                // SAFETY: both ends are whole records; the source is page-locked and lives as long as the pool.
-                unsafe { gpu.upload_raw(self.p + (s as usize * rec) as u64, (self.host + id * rec) as *const u8, rec)? };
-            }
-        }
-        gpu.upload(table, &self.slot[base as usize..][..ne])
-    }
-
-    /// Count a forward; every 512, report what the pool had to upload.
-    fn report(&mut self) {
-        self.stats[2] += 1;
-        if self.stats[2] == 512 {
-            let [need, up, n] = self.stats;
-            eprintln!("experts: {:.1}% of {} needed per forward uploaded ({:.0} MiB per forward)", 100.0 * up as f64 / need.max(1) as f64, need / n, (up * self.off[4]) as f64 / n as f64 / (1 << 20) as f64);
-            self.stats = [0; 3];
-        }
-    }
-}
-
-impl Drop for ExpertPool {
-    fn drop(&mut self) {
-        if self.host != 0 {
-            let _ = unsafe { cuda_core::memory::free_host(self.host as *mut std::ffi::c_void) };
-        }
-    }
-}
-
 /// A layer's MLP weights and, for a mixture, its router and experts.
 struct Mlp {
     gate_up: Weight,
@@ -620,7 +493,7 @@ fn mlp_weights(gpu: &mut Gpu, ck: &Checkpoint, cfg: &TextConfig, pool: &mut Expe
     }
     let (ne, ei) = (cfg.num_experts, cfg.moe_intermediate_size);
     m.router = concat_bf16_padded(gpu, ck, &[n("mlp.gate.weight"), n("mlp.shared_expert_gate.weight")], (moe_router_ld(cfg) - ne - 1) * h * 2)?;
-    let slots: Vec<u32> = if ck.has(&n("mlp.experts.gate_up_proj.q4")) {
+    let slots: Vec<u32> = if ck.has(&n("mlp.experts.q4r")) {
         let at = |i: usize| pool.p + pool.off[i] as u64;
         m.ex_gate_up = Weight { p: at(0), scale: at(1), fmt: Fmt::Int4 };
         m.ex_down = Weight { p: at(2), scale: at(3), fmt: Fmt::Int4 };
@@ -731,7 +604,7 @@ impl Model {
         // A 4-bit checkpoint is for small devices, and its embedding table and output head
         // are still bf16: the head is stored in 8 bits and the table stays in host memory (a
         // step uploads its tokens' rows; the draft head keeps its shortlist's).
-        let small_tables = ["gate_proj.weight", "experts.gate_up_proj"].iter().any(|n| ck.has(&format!("{P}layers.0.mlp.{n}.q4"))) && cfg.hidden_size % 32 == 0;
+        let small_tables = ["gate_proj.weight.q4", "experts.q4r"].iter().any(|n| ck.has(&format!("{P}layers.0.mlp.{n}"))) && cfg.hidden_size % 32 == 0;
         let tied = cfg.tied() || !ck.has("lm_head.weight");
         let embed_name = format!("{P}embed_tokens.weight");
         let mut small_head = None;
@@ -1038,7 +911,7 @@ impl Model {
             load: LoadStats { open_s, upload_s, weight_bytes },
             prof: Prof::from_env(),
             graphs: Default::default(),
-            use_graphs: std::env::var("AQ_NO_GRAPHS").is_err() && std::env::var("AQ_MOE_ROUTES").is_err() && pool.host == 0,
+            use_graphs: std::env::var("AQ_NO_GRAPHS").is_err() && std::env::var("AQ_MOE_ROUTES").is_err() && !pool.paged(),
             experts: pool,
             routes: std::env::var("AQ_MOE_ROUTES").ok().map(std::fs::File::create).transpose()?,
             cur_chunks: 0,
@@ -2338,7 +2211,7 @@ impl Model {
                     g.k.moe_bucket(&st, cfg((1, 1, 1), ne), s.moe_idx as *const u64, tu, s.moe_list as *mut u32, s.moe_jobs as *mut u32, jobs, ne, ek).map_err(de)?;
                 }
                 mark!("moe_route");
-                let paged = self.experts.host != 0 && l.ex_gate_up.fmt == Fmt::Int4;
+                let paged = self.experts.paged() && l.ex_gate_up.fmt == Fmt::Int4;
                 // Each token's selections, then 0xffff up to 16.
                 let idx: Vec<u16> = if paged || self.routes.is_some() { g.download(s.moe_idx, t * 16)? } else { Vec::new() };
                 if paged {
@@ -2381,7 +2254,7 @@ impl Model {
                 );
             }
         }
-        if self.experts.host != 0 {
+        if self.experts.paged() {
             // Another lane's forward may evict what this one's queued kernels still read.
             g.sync()?;
             self.experts.report();

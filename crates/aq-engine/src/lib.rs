@@ -4,6 +4,7 @@ pub mod config;
 pub mod cublaslt;
 pub mod draft;
 pub mod engine;
+mod experts;
 pub mod gpu;
 pub mod model;
 pub mod weights;
