@@ -43,47 +43,64 @@ def unpack(p, axis):  # 8 4-bit codes per int32 along `axis`
 
 
 quant, orig = index(qdir), index(odir)
-tensors, layers = {}, 0
-experts = {}  # "<layer>.mlp.experts" -> {(expert, projection): (codes, scales)}
-dense = {}  # the same for experts left in bf16: {(expert, projection): weight}
 EXPERT = r"(.*\.mlp\.experts)\.(\d+)\.(gate|up|down)_proj"
-for k, h in quant.items():
-    if k.endswith(".qweight"):
-        base = k[: -len(".qweight")]
-        codes = unpack(h.get_tensor(k).to(torch.int32), 0).t().contiguous().to(torch.uint8)  # [out, in]
-        zeros = unpack(quant[base + ".qzeros"].get_tensor(base + ".qzeros").to(torch.int32), 1)
-        # This packing stores the zero point minus one; symmetric 4-bit has it at 8.
-        assert bool((zeros == 7).all()), f"{base}: zero point is not 8"
-        scales = quant[base + ".scales"].get_tensor(base + ".scales").float().t().contiguous()  # [out, groups]
-        n_out, n_in = codes.shape
-        assert n_in % 128 == 0 and scales.shape == (n_out, n_in // 128), f"{base}: shape {codes.shape}, scales {scales.shape}"
-        q4 = codes[:, 0::2] | (codes[:, 1::2] << 4)
-        if m := re.fullmatch(EXPERT, base):
-            experts.setdefault(m[1], {})[int(m[2]), m[3]] = (q4, scales)
-        else:
-            tensors[base + ".weight.q4"], tensors[base + ".weight.q4s"] = q4, scales
-        layers += 1
-    elif m := re.fullmatch(EXPERT + r"\.weight", k):
-        dense.setdefault(m[1], {})[int(m[2]), m[3]] = h.get_tensor(k)
-    elif not k.endswith((".qzeros", ".scales", ".g_idx")):
-        tensors[k] = h.get_tensor(k)
-for prefix, parts in dense.items():
-    ne = len(parts) // 3
-    tensors[f"{prefix}.gate_up_proj"] = torch.stack([torch.cat([parts[e, "gate"], parts[e, "up"]]) for e in range(ne)])
-    tensors[f"{prefix}.down_proj"] = torch.stack([parts[e, "down"] for e in range(ne)])
-stacked = {f"{p}.{n}" for p in experts for n in ("gate_up_proj", "down_proj")}
-for prefix in list(experts):
-    parts, records = experts.pop(prefix), []
-    for e in range(len(parts) // 3):
-        pieces = [torch.cat([parts[e, p][j] for p in projs]) for projs in (("gate", "up"), ("down",)) for j in (0, 1)]
-        records.append(torch.cat([t.contiguous().view(torch.uint8).flatten() for t in pieces]))
-    tensors[f"{prefix}.q4r"] = torch.stack(records)
-missing = [k for k in orig if k not in tensors and k + ".q4" not in tensors and k not in stacked]
-for k in missing:
-    tensors[k] = orig[k].get_tensor(k)
-save_file(tensors, os.path.join(out, "model.safetensors"))
+# One output file per layer and one for the rest, so that memory holds one at a time.
+groups = {}
+for k in quant:
+    m = re.match(r"(.*?layers\.\d+)\.", k)
+    groups.setdefault(m[1] if m else "", []).append(k)
+written, stacked, layers, files = set(), set(), 0, 0
+
+
+def save(tensors):
+    global files
+    if tensors:
+        save_file(tensors, os.path.join(out, f"model-{files:05d}.safetensors"))
+        written.update(tensors)
+        files += 1
+
+
+for _, keys in sorted(groups.items()):
+    tensors = {}
+    experts = {}  # "<layer>.mlp.experts" -> {(expert, projection): (codes, scales)}
+    dense = {}  # the same for experts left in bf16: {(expert, projection): weight}
+    for k in keys:
+        h = quant[k]
+        if k.endswith(".qweight"):
+            base = k[: -len(".qweight")]
+            codes = unpack(h.get_tensor(k).to(torch.int32), 0).t().contiguous().to(torch.uint8)  # [out, in]
+            zeros = unpack(quant[base + ".qzeros"].get_tensor(base + ".qzeros").to(torch.int32), 1)
+            # This packing stores the zero point minus one; symmetric 4-bit has it at 8.
+            assert bool((zeros == 7).all()), f"{base}: zero point is not 8"
+            scales = quant[base + ".scales"].get_tensor(base + ".scales").float().t().contiguous()  # [out, groups]
+            n_out, n_in = codes.shape
+            assert n_in % 128 == 0 and scales.shape == (n_out, n_in // 128), f"{base}: shape {codes.shape}, scales {scales.shape}"
+            q4 = codes[:, 0::2] | (codes[:, 1::2] << 4)
+            if m := re.fullmatch(EXPERT, base):
+                experts.setdefault(m[1], {})[int(m[2]), m[3]] = (q4, scales)
+            else:
+                tensors[base + ".weight.q4"], tensors[base + ".weight.q4s"] = q4, scales
+            layers += 1
+        elif m := re.fullmatch(EXPERT + r"\.weight", k):
+            dense.setdefault(m[1], {})[int(m[2]), m[3]] = h.get_tensor(k)
+        elif not k.endswith((".qzeros", ".scales", ".g_idx")):
+            tensors[k] = h.get_tensor(k)
+    for prefix, parts in dense.items():
+        ne = len(parts) // 3
+        tensors[f"{prefix}.gate_up_proj"] = torch.stack([torch.cat([parts[e, "gate"], parts[e, "up"]]) for e in range(ne)])
+        tensors[f"{prefix}.down_proj"] = torch.stack([parts[e, "down"] for e in range(ne)])
+    for prefix, parts in experts.items():
+        records = []
+        for e in range(len(parts) // 3):
+            pieces = [torch.cat([parts[e, p][j] for p in projs]) for projs in (("gate", "up"), ("down",)) for j in (0, 1)]
+            records.append(torch.cat([t.contiguous().view(torch.uint8).flatten() for t in pieces]))
+        tensors[f"{prefix}.q4r"] = torch.stack(records)
+        stacked.update(f"{prefix}.{n}" for n in ("gate_up_proj", "down_proj"))
+    save(tensors)
+missing = [k for k in orig if k not in written and k + ".q4" not in written and k not in stacked]
+save({k: orig[k].get_tensor(k) for k in missing})
 for f in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
     if os.path.exists(os.path.join(odir, f)):
         shutil.copy(os.path.join(odir, f), out)
-size = os.path.getsize(os.path.join(out, "model.safetensors")) / 2**30
-print(f"{layers} quantized matrices, {len(missing)} tensors from the original checkpoint, {size:.2f} GiB -> {out}")
+size = sum(os.path.getsize(f) for f in glob.glob(os.path.join(out, "model-*.safetensors"))) / 2**30
+print(f"{layers} quantized matrices, {len(missing)} tensors from the original checkpoint, {size:.2f} GiB in {files} files -> {out}")
